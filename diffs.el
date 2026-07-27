@@ -4,7 +4,7 @@
 
 ;; Author: Lucius Chen
 ;; URL: https://github.com/LuciusChen/diffs.el
-;; Version: 0.3.0
+;; Version: 0.3.1
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: vc, tools
 
@@ -42,6 +42,7 @@
 (require 'vc)
 (require 'cl-lib)
 (require 'subr-x)
+(require 'fringe)
 
 (declare-function vc-git-command "vc-git")
 (declare-function vc-git-root "vc-git")
@@ -88,6 +89,15 @@ Both sides receive the same number of physical rows, with filler
 rows added to the shorter side as necessary."
   :type 'boolean)
 
+(defcustom diffs-fringe-bars t
+  "When non-nil, show colored fringe bars on added and removed lines."
+  :type 'boolean)
+
+(defcustom diffs-fringe-bar-width 2
+  "Width in pixels of added and removed line bars in the left fringe.
+Values outside the range 1 through 8 are clamped."
+  :type 'integer)
+
 (defcustom diffs-fullscreen t
   "When non-nil, the diffs view takes over the whole frame.
 `diffs-quit' (bound to \\`q') restores the previous window layout."
@@ -122,6 +132,43 @@ rows added to the shorter side as necessary."
   "Face for alignment filler lines in the side-by-side view.
 Inherits `hl-line': a tint close to, but distinguishable from,
 the background in any theme.")
+
+(defun diffs--define-fringe-bitmap ()
+  "Define the full-height bitmap used by `diffs-fringe-bars'."
+  (when (fboundp 'define-fringe-bitmap)
+    (let* ((scale (if (and (boundp 'text-scale-mode-amount)
+                           (boundp 'text-scale-mode-step)
+                           (numberp text-scale-mode-amount))
+                      (expt text-scale-mode-step text-scale-mode-amount)
+                    1))
+           (spacing (or (and (display-graphic-p)
+                             (default-value 'line-spacing))
+                        0))
+           (spacing (pcase spacing
+                      ((pred numberp) spacing)
+                      (`(,above . ,below) (+ above below))
+                      (_ 0)))
+           (width (max 1 (min 8 diffs-fringe-bar-width)))
+           (height (max 1
+                        (+ (ceiling (* (frame-char-height) scale))
+                           (if (floatp spacing)
+                               (truncate (* (frame-char-height) spacing))
+                             spacing))))
+           (bits (1- (ash 1 width))))
+      (define-fringe-bitmap
+       'diffs-fringe-bar
+       (make-vector height bits)
+       height width 'center))))
+
+(defun diffs--fringe-prefix (indicator)
+  "Return a fringe bar prefix for diff INDICATOR, or an empty string."
+  (let ((face (pcase indicator
+                (?+ 'diff-indicator-added)
+                (?- 'diff-indicator-removed))))
+    (if (and diffs-fringe-bars face)
+        (propertize
+         " " 'display `(left-fringe diffs-fringe-bar ,face))
+      "")))
 
 (defvar-local diffs--stats nil
   "List (FILES ADDED REMOVED) accumulated by the last scan.")
@@ -341,17 +388,24 @@ non-nil, only apply properties to lines intersecting that region."
                      (or (null rend)
                          (and (< (point) rend)
                               (>= (1+ (line-end-position)) (or rbeg 0)))))
-            (when diffs-line-numbers
-              (diffs--put
-               (point) (min (point-max) (1+ (line-end-position)))
-               'line-prefix
-               (propertize
-                (concat (if old (format fmt old-line) empty) " "
-                        (if new (format fmt new-line) empty) " ")
-                'face 'diffs-line-number)
-               'wrap-prefix
-               (propertize (make-string (+ (* 2 width) 2) ?\s)
-                           'face 'diffs-line-number)))
+            (let ((fringe (diffs--fringe-prefix c)))
+              (when (or diffs-line-numbers (not (string-empty-p fringe)))
+                (diffs--put
+                 (point) (min (point-max) (1+ (line-end-position)))
+                 'line-prefix
+                 (concat
+                  fringe
+                  (when diffs-line-numbers
+                    (propertize
+                     (concat (if old (format fmt old-line) empty) " "
+                             (if new (format fmt new-line) empty) " ")
+                     'face 'diffs-line-number)))
+                 'wrap-prefix
+                 (concat
+                  fringe
+                  (when diffs-line-numbers
+                    (propertize (make-string (+ (* 2 width) 2) ?\s)
+                                'face 'diffs-line-number))))))
             (when (and diffs-hide-markers (memq c '(?+ ?- ?\s)))
               (diffs--put (point) (1+ (point)) 'display "")))
           (when (memq c '(?+ ?- ?\s ?\n ?\\))
@@ -445,6 +499,8 @@ hunk headers, and enables outline folding (TAB on headings).
     (user-error "`diffs-minor-mode' only works in diff-mode buffers"))
   (if diffs-minor-mode
       (progn
+        (diffs--define-fringe-bitmap)
+        (add-hook 'text-scale-mode-hook #'diffs--define-fringe-bitmap nil t)
         (setq-local diff-font-lock-prettify nil)
         (when (eq diff-font-lock-syntax t)
           (setq-local diff-font-lock-syntax 'hunk-also))
@@ -455,6 +511,7 @@ hunk headers, and enables outline folding (TAB on headings).
         (setq-local outline-minor-mode-highlight nil)
         (outline-minor-mode 1))
     (jit-lock-unregister #'diffs--jit-decorate)
+    (remove-hook 'text-scale-mode-hook #'diffs--define-fringe-bitmap t)
     (outline-minor-mode -1)
     (diffs--undecorate)))
 
@@ -639,12 +696,21 @@ WIDTH is the number-column width; ROLE is `old' or `new'."
                     (propertize "\n" 'face 'diffs-filler)
                   "\n"))
         (when (memq kind '(ctx del add filler))
-          (put-text-property
-           beg (point) 'line-prefix
-           (propertize (if num (format fmt num) empty)
-                       'face (if (eq kind 'filler)
-                                 '(diffs-line-number diffs-filler)
-                               'diffs-line-number))))
+          (let* ((indicator (pcase kind
+                              ('del (and (eq role 'old) ?-))
+                              ('add (and (eq role 'new) ?+))))
+                 (fringe (diffs--fringe-prefix indicator)))
+            (when (or diffs-line-numbers (not (string-empty-p fringe)))
+              (put-text-property
+               beg (point) 'line-prefix
+               (concat
+                fringe
+                (when diffs-line-numbers
+                  (propertize
+                   (if num (format fmt num) empty)
+                   'face (if (eq kind 'filler)
+                             '(diffs-line-number diffs-filler)
+                           'diffs-line-number))))))))
         (when src
           (put-text-property beg (point) 'diffs-src (cons file src)))))))
 
@@ -700,8 +766,10 @@ in lockstep."
 
 (define-derived-mode diffs-split-mode special-mode "diffs-split"
   "Major mode for one side of the diffs side-by-side view."
+  (diffs--define-fringe-bitmap)
   (setq truncate-lines t)
   (setq-local cursor-in-non-selected-windows nil)
+  (add-hook 'text-scale-mode-hook #'diffs--define-fringe-bitmap nil t)
   (add-hook 'post-command-hook #'diffs--split-post-command nil t)
   (add-hook 'window-scroll-functions #'diffs--split-scroll-hook nil t))
 

@@ -46,6 +46,35 @@
       (diffs-minor-mode -1)
       (should (equal (buffer-string) text)))))
 
+(ert-deftest diffs-unified-view-adds-theme-native-fringe-bars ()
+  (let ((diffs-line-numbers nil))
+    (diffs-tests--with-diff diffs-tests--normal
+      (diffs-minor-mode 1)
+      (should (fringe-bitmap-p 'diffs-fringe-bar))
+      (goto-char (point-min))
+      (re-search-forward "^-(message")
+      (let ((prefix (get-text-property (line-beginning-position)
+                                       'line-prefix)))
+        (should (equal (get-text-property 0 'display prefix)
+                       '(left-fringe diffs-fringe-bar
+                         diff-indicator-removed))))
+      (re-search-forward "^+(message")
+      (let ((prefix (get-text-property (line-beginning-position)
+                                       'line-prefix)))
+        (should (equal (get-text-property 0 'display prefix)
+                       '(left-fringe diffs-fringe-bar
+                         diff-indicator-added)))))))
+
+(ert-deftest diffs-fringe-bars-can-be-disabled ()
+  (let ((diffs-line-numbers nil)
+        (diffs-fringe-bars nil))
+    (diffs-tests--with-diff diffs-tests--normal
+      (diffs-minor-mode 1)
+      (goto-char (point-min))
+      (re-search-forward "^-(message")
+      (should-not
+       (get-text-property (line-beginning-position) 'line-prefix)))))
+
 (ert-deftest diffs-decodes-git-quoted-file-name ()
   (diffs-tests--with-diff
       (concat
@@ -171,6 +200,22 @@
           (should (> (with-current-buffer old-buf
                        (count-lines (point-min) (point-max)))
                      3))
+          (with-current-buffer old-buf
+            (goto-char (point-min))
+            (re-search-forward "aaaa")
+            (let ((prefix (get-text-property (line-beginning-position)
+                                             'line-prefix)))
+              (should (equal (get-text-property 0 'display prefix)
+                             '(left-fringe diffs-fringe-bar
+                               diff-indicator-removed)))))
+          (with-current-buffer new-buf
+            (goto-char (point-min))
+            (re-search-forward "bbbb")
+            (let ((prefix (get-text-property (line-beginning-position)
+                                             'line-prefix)))
+              (should (equal (get-text-property 0 'display prefix)
+                             '(left-fringe diffs-fringe-bar
+                               diff-indicator-added)))))
           (diffs-split-quit)
           (should (eq (window-buffer) buf))
           (should-not (buffer-live-p old-buf))

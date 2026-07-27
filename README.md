@@ -4,10 +4,10 @@ Fast, pretty file-level diff viewing for Emacs, inspired by
 [diffs.com](https://diffs.com/).
 
 A rendering layer on top of `diff-mode`: old/new line-number columns,
-no `+`/`-` marker noise, compact styled file and hunk headers,
-full-width line backgrounds, word-level refinement, lazy
-source-language syntax highlighting, and a two-window side-by-side
-view with synchronized scrolling.
+no `+`/`-` marker noise, colored fringe bars, compact styled file and
+hunk headers, full-width line backgrounds, word-level refinement,
+lazy source-language syntax highlighting, and a two-window
+side-by-side view with synchronized scrolling.
 
 Pure Elisp — no external renderer. Compared to delta/magit-delta:
 
@@ -61,6 +61,9 @@ line numbers are available throughout.
 - `diffs-split-fontify-threshold` — above this many lines, the split
   view fontifies the visible region instead of the whole buffer.
 - `diffs-split-wrap-lines` — wrap long split rows with aligned fillers.
+- `diffs-fringe-bars` — show theme-native added/removed bars in the
+  left fringe.
+- `diffs-fringe-bar-width` — set the bar width in pixels.
 
 ## Integrations
 

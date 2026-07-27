@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 — 2026-07-27
+
+- Add full-height, theme-native fringe bars for added and removed lines.
+- Show the bars in unified and side-by-side views, including wrapped rows.
+- Scale the fringe bitmap with text size and line spacing.
+
 ## 0.3.0 — 2026-07-27
 
 - Preserve and display metadata-only changes such as renames and mode changes.
