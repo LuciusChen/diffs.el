@@ -31,10 +31,25 @@ Pure Elisp — no external renderer. Compared to delta/magit-delta:
 | `diffs-commit` | Show a commit (Git) |
 | `diffs-commit-at-line` | Show the commit that last touched the current line |
 | `diffs-minor-mode` | Use the renderer in any diff-mode buffer |
+| `diffs-toggle-index` | Toggle the changed-file index side window |
 
 Inside the unified view: `n`/`p` hunks, `N`/`P` files, `TAB` folds on
-headings, `RET` jumps to source, `s` toggles the side-by-side view,
-`g` refreshes, `q` quits.
+headings, `RET` jumps to source, `i` toggles the changed-file index,
+`s` toggles the side-by-side view, `g` refreshes, `q` quits.
+
+## Changed-file index and sticky context
+
+The header line stays pinned to the file and hunk at the top of the
+window.  It shows the current file position (`[3/42]`), per-file
+addition/deletion counts, hunk line starts, and the hunk's function
+context when available.
+
+Press `i` to open a left side window containing only files present in
+the diff—not the complete repository tree.  Each entry includes
+addition/deletion counts and follows the current file while the diff
+scrolls.  In the index, `n`/`p` preview adjacent files without moving
+focus, `RET` or mouse-1 visits a file, and `i`/`q` hides the index.
+The index remains available with the side-by-side view.
 
 ## Side-by-side view
 
@@ -66,13 +81,14 @@ to a split with the same width is effectively immediate.
 - `diffs-split-wrap-lines` — wrap long split rows with aligned fillers.
 - `diffs-split-full-width-backgrounds` — extend split-view added and
   removed backgrounds across the complete row.
+- `diffs-index-width` — set the changed-file index width in columns.
 - `diffs-fringe-bars` — show theme-native added/removed bars in the
   left fringe.
 - `diffs-fringe-bar-width` — set the bar width in pixels.
 
 On an M-series Mac running Emacs 32, the included synthetic benchmark
 (800 files, 22,000 lines, 528 KB) measures about 15 ms for scanning,
-310 ms for the first side-by-side render, and 0.3 ms for a cached
+330 ms for the first side-by-side render, and 0.7 ms for a cached
 toggle.  This includes line numbers, aligned wrapping, and fringe bars;
 syntax/refine fontification is limited to the visible region at this
 size.  Run it on your machine with:

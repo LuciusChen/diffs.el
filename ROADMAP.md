@@ -12,6 +12,8 @@ features that improve an interactive Emacs review workflow.
   refinement, source syntax faces, synchronized scrolling, source
   navigation, hunk/file navigation, folding, theme-native colors, and
   full-height fringe bars.
+- Sticky file/hunk context and a toggleable changed-file index with
+  per-file stats and current-file tracking.
 - Lazy unified rendering and visible-region fontification for large
   diffs, with cached side-by-side buffers on repeated toggles.
 - Native access to isearch, copy/yank, `diff-goto-source`,
@@ -19,9 +21,7 @@ features that improve an interactive Emacs review workflow.
 
 ## P0 — large-review fundamentals
 
-1. **File index and sticky context.**  Add a project-diff file sidebar
-   with per-file stats and keep the current file/hunk title visible
-   while scrolling.
+1. ~~**File index and sticky context.**~~ Completed in 0.5.0.
 2. **Expandable unchanged context.**  Retain or retrieve complete file
    contents so collapsed gaps can expand by a few lines or all the way
    to the next hunk.
@@ -52,4 +52,4 @@ features that improve an interactive Emacs review workflow.
    source-file items beside patches and make file headers, gutters, and
    hunk separators replaceable without advising internals.
 
-The next implementation target is P0.1: file index plus sticky context.
+The next implementation target is P0.2: expandable unchanged context.

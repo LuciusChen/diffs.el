@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0 — 2026-07-27
+
+- Add a toggleable changed-file index side window with per-file stats,
+  current-file tracking, keyboard preview, RET navigation, and mouse
+  navigation.
+- Add sticky file and hunk context to unified and side-by-side headers.
+- Cache section positions in a vector for fast header and index lookup.
+- Preserve index visibility while entering and leaving side-by-side
+  views.
+
 ## 0.4.1 — 2026-07-27
 
 - Extend split-view added and removed backgrounds through the

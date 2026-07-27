@@ -24,6 +24,17 @@
    "rename from old.el\n"
    "rename to new.el\n"))
 
+(defconst diffs-tests--two-files
+  (concat
+   diffs-tests--normal
+   "diff --git a/bar.el b/bar.el\n"
+   "index 3333333..4444444 100644\n"
+   "--- a/bar.el\n"
+   "+++ b/bar.el\n"
+   "@@ -10 +10 @@ bar-function\n"
+   "-old bar\n"
+   "+new bar\n"))
+
 (defmacro diffs-tests--with-diff (text &rest body)
   (declare (indent 1) (debug t))
   `(with-temp-buffer
@@ -44,7 +55,91 @@
     (let* ((section (car diffs--sections))
            (hunks (plist-get section :hunks)))
       (should (= (length hunks) 1))
-      (should (= (nth 3 (car hunks)) (plist-get section :end))))))
+      (should (= (nth 3 (car hunks)) (plist-get section :end)))
+      (should (equal (nth 4 (car hunks)) "")))))
+
+(ert-deftest diffs-sticky-header-follows-file-and-hunk-position ()
+  (diffs-tests--with-diff diffs-tests--two-files
+    (diffs--scan)
+    (let* ((section (aref diffs--section-vector 1))
+           (hunk (car (plist-get section :hunks))))
+      (goto-char (1+ (car hunk)))
+      (let ((header (diffs--header-line)))
+        (should (string-match-p "bar\\.el" header))
+        (should (string-match-p "\\[2/2\\]" header))
+        (should (string-match-p (regexp-quote "−10 +10") header))
+        (should (string-match-p "bar-function" header))))))
+
+(ert-deftest diffs-changed-file-index-previews-and-visits-files ()
+  (let ((owner (generate-new-buffer " *diffs index owner*"))
+        index second)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer owner)
+          (insert diffs-tests--two-files)
+          (diff-mode)
+          (diffs-minor-mode 1)
+          (setq second (aref diffs--section-vector 1))
+          (diffs-toggle-index)
+          (setq index diffs--index-buffer)
+          (should (buffer-live-p index))
+          (should (get-buffer-window index))
+          (with-current-buffer index
+            (should (derived-mode-p 'diffs-index-mode))
+            (should (= (count-lines (point-min) (point-max)) 2))
+            (should (equal
+                     (plist-get (get-text-property
+                                 (point-min) 'diffs-index-section)
+                                :file)
+                     "foo.el")))
+          (select-window (get-buffer-window index))
+          (goto-char (point-min))
+          (diffs-index-next-file)
+          (should (eq (diffs--index-section-at-point) second))
+          (should (= (overlay-start diffs--index-current-overlay)
+                     (line-beginning-position)))
+          (with-current-buffer owner
+            (should (= (point) (plist-get second :beg))))
+          (diffs-index-visit)
+          (should (eq (current-buffer) owner))
+          (diffs-toggle-index)
+          (should-not (get-buffer-window index))
+          (diffs-minor-mode -1)
+          (should-not (buffer-live-p index)))
+      (dolist (buffer (list index owner))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest diffs-index-visibility-survives-split-layout-restoration ()
+  (let ((owner (generate-new-buffer " *diffs index split owner*"))
+        (diffs-index-width 24)
+        index)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer owner)
+          (insert diffs-tests--two-files)
+          (diff-mode)
+          (diffs-minor-mode 1)
+          (diffs-toggle-index)
+          (setq index diffs--index-buffer)
+          (diffs-toggle-split)
+          (should (get-buffer-window index))
+          (diffs-toggle-index)
+          (should-not (get-buffer-window index))
+          (diffs-split-quit)
+          (should (eq (current-buffer) owner))
+          (should-not (get-buffer-window index))
+          (diffs-toggle-split)
+          (diffs-toggle-index)
+          (should (get-buffer-window index))
+          (diffs-split-quit)
+          (should (eq (current-buffer) owner))
+          (should (get-buffer-window index))
+          (diffs-toggle-index)
+          (diffs-minor-mode -1))
+      (dolist (buffer (list index owner))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
 
 (ert-deftest diffs-decoration-preserves-buffer-text ()
   (diffs-tests--with-diff diffs-tests--normal
@@ -254,6 +349,14 @@
              (diffs-tests--face-includes-p
               (get-text-property (line-end-position) 'face)
               'diffs-split-removed-line))
+            (should (equal (get-text-property (point) 'diffs-file)
+                           "foo.el"))
+            (should (get-text-property (point) 'diffs-hunk))
+            (cl-letf (((symbol-function 'get-buffer-window)
+                       (lambda (&rest _) nil)))
+              (should (string-match-p
+                       (regexp-quote "foo.el")
+                       (diffs--split-header-line))))
             (should
              (eq (face-attribute
                   'diffs-split-removed-line :extend nil 'default)
