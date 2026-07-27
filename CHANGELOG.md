@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 — 2026-07-27
+
+- Cache side-by-side buffers so repeated toggles reuse the rendered view.
+- Stream wrapped rows directly into the old/new buffers instead of
+  materializing another pair of full row lists.
+- Reuse short line strings and cache hunk end positions to reduce
+  allocation and avoid repeated hunk-list searches.
+- Add a reproducible 2,200/22,000-line benchmark and performance
+  regression coverage.
+- Document the prioritized feature gaps against diffs.com.
+
 ## 0.3.1 — 2026-07-27
 
 - Add full-height, theme-native fringe bars for added and removed lines.

@@ -1,6 +1,6 @@
 EMACS ?= emacs
 
-.PHONY: test compile check
+.PHONY: test compile check benchmark
 
 test:
 	$(EMACS) -Q --batch -L . -L test -l diffs-tests \
@@ -14,3 +14,6 @@ compile:
 	      (byte-compile-file "diffs.el")))'
 
 check: test compile
+
+benchmark:
+	$(EMACS) -Q --batch -L . -l test/diffs-benchmark.el

@@ -4,7 +4,7 @@
 
 ;; Author: Lucius Chen
 ;; URL: https://github.com/LuciusChen/diffs.el
-;; Version: 0.3.1
+;; Version: 0.4.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: vc, tools
 
@@ -176,7 +176,7 @@ the background in any theme.")
 (defvar-local diffs--sections nil
   "List of file-section plists built by `diffs--scan'.
 Each element: (:beg N :block-end N :end N :file S :adds N :dels N
-:width N :hunks ((POS OLD-START NEW-START) ...)).")
+:width N :hunks ((POS OLD-START NEW-START END) ...)).")
 
 (defvar-local diffs--revision nil
   "Reference revision this buffer was generated against, or nil.")
@@ -284,7 +284,7 @@ Return a section plist; see `diffs--sections'."
                                                    section-end t)
                                 (line-beginning-position))
                            section-end))))
-          (push (list (line-beginning-position) old new) hunks)
+          (push (list (line-beginning-position) old new hend) hunks)
           (setq max-line (max max-line (+ old oldc) (+ new newc)))
           (cl-incf adds (count-matches "^\\+" (line-end-position) hend))
           (cl-incf dels (count-matches "^-" (line-end-position) hend)))))
@@ -355,8 +355,7 @@ Return a section plist; see `diffs--sections'."
 
 (defun diffs--hunk-end (hunk sec)
   "Return the end position of HUNK in section SEC."
-  (let ((rest (cdr (memq hunk (plist-get sec :hunks)))))
-    (if rest (caar rest) (plist-get sec :end))))
+  (or (nth 3 hunk) (plist-get sec :end)))
 
 (defun diffs--decorate-hunk (hunk end width &optional rbeg rend)
   "Decorate HUNK (see `diffs--sections') ending at END.
@@ -469,6 +468,7 @@ non-nil, only apply properties to lines intersecting that region."
 (defun diffs-quit ()
   "Quit the diffs view, restoring the previous window layout."
   (interactive)
+  (diffs--split-cache-clear)
   (if (window-configuration-p diffs--window-configuration)
       (progn
         (bury-buffer)
@@ -488,6 +488,9 @@ non-nil, only apply properties to lines intersecting that region."
 (defvar-local diffs--regenerator nil
   "Function that regenerates this buffer's diff, for `diffs-refresh'.")
 
+(defvar-local diffs--split-cache nil
+  "Cached side-by-side buffers and the render key that produced them.")
+
 ;;;###autoload
 (define-minor-mode diffs-minor-mode
   "Pretty rendering for `diff-mode' buffers.
@@ -501,6 +504,7 @@ hunk headers, and enables outline folding (TAB on headings).
       (progn
         (diffs--define-fringe-bitmap)
         (add-hook 'text-scale-mode-hook #'diffs--define-fringe-bitmap nil t)
+        (add-hook 'kill-buffer-hook #'diffs--split-cache-clear nil t)
         (setq-local diff-font-lock-prettify nil)
         (when (eq diff-font-lock-syntax t)
           (setq-local diff-font-lock-syntax 'hunk-also))
@@ -512,6 +516,8 @@ hunk headers, and enables outline folding (TAB on headings).
         (outline-minor-mode 1))
     (jit-lock-unregister #'diffs--jit-decorate)
     (remove-hook 'text-scale-mode-hook #'diffs--define-fringe-bitmap t)
+    (remove-hook 'kill-buffer-hook #'diffs--split-cache-clear t)
+    (diffs--split-cache-clear)
     (outline-minor-mode -1)
     (diffs--undecorate)))
 
@@ -538,12 +544,31 @@ hunk headers, and enables outline folding (TAB on headings).
 
 (defvar diffs--split-syncing nil)
 
+(defun diffs--split-cache-clear ()
+  "Kill cached split buffers belonging to the current unified buffer."
+  (when diffs--split-cache
+    (dolist (key '(:old :new))
+      (when-let* ((buffer (plist-get diffs--split-cache key)))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))
+    (setq diffs--split-cache nil)))
+
 (defun diffs--bake-overlay-faces ()
   "Copy overlay faces (refine, syntax) into text properties."
   (with-silent-modifications
     (dolist (o (overlays-in (point-min) (point-max)))
       (when-let* ((face (overlay-get o 'face)))
         (add-face-text-property (overlay-start o) (overlay-end o) face nil)))))
+
+(defun diffs--visible-region ()
+  "Return the visible buffer region, including in batch frames."
+  (let ((beg (window-start)))
+    (cons beg
+          (or (window-end nil t)
+              (save-excursion
+                (goto-char beg)
+                (forward-line (window-body-height))
+                (point))))))
 
 (defun diffs--split-line (pos)
   "Return the line at POS as a string, without marker, with properties."
@@ -626,7 +651,11 @@ for RET, KIND one of header, sep, ctx, del, add, filler."
 
 (defun diffs--split-string (string width)
   "Split STRING into property-preserving chunks of display WIDTH."
-  (if (string-empty-p string)
+  (if (or (string-empty-p string)
+          ;; `string-width' treats TAB as one column, so use this fast
+          ;; path only for the overwhelmingly common TAB-free case.
+          (and (not (string-search "\t" string))
+               (<= (string-width string) width)))
       (list string)
     (let ((start 0)
           chunks)
@@ -678,41 +707,97 @@ Return (OLD-WRAPPED NEW-WRAPPED)."
      old-rows new-rows)
     (list (nreverse old-wrapped) (nreverse new-wrapped))))
 
+(defun diffs--split-insert-row
+    (str num src kind file width role &optional fmt empty)
+  "Insert one split row described by STR, NUM, SRC, KIND and FILE.
+WIDTH is the number-column width; ROLE is `old' or `new'."
+  (let ((fmt (or fmt (format "%%%dd " width)))
+        (empty (or empty (make-string (1+ width) ?\s))))
+    (let ((beg (point)))
+      (insert str)
+      (let ((face (pcase kind
+                    ('del (and (eq role 'old) 'diff-removed))
+                    ('add (and (eq role 'new) 'diff-added))
+                    ('filler 'diffs-filler))))
+        (when face
+          (add-face-text-property beg (point) face t)))
+      (insert (if (eq kind 'filler)
+                  (propertize "\n" 'face 'diffs-filler)
+                "\n"))
+      (when (memq kind '(ctx del add filler))
+        (let* ((indicator (pcase kind
+                            ('del (and (eq role 'old) ?-))
+                            ('add (and (eq role 'new) ?+))))
+               (fringe (diffs--fringe-prefix indicator)))
+          (when (or diffs-line-numbers (not (string-empty-p fringe)))
+            (put-text-property
+             beg (point) 'line-prefix
+             (concat
+              fringe
+              (when diffs-line-numbers
+                (propertize
+                 (if num (format fmt num) empty)
+                 'face (if (eq kind 'filler)
+                           '(diffs-line-number diffs-filler)
+                         'diffs-line-number))))))))
+      (when src
+        (put-text-property beg (point) 'diffs-src (cons file src))))))
+
 (defun diffs--split-render (rows width role)
   "Insert ROWS into the current buffer.
 WIDTH is the number-column width; ROLE is `old' or `new'."
   (let ((fmt (format "%%%dd " width))
         (empty (make-string (1+ width) ?\s)))
     (pcase-dolist (`(,str ,num ,src ,kind ,file) rows)
-      (let ((beg (point)))
-        (insert str)
-        (let ((face (pcase kind
-                      ('del (and (eq role 'old) 'diff-removed))
-                      ('add (and (eq role 'new) 'diff-added))
-                      ('filler 'diffs-filler))))
-          (when face
-            (add-face-text-property beg (point) face t)))
-        (insert (if (eq kind 'filler)
-                    (propertize "\n" 'face 'diffs-filler)
-                  "\n"))
-        (when (memq kind '(ctx del add filler))
-          (let* ((indicator (pcase kind
-                              ('del (and (eq role 'old) ?-))
-                              ('add (and (eq role 'new) ?+))))
-                 (fringe (diffs--fringe-prefix indicator)))
-            (when (or diffs-line-numbers (not (string-empty-p fringe)))
-              (put-text-property
-               beg (point) 'line-prefix
-               (concat
-                fringe
-                (when diffs-line-numbers
-                  (propertize
-                   (if num (format fmt num) empty)
-                   'face (if (eq kind 'filler)
-                             '(diffs-line-number diffs-filler)
-                           'diffs-line-number))))))))
-        (when src
-          (put-text-property beg (point) 'diffs-src (cons file src)))))))
+      (diffs--split-insert-row
+       str num src kind file width role fmt empty))))
+
+(defun diffs--split-render-pair
+    (old-rows new-rows width content-width old-buffer new-buffer)
+  "Render OLD-ROWS and NEW-ROWS directly into their paired buffers.
+WIDTH is the number-column width and CONTENT-WIDTH is the wrapping
+width.  Return the rendered hunk anchor line numbers."
+  (let ((fmt (format "%%%dd " width))
+        (empty (make-string (1+ width) ?\s))
+        (line 0)
+        anchors)
+    (cl-mapc
+     (lambda (old new)
+       (let* ((wrap (and diffs-split-wrap-lines
+                         (not (memq (nth 3 old) '(header sep)))))
+              (old-chunks (if wrap
+                              (diffs--split-string (car old) content-width)
+                            (list (car old))))
+              (new-chunks (if wrap
+                              (diffs--split-string (car new) content-width)
+                            (list (car new))))
+              (count (max (length old-chunks) (length new-chunks))))
+         (when (eq (nth 3 old) 'sep)
+           (push (1+ line) anchors))
+         (dotimes (index count)
+           (let ((old-chunk (pop old-chunks))
+                 (new-chunk (pop new-chunks)))
+             (with-current-buffer old-buffer
+               (if old-chunk
+                   (diffs--split-insert-row
+                    old-chunk (and (zerop index) (nth 1 old))
+                    (nth 2 old) (nth 3 old) (nth 4 old)
+                    width 'old fmt empty)
+                 (diffs--split-insert-row
+                  "" nil nil 'filler (nth 4 old)
+                  width 'old fmt empty)))
+             (with-current-buffer new-buffer
+               (if new-chunk
+                   (diffs--split-insert-row
+                    new-chunk (and (zerop index) (nth 1 new))
+                    (nth 2 new) (nth 3 new) (nth 4 new)
+                    width 'new fmt empty)
+                 (diffs--split-insert-row
+                  "" nil nil 'filler (nth 4 new)
+                  width 'new fmt empty))))
+           (cl-incf line))))
+     old-rows new-rows)
+    (nreverse anchors)))
 
 (defun diffs--split-sync-from (window &optional start)
   "Align the window(s) paired with WINDOW to its scroll position.
@@ -817,72 +902,114 @@ in lockstep."
   "Leave the side-by-side view and return to the unified view."
   (interactive)
   (let ((old (current-buffer))
-        (other diffs--split-other))
-    (when (window-configuration-p diffs--split-window-configuration)
-      (set-window-configuration diffs--split-window-configuration)
-      (setq diffs--split-window-configuration nil))
-    (when (buffer-live-p other) (kill-buffer other))
-    (when (buffer-live-p old) (kill-buffer old))))
+        (other diffs--split-other)
+        (configuration diffs--split-window-configuration))
+    (when (window-configuration-p configuration)
+      (set-window-configuration configuration))
+    ;; Keep the rendered pair alive.  The owning unified buffer kills it
+    ;; when the diff changes, is refreshed, or is itself killed.
+    (dolist (buffer (list old other))
+      (when (buffer-live-p buffer)
+        (bury-buffer buffer)))))
 
 (defun diffs-toggle-split ()
   "Toggle between the unified and the side-by-side view."
   (interactive)
   (unless diffs-minor-mode
     (user-error "Not in a diffs buffer"))
-  (if (<= (count-lines (point-min) (point-max)) diffs-split-fontify-threshold)
-      (progn (font-lock-ensure)
-             (diffs--bake-overlay-faces))
-    (let ((beg (window-start))
-          (end (or (window-end nil t) (point-max))))
-      (font-lock-ensure beg end)
-      (diffs--bake-overlay-faces)
-      (message "diffs: large diff — carrying visible refine/syntax faces")))
   (let* ((unified (current-buffer))
-         (width (apply #'max 2 (mapcar (lambda (s) (plist-get s :width))
-                                       diffs--sections)))
-         (collected (diffs--split-collect))
-         (old-buf (generate-new-buffer (concat (buffer-name unified) ":old")))
-         (new-buf (generate-new-buffer (concat (buffer-name unified) ":new")))
-         (dir default-directory)
-         (configuration (current-window-configuration))
-         (w1 (or (get-buffer-window unified) (selected-window)))
-         (w2 (progn
-               (set-window-buffer w1 old-buf)
-               (split-window w1 nil 'right))))
-    (set-window-buffer w2 new-buf)
-    (let* ((content-width
-            (max 8 (- (min (window-body-width w1)
-                           (window-body-width w2))
-                      width 1)))
-           (rows (if diffs-split-wrap-lines
-                     (diffs--split-wrap-rows
-                      (nth 0 collected) (nth 1 collected) content-width)
-                   (list (nth 0 collected) (nth 1 collected))))
-           (old-rows (nth 0 rows))
-           (new-rows (nth 1 rows))
-           (anchors (cl-loop for row in old-rows
-                             for line from 1
-                             when (eq (nth 3 row) 'sep)
-                             collect line)))
-      (dolist (spec (list (list old-buf old-rows 'old new-buf)
-                          (list new-buf new-rows 'new old-buf)))
-        (with-current-buffer (nth 0 spec)
-          (diffs--split-render (nth 1 spec) width (nth 2 spec))
-          (goto-char (point-min))
-          (diffs-split-mode)
-          (setq default-directory dir)
-          (setq-local diffs--split-unified unified)
-          (setq-local diffs--split-anchors anchors)
-          (setq-local diffs--split-other (nth 3 spec))
-          (setq-local diffs--split-window-configuration configuration)
-          (setq header-line-format
-                (list (format " %s" (if (eq (nth 2 spec) 'old)
-                                        (or (buffer-local-value
-                                             'diffs--revision unified)
-                                            "old")
-                                      "new")))))))
-    (select-window w2)
-    (diffs--split-sync-from w2)))
+         (line-count (count-lines (point-min) (point-max)))
+         (modified-tick (buffer-chars-modified-tick))
+         (wrap-lines diffs-split-wrap-lines)
+         (show-line-numbers diffs-line-numbers)
+         (show-fringe-bars diffs-fringe-bars)
+         (fringe-bar-width diffs-fringe-bar-width)
+         (source-tab-width tab-width))
+    (let* ((cached diffs--split-cache)
+           (old-buf (plist-get cached :old))
+           (new-buf (plist-get cached :new)))
+      (unless (and (buffer-live-p old-buf) (buffer-live-p new-buf))
+        (diffs--split-cache-clear)
+        (setq old-buf
+              (generate-new-buffer (concat (buffer-name unified) ":old"))
+              new-buf
+              (generate-new-buffer (concat (buffer-name unified) ":new"))
+              diffs--split-cache
+              (list :old old-buf :new new-buf)))
+      (let* ((width
+              (apply #'max 2
+                     (mapcar (lambda (s) (plist-get s :width))
+                             diffs--sections)))
+             (dir default-directory)
+             (configuration (current-window-configuration))
+             (w1 (or (get-buffer-window unified) (selected-window)))
+             (w2 (progn
+                   (set-window-buffer w1 old-buf)
+                   (split-window w1 nil 'right))))
+        (set-window-buffer w2 new-buf)
+        (let* ((content-width
+                (max 8 (- (min (window-body-width w1)
+                               (window-body-width w2))
+                          width 1)))
+               (key (list modified-tick
+                          content-width width
+                          wrap-lines
+                          show-line-numbers
+                          show-fringe-bars
+                          fringe-bar-width
+                          source-tab-width))
+               anchors)
+          (if (equal key (plist-get diffs--split-cache :key))
+              (setq anchors (plist-get diffs--split-cache :anchors))
+            (with-current-buffer unified
+              (if (<= line-count diffs-split-fontify-threshold)
+                  (font-lock-ensure)
+                (pcase-let ((`(,beg . ,end) (diffs--visible-region)))
+                  (font-lock-ensure beg end)
+                  (message
+                   "diffs: large diff — carrying visible refine/syntax faces")))
+              (diffs--bake-overlay-faces))
+            (dolist (buffer (list old-buf new-buf))
+              (with-current-buffer buffer
+                (let ((inhibit-read-only t))
+                  (fundamental-mode)
+                  (erase-buffer))))
+            (let ((collected (with-current-buffer unified
+                               (diffs--split-collect))))
+              (let ((diffs-split-wrap-lines wrap-lines)
+                    (diffs-line-numbers show-line-numbers)
+                    (diffs-fringe-bars show-fringe-bars)
+                    (diffs-fringe-bar-width fringe-bar-width)
+                    (tab-width source-tab-width))
+                (setq anchors
+                      (diffs--split-render-pair
+                       (nth 0 collected) (nth 1 collected)
+                       width content-width old-buf new-buf))))
+            (setq diffs--split-cache
+                  (list :key key :anchors anchors
+                        :old old-buf :new new-buf)))
+          (dolist (spec (list (list old-buf 'old new-buf)
+                              (list new-buf 'new old-buf)))
+            (with-current-buffer (nth 0 spec)
+              (goto-char (point-min))
+              (unless (derived-mode-p 'diffs-split-mode)
+                (diffs-split-mode))
+              (setq default-directory dir)
+              (setq-local diffs--split-unified unified)
+              (setq-local diffs--split-anchors anchors)
+              (setq-local diffs--split-other (nth 2 spec))
+              (setq-local diffs--split-window-configuration configuration)
+              (setq header-line-format
+                    (list
+                     (format
+                      " %s"
+                      (if (eq (nth 1 spec) 'old)
+                          (or (buffer-local-value
+                               'diffs--revision unified)
+                              "old")
+                        "new")))))))
+        (select-window w2)
+        (diffs--split-sync-from w2)))))
 
 ;;;; Diff generation
 

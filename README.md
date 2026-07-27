@@ -13,7 +13,7 @@ Pure Elisp — no external renderer. Compared to delta/magit-delta:
 
 - No renderer subprocess and no ANSI parsing.  (The commands still use
   VC/Git to produce their input.)  Opening a diff costs one cheap scan
-  (≈20 ms for 22k lines / 800 files); on large diffs even the decorations
+  (≈15 ms for 22k lines / 800 files); on large diffs even the decorations
   are applied lazily through jit-lock, so only what you see is rendered.
 - The diff text is never modified: `diff-goto-source` (RET), isearch,
   `diff-apply-hunk` and the rest of diff-mode keep working; line
@@ -49,10 +49,11 @@ Long lines wrap to aligned physical rows, so one side never drifts away
 from the other.  Set `diffs-split-wrap-lines` to nil to use truncated
 lines and horizontal scrolling instead.
 
-Very large diffs split instantly without up-front whole-buffer
-fontification (see `diffs-split-fontify-threshold`).  Refine and syntax
-faces from the visible region are retained; alignment, diff colors and
-line numbers are available throughout.
+Very large diffs avoid up-front whole-buffer fontification (see
+`diffs-split-fontify-threshold`).  Refine and syntax faces from the
+visible region are retained; alignment, diff colors and line numbers
+are available throughout.  The rendered pair is cached, so returning
+to a split with the same width is effectively immediate.
 
 ## Performance knobs
 
@@ -64,6 +65,17 @@ line numbers are available throughout.
 - `diffs-fringe-bars` — show theme-native added/removed bars in the
   left fringe.
 - `diffs-fringe-bar-width` — set the bar width in pixels.
+
+On an M-series Mac running Emacs 32, the included synthetic benchmark
+(800 files, 22,000 lines, 528 KB) measures about 15 ms for scanning,
+310 ms for the first side-by-side render, and 0.3 ms for a cached
+toggle.  This includes line numbers, aligned wrapping, and fringe bars;
+syntax/refine fontification is limited to the visible region at this
+size.  Run it on your machine with:
+
+```sh
+make benchmark
+```
 
 ## Integrations
 
@@ -115,3 +127,6 @@ Run the ERT suite with:
 ```sh
 make test
 ```
+
+See [ROADMAP.md](ROADMAP.md) for the current feature-gap audit against
+diffs.com and the planned development order.

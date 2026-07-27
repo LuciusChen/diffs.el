@@ -36,7 +36,10 @@
     (diffs--scan)
     (should (equal diffs--stats '(1 2 1)))
     (should (equal (plist-get (car diffs--sections) :file) "foo.el"))
-    (should (= (length (plist-get (car diffs--sections) :hunks)) 1))))
+    (let* ((section (car diffs--sections))
+           (hunks (plist-get section :hunks)))
+      (should (= (length hunks) 1))
+      (should (= (nth 3 (car hunks)) (plist-get section :end))))))
 
 (ert-deftest diffs-decoration-preserves-buffer-text ()
   (diffs-tests--with-diff diffs-tests--normal
@@ -172,9 +175,15 @@
     (should (eq (get-text-property 0 'face (car chunks))
                 'font-lock-string-face))))
 
+(ert-deftest diffs-split-string-reuses-an-unwrapped-string ()
+  (let* ((source (propertize "short" 'face 'font-lock-string-face))
+         (chunks (diffs--split-string source 80)))
+    (should (= (length chunks) 1))
+    (should (eq (car chunks) source))))
+
 (ert-deftest diffs-split-view-wraps-and-restores-window-layout ()
   (let ((buf (generate-new-buffer " *diffs split test*"))
-        old-buf new-buf)
+        old-buf new-buf old-tick new-tick)
     (unwind-protect
         (save-window-excursion
           (switch-to-buffer buf)
@@ -216,8 +225,28 @@
               (should (equal (get-text-property 0 'display prefix)
                              '(left-fringe diffs-fringe-bar
                                diff-indicator-added)))))
+          (setq old-tick
+                (with-current-buffer old-buf
+                  (buffer-chars-modified-tick))
+                new-tick
+                (with-current-buffer new-buf
+                  (buffer-chars-modified-tick)))
           (diffs-split-quit)
           (should (eq (window-buffer) buf))
+          (should (buffer-live-p old-buf))
+          (should (buffer-live-p new-buf))
+          (diffs-toggle-split)
+          (should (eq (current-buffer) new-buf))
+          (should (eq diffs--split-other old-buf))
+          (should (= old-tick
+                     (with-current-buffer old-buf
+                       (buffer-chars-modified-tick))))
+          (should (= new-tick
+                     (with-current-buffer new-buf
+                       (buffer-chars-modified-tick))))
+          (diffs-split-quit)
+          (with-current-buffer buf
+            (diffs-minor-mode -1))
           (should-not (buffer-live-p old-buf))
           (should-not (buffer-live-p new-buf)))
       (dolist (buffer (list old-buf new-buf buf))
