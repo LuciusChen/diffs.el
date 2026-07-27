@@ -4,7 +4,7 @@
 
 ;; Author: Lucius Chen
 ;; URL: https://github.com/LuciusChen/diffs.el
-;; Version: 0.4.0
+;; Version: 0.4.1
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: vc, tools
 
@@ -98,6 +98,13 @@ rows added to the shorter side as necessary."
 Values outside the range 1 through 8 are clamped."
   :type 'integer)
 
+(defcustom diffs-split-full-width-backgrounds t
+  "When non-nil, extend split-view change backgrounds across each row.
+The line-number gutter receives the same theme-native background.
+Word-level `diff-refine-added' and `diff-refine-removed' faces
+remain layered above it."
+  :type 'boolean)
+
 (defcustom diffs-fullscreen t
   "When non-nil, the diffs view takes over the whole frame.
 `diffs-quit' (bound to \\`q') restores the previous window layout."
@@ -132,6 +139,20 @@ Values outside the range 1 through 8 are clamped."
   "Face for alignment filler lines in the side-by-side view.
 Inherits `hl-line': a tint close to, but distinguishable from,
 the background in any theme.")
+
+(defface diffs-split-added-line
+  '((t :inherit diff-added :extend t))
+  "Full-width added-line face in the side-by-side view.")
+
+(defface diffs-split-removed-line
+  '((t :inherit diff-removed :extend t))
+  "Full-width removed-line face in the side-by-side view.")
+
+(defun diffs--split-line-prefix-face (change-face)
+  "Return the line-number face, optionally layered over CHANGE-FACE."
+  (if change-face
+      (list 'diffs-line-number change-face)
+    'diffs-line-number))
 
 (defun diffs--define-fringe-bitmap ()
   "Define the full-height bitmap used by `diffs-fringe-bars'."
@@ -716,18 +737,34 @@ WIDTH is the number-column width; ROLE is `old' or `new'."
     (let ((beg (point)))
       (insert str)
       (let ((face (pcase kind
-                    ('del (and (eq role 'old) 'diff-removed))
-                    ('add (and (eq role 'new) 'diff-added))
+                    ('del (and (eq role 'old)
+                               (if diffs-split-full-width-backgrounds
+                                   'diffs-split-removed-line
+                                 'diff-removed)))
+                    ('add (and (eq role 'new)
+                               (if diffs-split-full-width-backgrounds
+                                   'diffs-split-added-line
+                                 'diff-added)))
                     ('filler 'diffs-filler))))
+        (insert (if (eq kind 'filler)
+                    (propertize "\n" 'face 'diffs-filler)
+                  "\n"))
         (when face
-          (add-face-text-property beg (point) face t)))
-      (insert (if (eq kind 'filler)
-                  (propertize "\n" 'face 'diffs-filler)
-                "\n"))
+          (add-face-text-property
+           beg
+           (if (or diffs-split-full-width-backgrounds (eq kind 'filler))
+               (point)
+             (max beg (1- (point))))
+           face t)))
       (when (memq kind '(ctx del add filler))
         (let* ((indicator (pcase kind
                             ('del (and (eq role 'old) ?-))
                             ('add (and (eq role 'new) ?+))))
+               (change-face (pcase indicator
+                              (?+ (and diffs-split-full-width-backgrounds
+                                       'diffs-split-added-line))
+                              (?- (and diffs-split-full-width-backgrounds
+                                       'diffs-split-removed-line))))
                (fringe (diffs--fringe-prefix indicator)))
           (when (or diffs-line-numbers (not (string-empty-p fringe)))
             (put-text-property
@@ -739,9 +776,10 @@ WIDTH is the number-column width; ROLE is `old' or `new'."
                  (if num (format fmt num) empty)
                  'face (if (eq kind 'filler)
                            '(diffs-line-number diffs-filler)
-                         'diffs-line-number))))))))
+                         (diffs--split-line-prefix-face
+                          change-face))))))))
       (when src
-        (put-text-property beg (point) 'diffs-src (cons file src))))))
+        (put-text-property beg (point) 'diffs-src (cons file src)))))))
 
 (defun diffs--split-render (rows width role)
   "Insert ROWS into the current buffer.
@@ -924,6 +962,7 @@ in lockstep."
          (show-line-numbers diffs-line-numbers)
          (show-fringe-bars diffs-fringe-bars)
          (fringe-bar-width diffs-fringe-bar-width)
+         (full-width-backgrounds diffs-split-full-width-backgrounds)
          (source-tab-width tab-width))
     (let* ((cached diffs--split-cache)
            (old-buf (plist-get cached :old))
@@ -957,6 +996,7 @@ in lockstep."
                           show-line-numbers
                           show-fringe-bars
                           fringe-bar-width
+                          full-width-backgrounds
                           source-tab-width))
                anchors)
           (if (equal key (plist-get diffs--split-cache :key))
@@ -980,6 +1020,8 @@ in lockstep."
                     (diffs-line-numbers show-line-numbers)
                     (diffs-fringe-bars show-fringe-bars)
                     (diffs-fringe-bar-width fringe-bar-width)
+                    (diffs-split-full-width-backgrounds
+                     full-width-backgrounds)
                     (tab-width source-tab-width))
                 (setq anchors
                       (diffs--split-render-pair
@@ -994,6 +1036,8 @@ in lockstep."
               (goto-char (point-min))
               (unless (derived-mode-p 'diffs-split-mode)
                 (diffs-split-mode))
+              (setq-local diffs-split-full-width-backgrounds
+                          full-width-backgrounds)
               (setq default-directory dir)
               (setq-local diffs--split-unified unified)
               (setq-local diffs--split-anchors anchors)

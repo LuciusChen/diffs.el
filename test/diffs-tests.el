@@ -31,6 +31,11 @@
      (diff-mode)
      ,@body))
 
+(defun diffs-tests--face-includes-p (value face)
+  "Return non-nil when face VALUE includes FACE."
+  (or (eq value face)
+      (and (listp value) (memq face value))))
+
 (ert-deftest diffs-scan-counts-files-and-lines ()
   (diffs-tests--with-diff diffs-tests--normal
     (diffs--scan)
@@ -77,6 +82,30 @@
       (re-search-forward "^-(message")
       (should-not
        (get-text-property (line-beginning-position) 'line-prefix)))))
+
+(ert-deftest diffs-split-full-width-backgrounds-can-be-disabled ()
+  (let ((diffs-split-full-width-backgrounds nil))
+    (with-temp-buffer
+      (diffs--split-insert-row "new" 1 1 'add "foo.el" 2 'new)
+      (goto-char (point-min))
+      (let* ((prefix (get-text-property (point) 'line-prefix))
+             (prefix-face
+              (get-text-property (1- (length prefix)) 'face prefix)))
+        (should-not
+         (diffs-tests--face-includes-p prefix-face 'diff-added))
+        (should-not
+         (diffs-tests--face-includes-p
+          (get-text-property (line-end-position) 'face)
+          'diff-added))))))
+
+(ert-deftest diffs-split-keeps-refinement-above-the-line-background ()
+  (with-temp-buffer
+    (diffs--split-insert-row
+     (propertize "new" 'face 'diff-refine-added)
+     1 1 'add "foo.el" 2 'new)
+    (let ((faces (get-text-property (point-min) 'face)))
+      (should (eq (car faces) 'diff-refine-added))
+      (should (memq 'diffs-split-added-line faces)))))
 
 (ert-deftest diffs-decodes-git-quoted-file-name ()
   (diffs-tests--with-diff
@@ -216,7 +245,19 @@
                                              'line-prefix)))
               (should (equal (get-text-property 0 'display prefix)
                              '(left-fringe diffs-fringe-bar
-                               diff-indicator-removed)))))
+                               diff-indicator-removed)))
+              (should
+               (diffs-tests--face-includes-p
+                (get-text-property (1- (length prefix)) 'face prefix)
+                'diffs-split-removed-line)))
+            (should
+             (diffs-tests--face-includes-p
+              (get-text-property (line-end-position) 'face)
+              'diffs-split-removed-line))
+            (should
+             (eq (face-attribute
+                  'diffs-split-removed-line :extend nil 'default)
+                 t)))
           (with-current-buffer new-buf
             (goto-char (point-min))
             (re-search-forward "bbbb")
@@ -224,7 +265,19 @@
                                              'line-prefix)))
               (should (equal (get-text-property 0 'display prefix)
                              '(left-fringe diffs-fringe-bar
-                               diff-indicator-added)))))
+                               diff-indicator-added)))
+              (should
+               (diffs-tests--face-includes-p
+                (get-text-property (1- (length prefix)) 'face prefix)
+                'diffs-split-added-line)))
+            (should
+             (diffs-tests--face-includes-p
+              (get-text-property (line-end-position) 'face)
+              'diffs-split-added-line))
+            (should
+             (eq (face-attribute
+                  'diffs-split-added-line :extend nil 'default)
+                 t)))
           (setq old-tick
                 (with-current-buffer old-buf
                   (buffer-chars-modified-tick))

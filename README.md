@@ -41,9 +41,11 @@ headings, `RET` jumps to source, `s` toggles the side-by-side view,
 `s` splits the frame into two synchronized windows — old on the left,
 new on the right — with row-perfect alignment (dimmed filler bands pad
 insertions and deletions), per-side line numbers, and the refinement
-and syntax faces carried over from the unified view.  `n`/`p` move by
-hunk in both windows, `RET` visits the source, `q` or `s` returns to
-the unified view and restores the window layout.
+and syntax faces carried over from the unified view.  Theme-native
+added/removed backgrounds cover the line-number gutter and extend to
+the right edge.  `n`/`p` move by hunk in both windows, `RET` visits the
+source, `q` or `s` returns to the unified view and restores the window
+layout.
 
 Long lines wrap to aligned physical rows, so one side never drifts away
 from the other.  Set `diffs-split-wrap-lines` to nil to use truncated
@@ -62,6 +64,8 @@ to a split with the same width is effectively immediate.
 - `diffs-split-fontify-threshold` — above this many lines, the split
   view fontifies the visible region instead of the whole buffer.
 - `diffs-split-wrap-lines` — wrap long split rows with aligned fillers.
+- `diffs-split-full-width-backgrounds` — extend split-view added and
+  removed backgrounds across the complete row.
 - `diffs-fringe-bars` — show theme-native added/removed bars in the
   left fringe.
 - `diffs-fringe-bar-width` — set the bar width in pixels.

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1 — 2026-07-27
+
+- Extend split-view added and removed backgrounds through the
+  line-number gutter and to the right edge of the window.
+- Keep fringe bars and word-level refinement layered above the
+  full-width, theme-native change backgrounds.
+- Add `diffs-split-full-width-backgrounds` to restore text-only split
+  backgrounds when desired.
+
 ## 0.4.0 — 2026-07-27
 
 - Cache side-by-side buffers so repeated toggles reuse the rendered view.
