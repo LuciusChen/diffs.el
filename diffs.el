@@ -4,7 +4,7 @@
 
 ;; Author: Lucius Chen
 ;; URL: https://github.com/LuciusChen/diffs.el
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: vc, tools
 
@@ -14,7 +14,7 @@
 ;; old/new line-number columns, no +/- marker noise, styled file and
 ;; hunk headers, full-width line backgrounds, word-level refinement,
 ;; source-language syntax highlighting, and a two-window side-by-side
-;; view with synchronized scrolling.
+;; view with synchronized scrolling and aligned long-line wrapping.
 ;;
 ;; Everything is implemented with text properties on top of the
 ;; unmodified diff text, so `diff-goto-source', isearch, `diff-apply-hunk'
@@ -41,6 +41,7 @@
 (require 'diff-mode)
 (require 'vc)
 (require 'cl-lib)
+(require 'subr-x)
 
 (declare-function vc-git-command "vc-git")
 (declare-function vc-git-root "vc-git")
@@ -69,7 +70,7 @@
 (defcustom diffs-lazy-threshold 10000
   "Decorate lazily via jit-lock when the diff has more lines than this.
 Lazy decoration makes huge diffs open instantly.  Set to 0 to
-always decorate lazily, or to most-positive-fixnum to always
+always decorate lazily, or to `most-positive-fixnum' to always
 decorate eagerly."
   :type 'natnum)
 
@@ -80,6 +81,12 @@ word-level refinement and syntax highlighting must be computed for
 the whole diff up front.  Beyond this many lines that would be
 slow; the split is built instantly with the diff colors only."
   :type 'natnum)
+
+(defcustom diffs-split-wrap-lines t
+  "When non-nil, wrap long side-by-side rows while preserving alignment.
+Both sides receive the same number of physical rows, with filler
+rows added to the shorter side as necessary."
+  :type 'boolean)
 
 (defcustom diffs-fullscreen t
   "When non-nil, the diffs view takes over the whole frame.
@@ -148,19 +155,69 @@ Each element: (:beg N :block-end N :end N :file S :adds N :dels N
       (forward-line 1))
     (point)))
 
+(defun diffs--decode-git-path (path)
+  "Decode PATH from Git's double-quoted pathname representation."
+  (if (multibyte-string-p path)
+      path
+    (decode-coding-string
+     path
+     (or file-name-coding-system
+         default-file-name-coding-system
+         locale-coding-system
+         'utf-8))))
+
+(defun diffs--git-path-token (text &optional start)
+  "Read one Git pathname token from TEXT at START.
+Return (PATH . END), where END is the next position in TEXT."
+  (when-let* ((start (string-match "[^ \t]" text (or start 0))))
+    (if (eq (aref text start) ?\")
+        (condition-case nil
+            (pcase-let* ((`(,path . ,end) (read-from-string text start)))
+              (cons (diffs--decode-git-path path) end))
+          (error nil))
+      (let ((end (or (string-match "[ \t]" text start) (length text))))
+        (cons (substring text start end) end)))))
+
+(defun diffs--strip-git-prefix (path)
+  "Strip Git's a/ or b/ prefix from PATH."
+  (if (string-match-p "\\`[ab]/" path)
+      (substring path 2)
+    path))
+
+(defun diffs--git-header-paths ()
+  "Return the old and new paths from a `diff --git' line at point."
+  (when (looking-at "^diff --git \\(.*\\)$")
+    (let* ((text (match-string-no-properties 1))
+           (old (diffs--git-path-token text))
+           (new (and old (diffs--git-path-token text (cdr old)))))
+      (when new
+        (list (diffs--strip-git-prefix (car old))
+              (diffs--strip-git-prefix (car new)))))))
+
+(defun diffs--file-name-from-marker (block-end)
+  "Return the new pathname from a +++ marker before BLOCK-END."
+  (save-excursion
+    (when (re-search-forward "^\\+\\+\\+ \\(.+\\)$" block-end t)
+      (let* ((text (match-string-no-properties 1))
+             (path (if (string-prefix-p "\"" text)
+                       (car (diffs--git-path-token text))
+                     (car (split-string text "\t")))))
+        (unless (equal path "/dev/null")
+          (diffs--strip-git-prefix path))))))
+
 (defun diffs--file-name-at-header (block-end)
   "Extract the file name from the header block between point and BLOCK-END."
   (save-excursion
-    (cond
-     ((looking-at "^diff --git \"?a/\\(?:.*\\)\"? \"?b/\\(.*?\\)\"?$")
-      (match-string-no-properties 1))
-     ((re-search-forward "^\\+\\+\\+ \"?\\([^\t\n\"]+\\)\"?" block-end t)
-      (let ((name (match-string-no-properties 1)))
-        (if (string-match "\\`[ab]/" name)
-            (substring name 2)
-          name)))
-     ((looking-at "^\\(?:diff\\|Index:\\) .*?\\([^ \t/]+\\)$")
-      (match-string-no-properties 1)))))
+    (let ((git-paths (diffs--git-header-paths)))
+      (cond
+       (git-paths (cadr git-paths))
+       ((diffs--file-name-from-marker block-end))
+       ((looking-at "^diff --\\(?:cc\\|combined\\) \\(.+\\)$")
+        (let ((path (car (diffs--git-path-token
+                          (match-string-no-properties 1)))))
+          (and path (diffs--strip-git-prefix path))))
+       ((looking-at "^\\(?:diff\\|Index:\\) .*?\\([^ \t/]+\\)$")
+        (match-string-no-properties 1))))))
 
 (defun diffs--scan-section (section-end)
   "Scan the file section starting at point, up to SECTION-END.
@@ -231,7 +288,13 @@ Return a section plist; see `diffs--sections'."
 
 (defun diffs--decorate-header (sec)
   "Display the header block of section SEC as one styled line."
-  (let* ((line (concat
+  (let* ((end (if (plist-get sec :hunks)
+                  (plist-get sec :block-end)
+                (save-excursion
+                  (goto-char (plist-get sec :beg))
+                  (forward-line 1)
+                  (point))))
+         (line (concat
                 (propertize (concat "── " (or (plist-get sec :file) "?") "  ")
                             'face 'diffs-file-header)
                 (propertize (format "+%d" (plist-get sec :adds))
@@ -240,7 +303,7 @@ Return a section plist; see `diffs--sections'."
                 (propertize (format "−%d" (plist-get sec :dels))
                             'face 'diffs-file-stats-removed)
                 "\n")))
-    (diffs--put (plist-get sec :beg) (plist-get sec :block-end)
+    (diffs--put (plist-get sec :beg) end
                 'display line)))
 
 (defun diffs--hunk-end (hunk sec)
@@ -346,7 +409,7 @@ non-nil, only apply properties to lines intersecting that region."
 
 ;;;; Minor mode
 
-(defvar diffs--window-configuration nil
+(defvar-local diffs--window-configuration nil
   "Window layout in effect before the diffs view was shown.")
 
 (defun diffs-quit ()
@@ -404,7 +467,7 @@ hunk headers, and enables outline folding (TAB on headings).
 
 ;;;; Side-by-side view
 
-(defvar diffs--split-window-configuration nil
+(defvar-local diffs--split-window-configuration nil
   "Window configuration saved before showing the split view.")
 
 (defvar-local diffs--split-other nil
@@ -453,6 +516,17 @@ for RET, KIND one of header, sep, ctx, del, add, filler."
                                     'face 'diffs-file-stats-removed))))
           (emit (list header nil nil 'header file)
                 (list header nil nil 'header file))
+          (unless (plist-get sec :hunks)
+            (save-excursion
+              (goto-char (plist-get sec :beg))
+              (forward-line 1)
+              (while (< (point) (plist-get sec :end))
+                (let ((text (buffer-substring
+                             (line-beginning-position)
+                             (line-end-position))))
+                  (emit (list text nil nil 'meta file)
+                        (list text nil nil 'meta file)))
+                (forward-line 1))))
           (dolist (hunk (plist-get sec :hunks))
             (push (1+ row) anchors)
             (let ((sep (propertize "⋯" 'face 'diffs-hunk-separator)))
@@ -492,6 +566,60 @@ for RET, KIND one of header, sep, ctx, del, add, filler."
                     (forward-line 1))
                   (flush))))))))
     (list (nreverse old-rows) (nreverse new-rows) (nreverse anchors))))
+
+(defun diffs--split-string (string width)
+  "Split STRING into property-preserving chunks of display WIDTH."
+  (if (string-empty-p string)
+      (list string)
+    (let ((start 0)
+          chunks)
+      (while (< start (length string))
+        (let ((end start)
+              (columns 0))
+          (catch 'line-full
+            (while (< end (length string))
+              (let* ((char (aref string end))
+                     (char-width
+                      (if (eq char ?\t)
+                          (- tab-width (% columns tab-width))
+                        (max 0 (char-width char)))))
+                (when (and (> (+ columns char-width) width) (> end start))
+                  (throw 'line-full nil))
+                (setq columns (+ columns char-width))
+                (cl-incf end))))
+          (when (= end start)
+            (cl-incf end))
+          (push (substring string start end) chunks)
+          (setq start end)))
+      (nreverse chunks))))
+
+(defun diffs--split-wrap-rows (old-rows new-rows width)
+  "Wrap OLD-ROWS and NEW-ROWS to WIDTH with row-perfect alignment.
+Return (OLD-WRAPPED NEW-WRAPPED)."
+  (let (old-wrapped new-wrapped)
+    (cl-mapc
+     (lambda (old new)
+       (if (memq (nth 3 old) '(header sep))
+           (progn
+             (push old old-wrapped)
+             (push new new-wrapped))
+         (let* ((old-chunks (diffs--split-string (car old) width))
+                (new-chunks (diffs--split-string (car new) width))
+                (count (max (length old-chunks) (length new-chunks))))
+           (dotimes (index count)
+             (cl-labels
+                 ((row (source chunks)
+                    (if-let* ((chunk (nth index chunks)))
+                        (list chunk
+                              (and (zerop index) (nth 1 source))
+                              (nth 2 source)
+                              (nth 3 source)
+                              (nth 4 source))
+                      (list "" nil nil 'filler (nth 4 source)))))
+               (push (row old old-chunks) old-wrapped)
+               (push (row new new-chunks) new-wrapped))))))
+     old-rows new-rows)
+    (list (nreverse old-wrapped) (nreverse new-wrapped))))
 
 (defun diffs--split-render (rows width role)
   "Insert ROWS into the current buffer.
@@ -548,7 +676,7 @@ in lockstep."
               (set-window-parameter w 'diffs--sync (cons pos vscroll)))))))))
 
 (defun diffs--split-scroll-hook (window start)
-  "Member of `window-scroll-functions' while a split view is shown."
+  "Synchronize WINDOW at START while a split view is shown."
   (unless diffs--split-syncing
     (let ((diffs--split-syncing t))
       (with-demoted-errors "diffs split sync: %S"
@@ -574,7 +702,8 @@ in lockstep."
   "Major mode for one side of the diffs side-by-side view."
   (setq truncate-lines t)
   (setq-local cursor-in-non-selected-windows nil)
-  (add-hook 'post-command-hook #'diffs--split-post-command nil t))
+  (add-hook 'post-command-hook #'diffs--split-post-command nil t)
+  (add-hook 'window-scroll-functions #'diffs--split-scroll-hook nil t))
 
 (defun diffs--split-move-to-anchor (next)
   "Move point to the next hunk anchor (previous when NEXT is nil)."
@@ -621,7 +750,6 @@ in lockstep."
   (interactive)
   (let ((old (current-buffer))
         (other diffs--split-other))
-    (remove-hook 'window-scroll-functions #'diffs--split-scroll-hook)
     (when (window-configuration-p diffs--split-window-configuration)
       (set-window-configuration diffs--split-window-configuration)
       (setq diffs--split-window-configuration nil))
@@ -636,42 +764,57 @@ in lockstep."
   (if (<= (count-lines (point-min) (point-max)) diffs-split-fontify-threshold)
       (progn (font-lock-ensure)
              (diffs--bake-overlay-faces))
-    (message "diffs: large diff — splitting without refine/syntax faces"))
+    (let ((beg (window-start))
+          (end (or (window-end nil t) (point-max))))
+      (font-lock-ensure beg end)
+      (diffs--bake-overlay-faces)
+      (message "diffs: large diff — carrying visible refine/syntax faces")))
   (let* ((unified (current-buffer))
          (width (apply #'max 2 (mapcar (lambda (s) (plist-get s :width))
                                        diffs--sections)))
          (collected (diffs--split-collect))
-         (anchors (nth 2 collected))
-         (old-buf (get-buffer-create (concat diffs-buffer-name ":old")))
-         (new-buf (get-buffer-create (concat diffs-buffer-name ":new")))
-         (dir default-directory))
-    (dolist (spec (list (list old-buf (nth 0 collected) 'old)
-                        (list new-buf (nth 1 collected) 'new)))
-      (with-current-buffer (nth 0 spec)
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (diffs--split-render (nth 1 spec) width (nth 2 spec)))
-        (goto-char (point-min))
-        (diffs-split-mode)
-        (setq default-directory dir)
-        (setq-local diffs--split-unified unified)
-        (setq-local diffs--split-anchors anchors)
-        (setq header-line-format
-              (list (format " %s" (if (eq (nth 2 spec) 'old)
-                                      (or (buffer-local-value 'diffs--revision
-                                                              unified)
-                                          "old")
-                                    "new"))))))
-    (with-current-buffer old-buf (setq-local diffs--split-other new-buf))
-    (with-current-buffer new-buf (setq-local diffs--split-other old-buf))
-    (setq diffs--split-window-configuration (current-window-configuration))
-    (add-hook 'window-scroll-functions #'diffs--split-scroll-hook)
-    (let* ((w1 (or (get-buffer-window unified) (selected-window)))
-           (w2 (progn (set-window-buffer w1 old-buf)
-                      (split-window w1 nil 'right))))
-      (set-window-buffer w2 new-buf)
-      (select-window w2)
-      (diffs--split-sync-from w2))))
+         (old-buf (generate-new-buffer (concat (buffer-name unified) ":old")))
+         (new-buf (generate-new-buffer (concat (buffer-name unified) ":new")))
+         (dir default-directory)
+         (configuration (current-window-configuration))
+         (w1 (or (get-buffer-window unified) (selected-window)))
+         (w2 (progn
+               (set-window-buffer w1 old-buf)
+               (split-window w1 nil 'right))))
+    (set-window-buffer w2 new-buf)
+    (let* ((content-width
+            (max 8 (- (min (window-body-width w1)
+                           (window-body-width w2))
+                      width 1)))
+           (rows (if diffs-split-wrap-lines
+                     (diffs--split-wrap-rows
+                      (nth 0 collected) (nth 1 collected) content-width)
+                   (list (nth 0 collected) (nth 1 collected))))
+           (old-rows (nth 0 rows))
+           (new-rows (nth 1 rows))
+           (anchors (cl-loop for row in old-rows
+                             for line from 1
+                             when (eq (nth 3 row) 'sep)
+                             collect line)))
+      (dolist (spec (list (list old-buf old-rows 'old new-buf)
+                          (list new-buf new-rows 'new old-buf)))
+        (with-current-buffer (nth 0 spec)
+          (diffs--split-render (nth 1 spec) width (nth 2 spec))
+          (goto-char (point-min))
+          (diffs-split-mode)
+          (setq default-directory dir)
+          (setq-local diffs--split-unified unified)
+          (setq-local diffs--split-anchors anchors)
+          (setq-local diffs--split-other (nth 3 spec))
+          (setq-local diffs--split-window-configuration configuration)
+          (setq header-line-format
+                (list (format " %s" (if (eq (nth 2 spec) 'old)
+                                        (or (buffer-local-value
+                                             'diffs--revision unified)
+                                            "old")
+                                      "new")))))))
+    (select-window w2)
+    (diffs--split-sync-from w2)))
 
 ;;;; Diff generation
 
@@ -680,6 +823,7 @@ in lockstep."
   (bound-and-true-p diff-hl-reference-revision))
 
 (defun diffs--header-line ()
+  "Return the summary displayed above a diffs buffer."
   (cl-destructuring-bind (&optional (files 0) (adds 0) (dels 0)) diffs--stats
     (concat
      " "
@@ -698,10 +842,6 @@ LINE, if non-nil, is the source line to move to.  REGENERATOR is
 stored for `diffs-refresh'."
   (with-current-buffer buf
     (goto-char (point-min))
-    (unless (re-search-forward "^@@ \\|^Binary files " nil t)
-      (kill-buffer buf)
-      (user-error "No changes"))
-    (goto-char (point-min))
     (diff-mode)
     (setq-local diff-vc-backend backend)
     (when rev
@@ -710,9 +850,14 @@ stored for `diffs-refresh'."
     (setq-local diffs--revision rev)
     (setq-local diffs--regenerator regenerator)
     (diffs-minor-mode 1)
+    (unless diffs--sections
+      (kill-buffer buf)
+      (user-error "No changes"))
     (setq header-line-format '((:eval (diffs--header-line)))))
   (unless (get-buffer-window buf)
-    (setq diffs--window-configuration (current-window-configuration)))
+    (let ((configuration (current-window-configuration)))
+      (with-current-buffer buf
+        (setq diffs--window-configuration configuration))))
   (pop-to-buffer buf)
   (when diffs-fullscreen
     (delete-other-windows))
@@ -791,7 +936,8 @@ Only supports Git."
               (user-error "Not in a Git repository")))
          (buf (diffs--prepare-buffer default-directory)))
     (apply #'vc-git-command buf 1 nil
-           `("show" ,rev "--" ,@(and file (list (file-relative-name file)))))
+           `("show" "--first-parent" ,rev "--"
+             ,@(and file (list (file-relative-name file)))))
     (diffs--present buf 'Git (format "%s^" rev) nil
                     (lambda () (diffs-commit rev file)))))
 
@@ -812,7 +958,7 @@ Blames the saved file, so save first for accurate results."
                                          "blame" "-L" (format "%d,%d" line line)
                                          "--porcelain" "--"
                                          (file-name-nondirectory file)))
-              (user-error "git blame failed (file not committed?)"))
+              (user-error "Git blame failed (file not committed?)"))
             (goto-char (point-min))
             (car (split-string (buffer-substring-no-properties
                                 (point) (line-end-position)))))))

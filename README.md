@@ -11,10 +11,10 @@ view with synchronized scrolling.
 
 Pure Elisp — no external renderer. Compared to delta/magit-delta:
 
-- No subprocess and no ANSI parsing.  Opening a diff costs one cheap
-  scan (≈20 ms for 22k lines / 800 files); on large diffs even the
-  decorations are applied lazily through jit-lock, so only what you
-  see is ever rendered.
+- No renderer subprocess and no ANSI parsing.  (The commands still use
+  VC/Git to produce their input.)  Opening a diff costs one cheap scan
+  (≈20 ms for 22k lines / 800 files); on large diffs even the decorations
+  are applied lazily through jit-lock, so only what you see is rendered.
 - The diff text is never modified: `diff-goto-source` (RET), isearch,
   `diff-apply-hunk` and the rest of diff-mode keep working; line
   numbers live in `line-prefix`, so copying and searching stay clean.
@@ -45,16 +45,22 @@ and syntax faces carried over from the unified view.  `n`/`p` move by
 hunk in both windows, `RET` visits the source, `q` or `s` returns to
 the unified view and restores the window layout.
 
-Very large diffs split instantly by skipping the up-front full
-fontification (see `diffs-split-fontify-threshold`); alignment, colors
-and numbers are unaffected.
+Long lines wrap to aligned physical rows, so one side never drifts away
+from the other.  Set `diffs-split-wrap-lines` to nil to use truncated
+lines and horizontal scrolling instead.
+
+Very large diffs split instantly without up-front whole-buffer
+fontification (see `diffs-split-fontify-threshold`).  Refine and syntax
+faces from the visible region are retained; alignment, diff colors and
+line numbers are available throughout.
 
 ## Performance knobs
 
 - `diffs-lazy-threshold` — above this many lines, decorations are
   applied per-region from jit-lock instead of eagerly.
 - `diffs-split-fontify-threshold` — above this many lines, the split
-  view skips whole-buffer refine/syntax fontification.
+  view fontifies the visible region instead of the whole buffer.
+- `diffs-split-wrap-lines` — wrap long split rows with aligned fillers.
 
 ## Integrations
 
@@ -89,3 +95,20 @@ for meow:
 
 The side-by-side buffers derive from `special-mode` and already get
 motion state by default.
+
+## Format handling
+
+Metadata-only Git changes such as renames and mode changes remain
+visible instead of being reported as an empty diff.  Quoted Git paths
+are decoded for source navigation.  Commit views use a first-parent
+two-way diff, including for merge commits, since the UI has an old and
+a new side.  A combined diff supplied directly remains visible as raw
+metadata instead of being hidden or rejected.
+
+## Development
+
+Run the ERT suite with:
+
+```sh
+make test
+```
