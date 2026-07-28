@@ -11,19 +11,19 @@
 
 ;;; Commentary:
 
-;; A rendering layer over `diff-mode' inspired by https://diffs.com/:
-;; old/new line-number columns, no +/- marker noise, styled file and
-;; hunk headers, full-width line backgrounds, word-level refinement,
-;; source-language syntax highlighting, and a two-window side-by-side
-;; view with synchronized scrolling and aligned long-line wrapping.
+;; A native review surface built on `diff-mode' and inspired by
+;; https://diffs.com/: old/new line-number columns, styled headers,
+;; full-width line backgrounds, source syntax, word-level refinement,
+;; inline comments, review decisions, and synchronized stacked or
+;; side-by-side layouts.
 ;;
-;; Everything is implemented with text properties on top of the
-;; unmodified diff text, so `diff-goto-source', isearch, `diff-apply-hunk'
-;; and the rest of the diff-mode machinery keep working.  Syntax
-;; highlighting stays lazy through jit-lock, and on large diffs the
-;; decorations themselves are applied lazily as well, so even huge
-;; diffs open instantly.  No external processes are used for
-;; rendering.
+;; The stacked buffer retains the unmodified patch as its source of
+;; truth, so `diff-goto-source', isearch, `diff-apply-hunk', and the rest
+;; of the diff-mode machinery keep working.  Indexed split buffers and
+;; review overlays derive from that owner state.  Syntax and decorations
+;; stay viewport-bounded on large reviews.  VC or Git produces patches;
+;; no external renderer is required.  Merge-conflict actions are
+;; separate guarded edits in the original language source buffer.
 ;;
 ;; Entry points:
 ;; - `diffs-file': current file against the reference revision.
@@ -34,6 +34,9 @@
 ;; - `diffs-conflicts': resolve merge markers in the current source
 ;;   buffer with Current, Incoming, Both, and Reset actions.
 ;; - `diffs-minor-mode': use the renderer in any diff-mode buffer.
+;; - `diffs-diff-hl-mode': render diff-hl hunk previews with diffs.el.
+;; - `diffs-review-install-agent-tools': install the live-session CLI
+;;   and Codex skill.
 ;; - `i' in the view: toggle the changed-file index.
 ;; - `e': incrementally reveal unchanged context.
 ;; - `s' in the view: toggle the side-by-side (split) view.
@@ -1606,16 +1609,6 @@ non-nil, only apply properties to lines intersecting that region."
             (when (and (< (car hunk) end) (> hend beg))
               (diffs--decorate-hunk hunk hend sec beg end)))))))
   `(jit-lock-bounds ,beg . ,end))
-
-(defun diffs--decorate ()
-  "Scan and decorate the whole buffer eagerly.  Sets `diffs--stats'."
-  (diffs--undecorate)
-  (diffs--scan)
-  (with-silent-modifications
-    (when diffs-prettify-headers
-      (dolist (sec diffs--sections)
-        (diffs--decorate-header sec))))
-  (diffs--decorate-eagerly))
 
 (defun diffs--decorate-setup ()
   "Scan the buffer and set up eager or lazy content decoration."

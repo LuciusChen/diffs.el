@@ -58,8 +58,8 @@ features that improve an interactive Emacs review workflow.
 
 ## P1 — review actions
 
-5. ~~**Line/range selection and annotations.**~~ Completed across the
-   0.9.0–0.11.0 work: stable file/side/line identities,
+5. ~~**Line/range selection and annotations.**~~ Completed in 0.12.0:
+   stable file/side/line identities,
    keyboard range selection, aligned inline annotations, Hunk-compatible
    sidecars, compact agent snapshots, atomic batch comments, and direct
    live-session access for coding agents.
@@ -67,11 +67,11 @@ features that improve an interactive Emacs review workflow.
    per-block and whole-hunk decisions, shared stacked/split previews,
    result line-number adjustment, reset, exact source validation, and
    explicit unsaved application.
-7. ~~**Merge-conflict view.**~~ Completed in 0.13.0 with an in-place
-   source-buffer presentation, Current/Incoming/Both/Reset transitions,
-   smerge-backed standard operations, two-way and diff3 parsing, stable
-   multi-block anchors, exact stale checks, atomic rollback, and normal
-   unsaved undo.
+7. ~~**Merge-conflict view.**~~ Implemented for the unreleased 0.13.0
+   with an in-place source-buffer presentation,
+   Current/Incoming/Both/Reset transitions, smerge-backed standard
+   operations, two-way and diff3 parsing, stable multi-block anchors,
+   exact stale checks, atomic rollback, and normal unsaved undo.
 
 ## P2 — extensibility and polish
 

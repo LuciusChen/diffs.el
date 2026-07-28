@@ -4,7 +4,7 @@
 
 ;; Author: Lucius Chen
 ;; URL: https://github.com/LuciusChen/diffs.el
-;; Version: 0.12.0
+;; Version: 0.13.0
 ;; Keywords: vc, tools
 
 ;;; Commentary:

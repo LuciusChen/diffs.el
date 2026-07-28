@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented for v0.8; awaiting hands-on user validation.
+Implemented and hands-on validated in v0.8.
 
 ## Problem
 

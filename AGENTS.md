@@ -194,7 +194,12 @@ Elisp and package-development rules adapted from the clutch development guide fo
 - Every release-relevant feature, bug fix, default, or public behavior change updates `CHANGELOG.md`.
 - Use `Unreleased` while a version is still being tested. Date it only when intentionally cutting the version.
 - Code is the source of truth when docs diverge; update docs immediately.
-- Prefer information structure over source-only rewrapping: focused paragraphs, short lists, and comparison tables.
+- Keep each semantic Markdown paragraph on one source line and let the renderer wrap it. Do not rewrap unchanged prose merely to fit a source-width column.
+- Fix information structure before line breaks: prefer focused headings, tables, short lists, and local rewrites over cosmetic source reflow.
+- For substantial README changes, make the opening explain what diffs.el is, who it serves, what problem it solves, and what the reader should do next. Keep Installation and Quick Start easy to find.
+- Lead with concrete user outcomes before implementation details. Avoid vague promotional claims, feature dumping, unnecessary badges, and calls to action.
+- Verify every documented command, capability, compatibility claim, metric, benchmark, and trust signal against code, metadata, tests, workflows, or release records. Clearly mark anything that remains unverified.
+- Keep documentation-only work documentation-only. Do not change product code, configuration, CI, or dependencies merely to make a documentation claim true unless the user explicitly requests it.
 - Significant workflow or architecture decisions should have a short record under `postmortem/` explaining why, alternatives, tradeoffs, deferred limits, and superseding decisions.
 
 ## Required Checks Before Commit

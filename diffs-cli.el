@@ -4,7 +4,7 @@
 
 ;; Author: Lucius Chen
 ;; URL: https://github.com/LuciusChen/diffs.el
-;; Version: 0.12.0
+;; Version: 0.13.0
 ;; Keywords: vc, tools
 
 ;;; Commentary:
@@ -62,7 +62,14 @@ CURRENT is the selector already parsed, if any."
 (defun diffs-cli--eval (form)
   "Evaluate FORM in the configured live Emacs server."
   (condition-case error-data
-      (server-eval-at diffs-cli--server form)
+      (let ((result (server-eval-at diffs-cli--server form)))
+        ;; `server-eval-at' transports returned strings as raw bytes.
+        ;; Review APIs return UTF-8 JSON, so decode that wire value before
+        ;; parsing or printing it in this command-line Emacs process.
+        (if (and (stringp result)
+                 (not (multibyte-string-p result)))
+            (decode-coding-string result 'utf-8)
+          result))
     (error
      (diffs-cli--fail
       "cannot use Emacs server %s: %s"

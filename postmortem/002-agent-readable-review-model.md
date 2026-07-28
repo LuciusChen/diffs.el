@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented and validated across the v0.9–v0.11 preview.
+Implemented and hands-on validated in v0.12.0.
 
 ## Problem
 

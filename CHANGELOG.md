@@ -2,6 +2,8 @@
 
 ## Unreleased (0.13.0)
 
+- Decode live-server JSON as UTF-8 at the session CLI boundary, preserving
+  CJK, emoji, and other non-ASCII text in both human and Agent comments.
 - Harden within-line refinement against the current diffs.com/jsdiff
   behavior with a two-sided `word-alt` edit sequence, Unicode
   whitespace handling, fast Unicode-character `char` comparison, a

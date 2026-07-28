@@ -30,8 +30,8 @@ trap cleanup EXIT HUP INT TERM
      (search-forward "+new")
      (beginning-of-line)
      (diffs-review-add-annotation
-      "Human CLI test note."
-      "This note exists only in the live owner buffer."))' >/dev/null
+      "中文 CLI 测试评论 😺"
+      "仅存在于 live owner buffer 中。"))' >/dev/null
 
 sessions=$("$repo_dir/bin/diffs" \
   --server "$server_name" session list --json)
@@ -44,13 +44,13 @@ human=$("$repo_dir/bin/diffs" \
   --server "$server_name" session comment list \
   --repo "$repo_dir" --type user --json)
 case $human in
-  *'"summary":"Human CLI test note."'*) ;;
-  *) echo "comment list could not read the live human note" >&2; exit 1 ;;
+  *'"summary":"中文 CLI 测试评论 😺"'*) ;;
+  *) echo "comment list corrupted the live UTF-8 human note" >&2; exit 1 ;;
 esac
 
 applied=$(
   printf '%s\n' \
-    '{"comments":[{"filePath":"live.el","oldLine":1,"summary":"Agent CLI test reply.","author":"cli-test"}]}' |
+    '{"comments":[{"filePath":"live.el","oldLine":1,"summary":"Agent 中文回复 🧪","author":"cli-test"}]}' |
     "$repo_dir/bin/diffs" --server "$server_name" \
       session comment apply --repo "$repo_dir" --stdin --json
 )
@@ -63,6 +63,6 @@ agent=$("$repo_dir/bin/diffs" \
   --server "$server_name" session comment list \
   --repo "$repo_dir" --type agent --json)
 case $agent in
-  *'"summary":"Agent CLI test reply."'*) ;;
-  *) echo "comment list could not read the live Agent reply" >&2; exit 1 ;;
+  *'"summary":"Agent 中文回复 🧪"'*) ;;
+  *) echo "comment list corrupted the live UTF-8 Agent reply" >&2; exit 1 ;;
 esac
