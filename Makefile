@@ -1,6 +1,7 @@
 EMACS ?= emacs
+EMACSCLIENT ?= emacsclient
 
-.PHONY: test compile check benchmark
+.PHONY: test session-cli-test compile check benchmark
 
 test:
 	$(EMACS) -Q --batch -L . -L test -l diffs-tests \
@@ -11,9 +12,14 @@ compile:
 	  --eval '(progn (require (quote bytecomp)) \
 	    (let ((byte-compile-dest-file-function \
 	           (lambda (_file) (make-temp-file "diffs-" nil ".elc")))) \
-	      (byte-compile-file "diffs.el")))'
+	      (mapc (function byte-compile-file) \
+	            (quote ("diffs.el" "diffs-cli.el" "diffs-assets.el")))))'
 
-check: test compile
+session-cli-test:
+	EMACS="$(EMACS)" EMACSCLIENT="$(EMACSCLIENT)" \
+	  ./test/run-session-cli.sh
+
+check: test session-cli-test compile
 
 benchmark:
 	$(EMACS) -Q --batch -L . -l test/diffs-benchmark.el

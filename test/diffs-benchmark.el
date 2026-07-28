@@ -18,8 +18,10 @@
         (insert (format "@@ -1,%d +1,%d @@\n" count count))
         (dotimes (line contexts)
           (insert (format " (message \"context %02d\")\n" line)))
-        (insert "-(message \"old value\")\n")
-        (insert "+(message \"new value\")\n")))
+        ;; Keep replacements unique so the within-line cache cannot make
+        ;; hundreds of files look like one comparison.
+        (insert (format "-(message \"old value %04d\")\n" file))
+        (insert (format "+(message \"new value %04d\")\n" file))))
     (buffer-string)))
 
 (defun diffs-benchmark--measure (name repetitions function)
@@ -31,6 +33,19 @@
              name repetitions
              (* 1000 (/ (nth 0 result) (float repetitions)))
              (nth 1 result) (nth 2 result)))))
+
+(defun diffs-benchmark--goto-first-change ()
+  "Move point to the first unresolved changed row in a split buffer."
+  (let ((index
+         (cl-position-if
+          (lambda (row)
+            (memq (nth 3 row) '(add del)))
+          diffs--split-rows)))
+    (unless index
+      (error "Benchmark input has no split change row"))
+    (goto-char (aref diffs--split-row-positions index))
+    (when-let* ((window (get-buffer-window (current-buffer))))
+      (diffs--split-materialize-window window))))
 
 (let* ((text (diffs-benchmark--input))
        (buffer (generate-new-buffer " *diffs-benchmark*")))
@@ -63,13 +78,53 @@
            (with-current-buffer (window-buffer)
              (diffs-split-quit))))
         (diffs-benchmark--measure
+         "deep viewport" 1
+         (lambda ()
+           (with-current-buffer buffer
+             (switch-to-buffer buffer)
+             (diffs-toggle-split))
+           (let* ((split (window-buffer))
+                  (window (get-buffer-window split)))
+             (with-current-buffer split
+               (let* ((count (length diffs--split-rows))
+                      (index (max 0 (- count 100)))
+                      (position
+                       (aref diffs--split-row-positions index)))
+                 (set-window-start window position)
+                 (diffs--split-materialize-window window)
+                 (diffs-split-quit))))))
+        (diffs-benchmark--measure
          "cached split" 10
          (lambda ()
            (with-current-buffer buffer
              (switch-to-buffer buffer)
              (diffs-toggle-split))
            (with-current-buffer (window-buffer)
-             (diffs-split-quit)))))
+             (diffs-split-quit))))
+        ;; Exercise the installed public commands from the primary split
+        ;; workflow.  Each action invalidates and rebuilds the decision-aware
+        ;; split, so these timings include the complete interactive path.
+        (with-current-buffer buffer
+          (switch-to-buffer buffer)
+          (diffs-toggle-split))
+        (with-current-buffer (window-buffer)
+          (diffs-benchmark--goto-first-change))
+        (diffs-benchmark--measure
+         "decision A (split)" 1
+         (lambda ()
+           (with-current-buffer (window-buffer)
+             (let ((inhibit-message t))
+               (diffs-review-accept-change)))))
+        (diffs-benchmark--measure
+         "decision R (split)" 1
+         (lambda ()
+           (with-current-buffer (window-buffer)
+             (let ((inhibit-message t))
+               (diffs-review-reject-change)))))
+        (with-current-buffer (window-buffer)
+          (let ((inhibit-message t))
+            (diffs-review-reset-change))
+          (diffs-split-quit)))
     (when (buffer-live-p buffer)
       (kill-buffer buffer))))
 

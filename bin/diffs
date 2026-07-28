@@ -1,0 +1,19 @@
+#!/bin/sh
+
+set -eu
+
+script_path=$0
+while [ -L "$script_path" ]; do
+  link_dir=$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd)
+  script_path=$(readlink "$script_path")
+  case $script_path in
+    /*) ;;
+    *) script_path=$link_dir/$script_path ;;
+  esac
+done
+script_dir=$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd)
+cli_file=$script_dir/diffs-cli.el
+if [ ! -f "$cli_file" ]; then
+  cli_file=$script_dir/../diffs-cli.el
+fi
+exec "${EMACS:-emacs}" -Q --script "$cli_file" -- "$@"

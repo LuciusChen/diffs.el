@@ -1,5 +1,182 @@
 # Changelog
 
+## Unreleased (0.13.0)
+
+- Harden within-line refinement against the current diffs.com/jsdiff
+  behavior with a two-sided `word-alt` edit sequence, Unicode
+  whitespace handling, fast Unicode-character `char` comparison, a
+  multilingual conformance corpus, and randomized Myers validation.
+- Add `diffs-conflicts`, an in-place stacked merge-conflict workflow
+  that preserves the source buffer's language major mode, syntax, and
+  language-tool state.
+- Add Current, Incoming, Both, and Reset transitions under `C-c C-d`
+  plus clickable action rows. Each transition is one undoable,
+  unsaved source edit; no action saves or stages the file.
+- Parse two-way and diff3 conflicts, including marker widths greater
+  than seven and final marker lines without a newline. Diff3 Base is
+  displayed but deliberately excluded from Both.
+- Keep length-changing, adjacent, and empty conflict blocks anchored
+  with markers plus stable identities; leave ordinary boundary edits
+  outside the blocks and route mouse actions to the clicked buffer.
+- Reject malformed, nested, and orphaned input before enabling the
+  mode, and prevent stale source text from being overwritten.
+- Preserve existing `smerge-mode` state and roll back source text,
+  choice state, modified state, and presentation if rendering fails.
+- Remove conflict presentation cleanly on major-mode changes and
+  reverts, with a post-command reprojection after undo or redo.
+- Refine conflict presentation with full accept-action labels, quieter
+  action rows, section-colored marker lines, explicit Current/Incoming
+  labels, stronger marker backgrounds, and matching fringe bars while
+  preserving raw marker text.
+- Delegate standard conflict matching and Current/Incoming resolution
+  to smerge's public engine. Keep diffs.el's strict validation,
+  persistent Reset, diff3 Both-without-Base operation, and extended
+  marker fallback as the thin product-specific layer.
+- Add `diffs-diff-hl-show-hunk` as a standard
+  `diff-hl-show-hunk-function` adapter. Mouse and keyboard hunk entry
+  render only the current hunk with diffs.el's line pairing,
+  marker-free line numbers, source syntax, and word refinement while
+  preserving diff-hl's inline or posframe placement and actions.
+  Hunk content follows `diffs-default-view`, independently rendering
+  aligned split columns or the stacked unified layout. Split previews
+  omit unnecessary trailing-column padding and reserve space at the
+  parent-window edge so posframe wrapping cannot create empty
+  continuation rows.
+- Add opt-in `diffs-diff-hl-mode` to save, use, and restore diff-hl's
+  prior display backend. `diffs-diff-hl-display-function` can override
+  that backend explicitly without changing diff-hl mouse maps.
+- Keep saved and unsaved file diffs on the same last-revision baseline,
+  preserve the source hunk when entering the default split view, use
+  diff-hl's public project reference cache from non-file entry buffers,
+  and surface positioning failures instead of silently ignoring them.
+- Load expanded unchanged context from the review's captured repository
+  root even if its buffer directory later changes, retry stale negative
+  caches after a package reload, and retain old/new loader errors for
+  actionable failure messages.
+
+## 0.12.0 — 2026-07-28
+
+- Add diffs.com-style accept/reject previews for individual contiguous
+  change blocks, with prefix-argument whole-hunk decisions.
+- Share resolution state across stacked and split layouts; collapse
+  resolved split blocks to the selected result and adjust later result
+  line numbers.
+- Add per-block and complete-review reset actions.
+- Add guarded batch application to source buffers with exact-content
+  validation, leaving every changed buffer unsaved and unstaged.
+- Revalidate source text after the apply confirmation prompt, reconcile
+  repeated decisions after source undo, and roll back multi-buffer
+  failures as one change group.
+- Track applied source state independently from preview decisions, so
+  resetting a decision preserves exact `RET` targets and later applies
+  across length-changing blocks.
+- Generate refreshes in a staging buffer so backend failures preserve
+  the live session and layout; support `g` directly from split view and
+  restore its side and source-row identity after success.
+- Roll back failures after refresh adoption without rerunning mode
+  hooks, restoring full narrowed owner state, retained split/index
+  buffers, and exact window positions.
+- Report explicit old/new hunk counts in review JSON and omit ranges for
+  zero-count sides, matching comment-target validation.
+- Synchronize split-view horizontal scrolling and paired cursor
+  positions, including semantic `C-a`/`C-e` movement on unequal lines.
+- Consolidate unchanged-context control on one-way `e` expansion in
+  both layouts, leaving `TAB` exclusively to Emacs hunk/outline folding.
+- Add a native read-only `diffs-mode` and suppressed major-mode map for
+  first-party stacked views, allowing modal editors to select motion
+  semantics without package-specific integration.
+- Prevent source-syntax temporary buffers from prompting for save when
+  unchanged context is expanded.
+- Remove the context-control row once every unchanged line is visible,
+  while keeping hunk navigation and resolution metadata.
+
+- Add stable live review session ids and unambiguous selection by
+  repository, working directory, or session id.
+- Add the pure-Elisp-backed `diffs session` CLI for direct, no-file
+  session discovery, compact review reads, human/agent comment
+  filtering, atomic stdin apply, removal, and guarded clearing.
+- Install durable CLI and Codex skill copies from package-manager-safe
+  root Elisp assets, avoiding links that break after straight/MELPA
+  rebuilds; honor `EMACS` throughout the launcher and session tests.
+- Validate every Agent comment field before mutation, roll back a batch
+  when UI projection fails, reject targets on zero-count hunk sides,
+  and serialize pending decision state as JSON `false`.
+- Validate known sidecar fields and every current-diff target before
+  import while ignoring unknown fields and preserving dual old/new
+  ranges for forward compatibility; make import, comment removal, and
+  clearing restore prior state when projection fails.
+- Preflight every Agent-tool install target and restore files,
+  permissions, links, and directories after a later write failure;
+  detect directory symlinks before following their referents.
+- Make the bundled Codex skill use live sessions exclusively instead of
+  temporary JSON exports.
+
+- Add stable one-based file/old-or-new-side/line-range selection from
+  the current line or an active region, shared by stacked and split
+  layouts.
+- Add inline review annotations with summary, rationale, author/source
+  metadata, navigation, removal, and row-aligned peer spacers in split
+  view.
+- Import and export Hunk-compatible version-1 review sidecars using
+  `oldRange` and `newRange`.
+- Expose compact machine-readable live review snapshots with optional
+  patch text and notes.
+- Accept Hunk-style agent targets by line, range, or hunk through an
+  atomic batch API that validates every comment before changing review
+  state.
+- Bundle a `diffs-review` agent skill that uses the running Emacs server
+  rather than scraping the rendered UI.
+- Avoid copying unified-view text properties into split rows, keeping
+  the 800-file first-split benchmark around 280 ms despite the added
+  stable review metadata and source-coordinate state.
+- Extend the large-review benchmark with public split-view `A`/`R`
+  decision rebuilds, and defer hidden stacked-overlay projection until
+  the user returns to stacked; on the 800-file fixture this reduces
+  those actions from about 943/1,016 ms to roughly 320/400 ms.
+
+## 0.8.0 — 2026-07-27
+
+- Virtualize side-by-side visual rendering while keeping both split
+  buffers' complete text immediately searchable and copyable.
+- Bulk-insert split text and use row/position vectors as the stable data
+  model for scrolling, source navigation, context rebuilds, and sticky
+  headers.
+- Materialize line backgrounds, gutters, fringe bars, source syntax
+  faces, and within-line emphasis for the viewport plus configurable
+  overscan, always updating both columns together.
+- Add `diffs-split-overscan` and remove the superseded
+  `diffs-split-fontify-threshold`.
+- Extend the large-diff benchmark with first-time deep-viewport
+  materialization.
+- Bind `e` in stacked and split views to reveal unchanged context
+  incrementally to completion while leaving `TAB` to hunk folding.
+
+## 0.7.0 — 2026-07-27
+
+- Replace Emacs's whole-hunk refinement with a native, cached
+  within-line renderer shared by unified and side-by-side views.
+- Add monotonic global alignment of corresponding removed and added
+  lines, so inserted or deleted rows do not shift every later
+  word-level comparison in a change block.
+- Add diffs.com-style `word-alt` rendering as the default, with
+  configurable `word`, `char`, and `none` alternatives.
+- Add configurable line-length, pairing-distance, block-size, and
+  whitespace limits with bounded fallback behavior.
+
+## 0.6.0 — 2026-07-27
+
+- Add lazy, cached, source-syntax-highlighted one-way expansion of
+  unchanged context with `e`, while preserving the original patch text.
+- Carry expanded context into aligned side-by-side columns.
+- Open in side-by-side mode by default; add `diffs-default-view` for
+  selecting the unified/stacked initial layout.
+- Make split-view `q` close both columns and quit the complete diff;
+  keep `s` as the layout toggle.
+- Truncate split-view long lines by default, with aligned wrapping
+  available through `diffs-split-wrap-lines`.
+- Resolve old/new file content across working-tree, commit, and rename
+  views.
+
 ## 0.5.0 — 2026-07-27
 
 - Add a toggleable changed-file index side window with per-file stats,
