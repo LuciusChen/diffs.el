@@ -32,9 +32,11 @@
 ;; - `diffs-commit-at-line': show the commit that last touched the
 ;;   current line (blame).
 ;; - `diffs-items': show unchanged source files and patches in one review.
-;; - `diffs-conflicts': resolve merge markers in the current source
+;; - `diffs-mode': open .diff and .patch files as native reviews.
+;; - `diffs-conflict-mode': resolve merge markers in the current source
 ;;   buffer with Current, Incoming, Both, and Reset actions.
-;; - `diffs-minor-mode': use the renderer in any diff-mode buffer.
+;; - `diffs-minor-mode': integrate the renderer into an external
+;;   diff-mode buffer.
 ;; - `diffs-diff-hl-mode': render diff-hl hunk previews with diffs.el.
 ;; - `diffs-review-install-agent-tools': install the live-session CLI
 ;;   and Codex skill.
@@ -81,6 +83,8 @@
 (defvar diffs-conflict-mode)
 (defvar diffs--split-unified)
 (defvar diffs--review-skill-content)
+(defvar diffs--mode-context nil
+  "Dynamically bound initialization context for `diffs-mode'.")
 
 (defgroup diffs nil
   "Pretty file-level diff viewing."
@@ -2623,7 +2627,27 @@ When SELECT is non-nil, select the unified diff window."
 This preserves `diff-mode' navigation and hunk commands while exposing
 review commands through a suppressed, view-oriented major-mode map.
 Use `diffs-minor-mode' to decorate an arbitrary external diff buffer."
-  (setq buffer-read-only t))
+  (setq buffer-read-only t)
+  (when diffs--mode-context
+    (setq-local diffs--item-ranges
+                (plist-get diffs--mode-context :item-ranges))
+    (setq-local diff-vc-backend
+                (plist-get diffs--mode-context :backend))
+    (let ((revision (plist-get diffs--mode-context :revision))
+          (target-revision
+           (plist-get diffs--mode-context :target-revision)))
+      (when (or revision target-revision)
+        (setq-local diff-vc-revisions
+                    (list revision target-revision)))
+      (setq-local diffs--revision revision)
+      (setq-local diffs--target-revision target-revision))
+    (setq-local diffs--regenerator
+                (plist-get diffs--mode-context :regenerator)))
+  (diffs-minor-mode 1))
+
+;;;###autoload
+(add-to-list 'auto-mode-alist
+             '("\\.\\(?:diff\\|patch\\)\\'" . diffs-mode))
 
 ;;;###autoload
 (define-minor-mode diffs-minor-mode
@@ -9126,6 +9150,7 @@ When BLOCK is nil, use the conflict at point."
 ;;;###autoload
 (define-minor-mode diffs-conflict-mode
   "Resolve merge conflicts in place while preserving the source major mode.
+Enabling validates every block and moves to the first conflict.
 \\<diffs-conflict-mode-map>
 Use \\[diffs-conflict-current], \\[diffs-conflict-incoming],
 \\[diffs-conflict-both], and \\[diffs-conflict-reset] to choose or reset
@@ -9134,32 +9159,18 @@ command saves or stages the file."
   :lighter " Conflicts"
   :keymap diffs-conflict-mode-map
   (if diffs-conflict-mode
-      (condition-case error-data
-          (diffs--conflict-setup)
-        (error
-         (setq diffs-conflict-mode nil)
-         (diffs--conflict-clear-state)
-         (signal (car error-data) (cdr error-data))))
+      (unless diffs--conflict-blocks
+        (condition-case error-data
+            (progn
+              (diffs--conflict-setup)
+              (goto-char
+               (marker-position
+                (plist-get (car diffs--conflict-blocks) :begin))))
+          (error
+           (setq diffs-conflict-mode nil)
+           (diffs--conflict-clear-state)
+           (signal (car error-data) (cdr error-data)))))
     (diffs--conflict-clear-state)))
-
-;;;###autoload
-(defun diffs-conflicts ()
-  "Enter in-place stacked merge-conflict resolution for this buffer."
-  (interactive)
-  (if diffs-conflict-mode
-      (progn
-        (diffs--conflict-refresh-overlays)
-        (setq diffs--conflict-current-id
-              (plist-get (car diffs--conflict-blocks) :id))
-        (goto-char
-         (marker-position
-          (plist-get (car diffs--conflict-blocks) :begin))))
-    (diffs-conflict-mode 1)
-    (setq diffs--conflict-current-id
-          (plist-get (car diffs--conflict-blocks) :id))
-    (goto-char
-     (marker-position
-      (plist-get (car diffs--conflict-blocks) :begin)))))
 
 (defun diffs-conflict-current ()
   "Replace the conflict at point with its Current section."
@@ -9350,15 +9361,13 @@ RETURN-MARKER independently preserves the source point for quit.
 ITEM-RANGES carries mixed-item identity from `diffs-items'."
   (with-current-buffer buf
     (goto-char (point-min))
-    (diffs-mode)
-    (setq-local diffs--item-ranges item-ranges)
-    (setq-local diff-vc-backend backend)
-    (when (or rev target-revision)
-      (setq-local diff-vc-revisions (list rev target-revision)))
-    (setq-local diffs--revision rev)
-    (setq-local diffs--target-revision target-revision)
-    (setq-local diffs--regenerator regenerator)
-    (diffs-minor-mode 1)
+    (let ((diffs--mode-context
+           (list :item-ranges item-ranges
+                 :backend backend
+                 :revision rev
+                 :target-revision target-revision
+                 :regenerator regenerator)))
+      (diffs-mode))
     (unless diffs--sections
       (kill-buffer buf)
       (user-error "No changes"))

@@ -17,8 +17,7 @@ keep-all action includes the base section of a diff3 conflict.
 
 ## Decision
 
-`diffs-conflicts` enables a source-buffer-local
-`diffs-conflict-mode`.
+`diffs-conflict-mode` is the complete source-buffer-local entry. Enabling it validates the buffer, installs the presentation, and moves to the first conflict. Disabling it removes the presentation while leaving source edits intact; no wrapper command owns a second lifecycle.
 
 - The source buffer remains in its language major mode.  A minor mode
   adds a stacked action row and theme-native Current, Base, Incoming,

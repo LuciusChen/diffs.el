@@ -1303,6 +1303,21 @@
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest diffs-patch-files-enter-the-native-review-mode ()
+  (dolist (extension '("diff" "patch"))
+    (with-temp-buffer
+      (setq buffer-file-name
+            (expand-file-name
+             (format "diffs-mode-entry.%s" extension)
+             temporary-file-directory))
+      (insert diffs-tests--hidden-context)
+      (set-auto-mode)
+      (should (eq major-mode 'diffs-mode))
+      (should (derived-mode-p 'diff-mode))
+      (should diffs-minor-mode)
+      (should diffs--sections)
+      (should buffer-read-only))))
+
 (ert-deftest diffs-minor-mode-keeps-an-external-diff-editable ()
   (diffs-tests--with-diff diffs-tests--hidden-context
     (diffs-minor-mode 1)
@@ -4277,7 +4292,7 @@
             (lambda ()
               (cl-incf lower-calls)
               (funcall keep-lower))))
-        (diffs-conflicts)
+        (diffs-conflict-mode 1)
         (should
          (cl-every
           (lambda (block)
@@ -4304,7 +4319,7 @@
             (lambda ()
               (cl-incf match-calls)
               (funcall match-conflict))))
-        (diffs-conflicts)
+        (diffs-conflict-mode 1)
         (should
          (eq (plist-get (car diffs--conflict-blocks) :engine)
              'smerge))
@@ -4317,6 +4332,32 @@
           (buffer-substring-no-properties
            (point-min) (point-max))))))))
 
+(ert-deftest diffs-conflict-mode-is-the-complete-entry-and-toggle ()
+  (diffs-tests--with-conflict-source diffs-tests--two-conflicts
+    (goto-char (point-max))
+    (call-interactively #'diffs-conflict-mode)
+    (should diffs-conflict-mode)
+    (should diffs--conflict-blocks)
+    (should
+     (= (point)
+        (marker-position
+         (plist-get (car diffs--conflict-blocks) :begin))))
+    (let ((blocks diffs--conflict-blocks)
+          (overlays diffs--conflict-overlays)
+          (position (point)))
+      (diffs-conflict-mode 1)
+      (should (eq diffs--conflict-blocks blocks))
+      (should (equal diffs--conflict-overlays overlays))
+      (should (= (point) position)))
+    (call-interactively #'diffs-conflict-mode)
+    (should-not diffs-conflict-mode)
+    (should-not diffs--conflict-blocks)
+    (should-not diffs--conflict-overlays)
+    (should
+     (equal diffs-tests--two-conflicts
+            (buffer-substring-no-properties
+             (point-min) (point-max))))))
+
 (ert-deftest diffs-conflict-mode-preserves-source-mode-and-smerge-bindings ()
   (diffs-tests--with-conflict-source diffs-tests--two-conflicts
     (let ((source-file buffer-file-name)
@@ -4327,7 +4368,7 @@
              (mapcar (lambda (key) (key-binding (kbd key)))
                      '("c" "i" "b" "u" "n" "p")))
             (smerge-binding (key-binding (kbd "C-c ^ n"))))
-        (diffs-conflicts)
+        (diffs-conflict-mode 1)
         (should (eq major-mode 'emacs-lisp-mode))
         (should (equal buffer-file-name source-file))
         (should-not buffer-read-only)
@@ -4364,7 +4405,7 @@
 
 (ert-deftest diffs-conflict-major-mode-change-removes-presentation ()
   (diffs-tests--with-conflict-source diffs-tests--two-conflicts
-    (diffs-conflicts)
+    (diffs-conflict-mode 1)
     (should
      (cl-some
       (lambda (overlay)
@@ -4386,7 +4427,7 @@
 
 (ert-deftest diffs-conflict-revert-removes-stale-presentation-state ()
   (diffs-tests--with-conflict-source diffs-tests--two-conflicts
-    (diffs-conflicts)
+    (diffs-conflict-mode 1)
     (diffs-conflict-current)
     (revert-buffer t t)
     (should-not diffs-conflict-mode)
@@ -4407,7 +4448,7 @@
     (re-search-forward "'current")
     (let ((syntax-face
            (get-text-property (match-beginning 0) 'face)))
-      (diffs-conflicts)
+      (diffs-conflict-mode 1)
       (goto-char (point-min))
       (re-search-forward "'current")
       (should (equal
@@ -4509,7 +4550,7 @@
 
 (ert-deftest diffs-conflict-resolutions-track-multiple-blocks-and-reset ()
   (diffs-tests--with-conflict-source diffs-tests--two-conflicts
-    (diffs-conflicts)
+    (diffs-conflict-mode 1)
     (call-interactively (key-binding (kbd "C-c C-d i")))
     (diffs-conflict-next)
     (diffs-conflict-current)
@@ -4557,7 +4598,7 @@
 (ert-deftest diffs-conflict-both-omits-diff3-base-and-undo-restores-markers ()
   (diffs-tests--with-conflict-source diffs-tests--diff3-conflict
     (smerge-mode 1)
-    (diffs-conflicts)
+    (diffs-conflict-mode 1)
     (undo-boundary)
     (diffs-conflict-both)
     (undo-boundary)
@@ -4604,7 +4645,7 @@
           (undo-list (copy-tree buffer-undo-list))
           (overlays (overlays-in (point-min) (point-max)))
           (error-data
-           (should-error (diffs-conflicts) :type 'user-error)))
+           (should-error (diffs-conflict-mode 1) :type 'user-error)))
       (should (string-match-p
                "read-only" (error-message-string error-data)))
       (should-not diffs-conflict-mode)
@@ -4637,7 +4678,7 @@
              (buffer-substring-no-properties
               (point-min) (point-max))))
           (error-data
-           (should-error (diffs-conflicts) :type 'user-error)))
+           (should-error (diffs-conflict-mode 1) :type 'user-error)))
       (should (string-match-p
                "Widen" (error-message-string error-data)))
       (should-not diffs-conflict-mode)
@@ -4655,7 +4696,7 @@
 
 (ert-deftest diffs-conflict-stale-block-fails-without-overwriting-source ()
   (diffs-tests--with-conflict-source diffs-tests--two-conflicts
-    (diffs-conflicts)
+    (diffs-conflict-mode 1)
     (diffs-conflict-current)
     (goto-char (point-min))
     (re-search-forward "(message \"current two a\")")
@@ -4688,7 +4729,7 @@
           "incoming two\n"
           ">>>>>>> two\n")))
     (diffs-tests--with-conflict-source fixture
-      (diffs-conflicts)
+      (diffs-conflict-mode 1)
       (let* ((first (car diffs--conflict-blocks))
              (boundary
               (marker-position (plist-get first :end))))
@@ -4720,7 +4761,7 @@
           "incoming two\n"
           ">>>>>>> two\n")))
     (diffs-tests--with-conflict-source fixture
-      (diffs-conflicts)
+      (diffs-conflict-mode 1)
       (diffs-conflict-current)
       (let ((first-position (point)))
         (diffs-conflict-next)
@@ -4759,7 +4800,7 @@
             (with-current-buffer buffer
               (insert fixture)
               (emacs-lisp-mode)
-              (diffs-conflicts)))
+              (diffs-conflict-mode 1)))
           (delete-other-windows)
           (let* ((window-a (selected-window))
                  (window-b (split-window-right)))
@@ -4852,7 +4893,7 @@
               (point-min) (point-max)))
             (undo-list (copy-tree buffer-undo-list))
             (overlays (overlays-in (point-min) (point-max))))
-        (should-error (diffs-conflicts) :type 'user-error)
+        (should-error (diffs-conflict-mode 1) :type 'user-error)
         (should-not diffs-conflict-mode)
         (should-not (buffer-modified-p))
         (should (equal undo-list buffer-undo-list))
@@ -4873,7 +4914,7 @@
           "right\n"
           ">>>>>>>>>> incoming")))
     (diffs-tests--with-conflict-source fixture
-      (diffs-conflicts)
+      (diffs-conflict-mode 1)
       (diffs-conflict-both)
       (should
        (equal
@@ -4899,7 +4940,7 @@
           ">>>>>>> branch\n"
           "after\n")))
     (diffs-tests--with-conflict-source empty-current
-      (diffs-conflicts)
+      (diffs-conflict-mode 1)
       (diffs-conflict-current)
       (should
        (equal "before\nafter\n"
@@ -4911,7 +4952,7 @@
               (buffer-substring-no-properties
                (point-min) (point-max)))))
     (diffs-tests--with-conflict-source empty-incoming
-      (diffs-conflicts)
+      (diffs-conflict-mode 1)
       (diffs-conflict-incoming)
       (should
        (equal "before\nafter\n"
@@ -4925,7 +4966,7 @@
 
 (ert-deftest diffs-conflict-reset-after-an-explicit-save-stays-modified ()
   (diffs-tests--with-conflict-source diffs-tests--diff3-conflict
-    (diffs-conflicts)
+    (diffs-conflict-mode 1)
     (diffs-conflict-current)
     (save-buffer)
     (should-not (buffer-modified-p))
@@ -4944,7 +4985,7 @@
 
 (ert-deftest diffs-conflict-render-failure-rolls-back-source-and-state ()
   (diffs-tests--with-conflict-source diffs-tests--two-conflicts
-    (diffs-conflicts)
+    (diffs-conflict-mode 1)
     (let ((make-overlay-function (symbol-function 'make-overlay))
           (fail t))
       (cl-letf

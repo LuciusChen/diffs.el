@@ -2,15 +2,22 @@
 
 ## Unreleased (0.13.0)
 
+- Route `.diff` and `.patch` files directly through the self-contained
+  `diffs-mode`, while retaining `diffs-minor-mode` only as the renderer
+  boundary for externally owned diff-mode buffers. First-party
+  file/project/commit producers now initialize the same major-mode
+  entry instead of activating its renderer as a separate step.
 - Decode live-server JSON as UTF-8 at the session CLI boundary, preserving
   CJK, emoji, and other non-ASCII text in both human and Agent comments.
 - Harden within-line refinement against the current diffs.com/jsdiff
   behavior with a two-sided `word-alt` edit sequence, Unicode
   whitespace handling, fast Unicode-character `char` comparison, a
   multilingual conformance corpus, and randomized Myers validation.
-- Add `diffs-conflicts`, an in-place stacked merge-conflict workflow
+- Add `diffs-conflict-mode`, an in-place stacked merge-conflict workflow
   that preserves the source buffer's language major mode, syntax, and
-  language-tool state.
+  language-tool state. The minor mode is the complete public entry,
+  including validation and first-conflict positioning; there is no
+  separate wrapper command.
 - Add Current, Incoming, Both, and Reset transitions under `C-c C-d`
   plus clickable action rows. Each transition is one undoable,
   unsaved source edit; no action saves or stages the file.

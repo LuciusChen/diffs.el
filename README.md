@@ -2,7 +2,7 @@
 
 Diffs.el is a native review surface for Emacs users who want [diffs.com](https://diffs.com/)-style file and project diffs without replacing `diff-mode` or leaving their existing editing workflow.
 
-It adds aligned old/new line numbers, full-width change backgrounds, fringe bars, source syntax, within-line refinement, inline comments, accept/reject previews, and merge-conflict actions while preserving normal source navigation, search, copying, and hunk operations. Reviews open side by side by default; set `diffs-default-view` to `stacked` for a unified initial layout.
+It adds aligned old/new line numbers, full-width change backgrounds, fringe bars, source syntax, within-line refinement, inline comments, accept/reject previews, and merge-conflict actions while preserving normal source navigation, search, copying, and hunk operations. Command-created reviews open side by side by default; set `diffs-default-view` to `stacked` for a unified initial layout.
 
 ![A split diffs.el review with syntax-aware word-level changes and an inline comment](docs/screenshots/split-word-diff-review.png)
 
@@ -35,6 +35,8 @@ Alternatively, clone the repository, add its directory to `load-path`, and load 
 
 Run `M-x diffs-file` in a tracked file or `M-x diffs-project` anywhere inside a project. The first view is split; `s` switches layouts and `q` returns to the previous window configuration.
 
+Opening a `.diff` or `.patch` file enters `diffs-mode` directly, so no separate patch-view command is needed. File-backed patch buffers start with the native stacked owner because major-mode selection happens before Emacs displays the buffer; press `s` for the same split renderer. An externally generated buffer that already uses `diff-mode` can opt into the same renderer with `M-x diffs-minor-mode`.
+
 ### Entry points
 
 | Entry point | Kind | Description |
@@ -44,8 +46,9 @@ Run `M-x diffs-file` in a tracked file or `M-x diffs-project` anywhere inside a 
 | `diffs-commit` | Command | Show a commit (Git) |
 | `diffs-commit-at-line` | Command | Show the commit that last touched the current line |
 | `diffs-items` | Elisp API | Show unchanged source-file items and patch items in one review |
-| `diffs-conflicts` | Command | Resolve merge markers in place with Current, Incoming, Both, and Reset |
-| `diffs-minor-mode` | Command | Use the renderer in any diff-mode buffer |
+| `diffs-mode` | Major mode | Open `.diff` and `.patch` files as native read-only reviews |
+| `diffs-conflict-mode` | Minor mode | Resolve merge markers in place with Current, Incoming, Both, and Reset |
+| `diffs-minor-mode` | Integration | Use the renderer in an externally owned diff-mode buffer |
 | `diffs-diff-hl-mode` | Command | Render diff-hl's current inline or posframe hunk with diffs.el |
 
 ### Review keys
@@ -81,7 +84,7 @@ Decisions do not modify files by themselves. After reviewing several blocks, pre
 
 ## Merge conflicts
 
-Open a source file containing Git conflict markers and run `M-x diffs-conflicts`. The existing source buffer remains in its language major mode, so syntax highlighting, Eldoc, Xref, LSP state, file identity, and unrelated unsaved edits stay in place. Diffs.el adds a stacked action row above each conflict and theme-native backgrounds for its Current, optional Base, and Incoming sections. Current and Incoming marker rows use a stronger background than their code blocks, visually join those blocks, carry explicit section labels, and use matching fringe bars without changing the underlying Git marker text.
+Open a source file containing Git conflict markers and run `M-x diffs-conflict-mode`. The mode itself is the complete entry: it validates every block, installs the presentation, and moves to the first conflict; invoking it again disables only the presentation. The existing source buffer remains in its language major mode, so syntax highlighting, Eldoc, Xref, LSP state, file identity, and unrelated unsaved edits stay in place. Diffs.el adds a stacked action row above each conflict and theme-native backgrounds for its Current, optional Base, and Incoming sections. Current and Incoming marker rows use a stronger background than their code blocks, visually join those blocks, carry explicit section labels, and use matching fringe bars without changing the underlying Git marker text.
 
 Actions use the `C-c C-d` prefix:
 
