@@ -225,6 +225,16 @@
   (or (eq value face)
       (and (listp value) (memq face value))))
 
+(defun diffs-tests--split-insert-row
+    (string number source kind file width role)
+  "Insert and decorate one split test row."
+  (let ((begin (point)))
+    (insert string "\n")
+    (diffs--split-decorate-row
+     begin (point)
+     (list string number source kind file nil nil nil)
+     width role)))
+
 (defun diffs-tests--changed-texts (old new)
   "Return changed OLD and NEW substrings under the current options."
   (pcase-let ((`(,old-ranges . ,new-ranges)
@@ -5911,6 +5921,32 @@
                        '(left-fringe diffs-fringe-bar
                          diff-indicator-added)))))))
 
+(ert-deftest diffs-unified-change-backgrounds-reach-the-fringe ()
+  (diffs-tests--with-diff diffs-tests--normal
+    (diffs-minor-mode 1)
+    (dolist (spec '(("^-(message" diff-removed)
+                    ("^+(message" diff-added)))
+      (goto-char (point-min))
+      (re-search-forward (car spec))
+      (let* ((prefix
+              (get-text-property
+               (line-beginning-position) 'line-prefix))
+             (gutter-face
+              (get-text-property (1- (length prefix)) 'face prefix)))
+        (should
+         (diffs-tests--face-includes-p gutter-face (cadr spec)))))
+    (let ((section (car diffs--sections)))
+      (dolist (spec '((?- diff-removed) (?+ diff-added)))
+        (let* ((prefix
+                (diffs--review-resolution-prefix
+                 section (car spec) 1 1 nil))
+               (gutter-face
+                (get-text-property
+                 (1- (length prefix)) 'face prefix)))
+          (should
+           (diffs-tests--face-includes-p
+            gutter-face (cadr spec))))))))
+
 (ert-deftest diffs-fringe-bars-can-be-disabled ()
   (let ((diffs-line-numbers nil)
         (diffs-fringe-bars nil))
@@ -5924,7 +5960,8 @@
 (ert-deftest diffs-split-full-width-backgrounds-can-be-disabled ()
   (let ((diffs-split-full-width-backgrounds nil))
     (with-temp-buffer
-      (diffs--split-insert-row "new" 1 1 'add "foo.el" 2 'new)
+      (diffs-tests--split-insert-row
+       "new" 1 1 'add "foo.el" 2 'new)
       (goto-char (point-min))
       (let* ((prefix (get-text-property (point) 'line-prefix))
              (prefix-face
@@ -5938,7 +5975,7 @@
 
 (ert-deftest diffs-split-keeps-refinement-above-the-line-background ()
   (with-temp-buffer
-    (diffs--split-insert-row
+    (diffs-tests--split-insert-row
      (propertize "new" 'face 'diff-refine-added)
      1 1 'add "foo.el" 2 'new)
     (let ((faces (get-text-property (point-min) 'face)))
@@ -6025,9 +6062,10 @@
 (ert-deftest diffs-wraps-split-rows-in-aligned-pairs ()
   (let* ((old (list (list "abcdefghij" 7 7 'del "foo.el")))
          (new (list (list "xy" 8 8 'add "foo.el")))
-         (wrapped (diffs--split-wrap-rows old new 4))
-         (old-wrapped (car wrapped))
-         (new-wrapped (cadr wrapped)))
+         (physical
+          (diffs--split-physical-rows old new 4 t))
+         (old-wrapped (append (nth 0 physical) nil))
+         (new-wrapped (append (nth 1 physical) nil)))
     (should (= (length old-wrapped) 3))
     (should (= (length old-wrapped) (length new-wrapped)))
     (should (equal (mapcar #'car old-wrapped) '("abcd" "efgh" "ij")))

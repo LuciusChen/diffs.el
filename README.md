@@ -186,7 +186,7 @@ Press `i` to open a left side window containing only files present in the diff�
 
 ## Side-by-side view
 
-The default view splits the frame into two synchronized windows — old on the left, new on the right — with row-perfect alignment (dimmed filler bands pad insertions and deletions), per-side line numbers, and the same native refinement and syntax faces as the unified view. Theme-native added/removed backgrounds cover the line-number gutter and extend to the right edge.  `n`/`p` move by hunk in both windows, `RET` visits the source, `s` returns to the unified view, and `q` closes both columns and quits the complete diff view.
+The default view splits the frame into two synchronized windows — old on the left, new on the right — with row-perfect alignment (dimmed filler bands pad insertions and deletions), per-side line numbers, and the same native refinement and syntax faces as the unified view. In both stacked and split layouts, theme-native added/removed backgrounds run continuously from the fringe bar through the line-number gutter and extend to the right edge. `n`/`p` move by hunk in both windows, `RET` visits the source, `s` returns to the unified view, and `q` closes both columns and quits the complete diff view.
 
 Long lines are truncated by default and support horizontal scrolling. Horizontal offsets, paired cursor rows, and display columns stay synchronized; `C-a` and `C-e` move both sides to their respective line beginnings or ends. Set `diffs-split-wrap-lines` to non-nil to wrap them into aligned physical rows so the two sides never drift apart.
 

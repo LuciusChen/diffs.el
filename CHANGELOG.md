@@ -2,6 +2,9 @@
 
 ## Unreleased (0.13.0)
 
+- Extend stacked added/removed backgrounds through the line-number
+  gutter to the fringe bar, matching split rendering and retaining the
+  same coverage after review decisions reproject line prefixes.
 - Add `diffs-files` for comparing any two saved files in the native
   stacked or split review. Independent old/new source ownership keeps
   context expansion, token tools, `RET`, and refresh pointed at the

@@ -389,7 +389,7 @@ the background in any theme.")
   '((t :inherit warning :extend t))
   "Face for a merge-conflict block edited outside diffs.el.")
 
-(defun diffs--split-line-prefix-face (change-face)
+(defun diffs--line-prefix-face (change-face)
   "Return the line-number face, optionally layered over CHANGE-FACE."
   (if change-face
       (list 'diffs-line-number change-face)
@@ -2249,6 +2249,10 @@ non-nil, only apply properties to lines intersecting that region."
         (let* ((c (char-after))
                (old (memq c '(?- ?\s ?\n)))
                (new (memq c '(?+ ?\s ?\n)))
+               (change-face
+                (pcase c
+                  (?- 'diff-removed)
+                  (?+ 'diff-added)))
                (kind (pcase c
                        (?- 'del)
                        (?+ 'add)
@@ -2266,15 +2270,20 @@ non-nil, only apply properties to lines intersecting that region."
              'diffs-old-number (and old old-line)
              'diffs-new-number (and new new-line))
             (let* ((fringe (diffs--fringe-prefix c))
+                   (gutter-face
+                    (diffs--line-prefix-face change-face))
                    (gutter
                     (diffs--gutter
                      section 'stacked kind width
                      (and old old-line)
-                     (and new new-line)))
+                     (and new new-line)
+                     nil nil
+                     gutter-face))
                    (wrap-gutter
                     (diffs--gutter
                      section 'stacked kind width nil nil
-                     nil t)))
+                     nil t
+                     gutter-face)))
               (when (or gutter (not (string-empty-p fringe)))
                 (diffs--put
                  (point) (min (point-max) (1+ (line-end-position)))
@@ -4105,14 +4114,6 @@ and live-worktree target number."
           (vconcat (nreverse new-physical))
           (nreverse anchors))))
 
-(defun diffs--split-wrap-rows (old-rows new-rows width)
-  "Wrap OLD-ROWS and NEW-ROWS to WIDTH with row-perfect alignment.
-Return (OLD-WRAPPED NEW-WRAPPED)."
-  (pcase-let ((`(,old ,new . ,_)
-               (diffs--split-physical-rows
-                old-rows new-rows width t)))
-    (list (append old nil) (append new nil))))
-
 (defun diffs--split-source-face-runs (row)
   "Return source face runs corresponding to split ROW.
 Each run is (START END FACE), with offsets relative to ROW's text."
@@ -4346,7 +4347,7 @@ WIDTH is the number-column width and ROLE is `old' or `new'."
                (gutter-face
                 (if (eq kind 'filler)
                     '(diffs-line-number diffs-filler)
-                  (diffs--split-line-prefix-face change-face)))
+                  (diffs--line-prefix-face change-face)))
                (gutter
                 (and section
                      (diffs--gutter
@@ -4378,16 +4379,6 @@ WIDTH is the number-column width and ROLE is `old' or `new'."
           (add-face-text-property
            (+ begin (car run)) (+ begin (cdr run))
            refine-face nil))))))
-
-(defun diffs--split-insert-row (str num src kind file width role)
-  "Insert one split row described by STR, NUM, SRC, KIND and FILE.
-WIDTH is the number-column width; ROLE is `old' or `new'."
-  (let ((begin (point)))
-    (insert str "\n")
-    (diffs--split-decorate-row
-     begin (point)
-     (list str num src kind file nil nil nil)
-     width role)))
 
 (defun diffs--split-install-rows (rows width)
   "Bulk-insert ROWS and initialize their position index.
@@ -6834,13 +6825,19 @@ preview result numbers.  RESOLVED suppresses the change fringe."
                  (?- 'del)
                  (?+ 'add)
                  (_ 'ctx)))
+         (change-face
+          (pcase marker
+            (?- 'diff-removed)
+            (?+ 'diff-added)))
          (fringe
           (if resolved "" (diffs--fringe-prefix marker))))
     (concat
      fringe
      (or
       (diffs--gutter
-       section 'stacked kind width old-number new-number)
+       section 'stacked kind width old-number new-number
+       nil nil
+       (diffs--line-prefix-face change-face))
       ""))))
 
 (defun diffs--review-project-unified-result-numbers
