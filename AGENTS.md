@@ -44,7 +44,7 @@ Elisp and package-development rules adapted from the clutch development guide fo
 - A split cache key must include every option or state value that changes rendered output.
 - Cache invalidation must be explicit when the patch tick, window width, wrapping, theme-relevant faces, source revision, context expansion, or line-diff options change.
 - Large reviews must be lazy. Parse/index cheaply, render visible regions plus overscan, and cache completed work.
-- Virtualization must preserve complete searchable/copyable text. Do not trade away normal Emacs search, copying, source navigation, or position restoration for a faster first frame.
+- The default `auto` virtualization policy uses complete searchable/copyable text for small reviews and may select the paged skeleton model only above its configurable row threshold. Standard Emacs isearch, copying, source navigation, and position restoration must materialize the required projection before acting; document the remaining direct-Lisp buffer-text limitation and retain explicit `complete` and `paged` overrides.
 - Default non-wrapping split is the primary fast path. Configurable aligned wrapping must remain correct even if it needs a separate measurement path.
 - Expanded context remains display-backed and must not mutate the underlying patch.
 - Source syntax work must not run mode hooks, local variables, or local eval from historical file contents.
@@ -162,6 +162,7 @@ Elisp and package-development rules adapted from the clutch development guide fo
 - First split is the primary performance target; cached layout toggles must remain effectively immediate.
 - Large-diff syntax and within-line rendering must remain visible-region bounded.
 - Any material regression in the 800-file/22,000-line benchmark requires an explanation and explicit user-value tradeoff.
+- Row collection, physical indexing, and decision rebuilding must also remain approximately linear in the 4,000-file/110,000-line `make benchmark-large` tier.
 - Optimize user-perceived first frame before total background completion, without making later scrolling unpredictable.
 
 ## Version and Compatibility Baseline
@@ -222,6 +223,8 @@ Elisp and package-development rules adapted from the clutch development guide fo
    ```bash
    make benchmark
    ```
+
+   Also run `make benchmark-large` when changing row collection, physical indexing, viewport lookup, or decision rebuilding.
 
 4. Byte-compile every distributable Elisp file with zero warnings.
 

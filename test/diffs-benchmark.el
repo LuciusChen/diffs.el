@@ -6,6 +6,10 @@
 (defvar diffs-benchmark--files
   (string-to-number (or (getenv "DIFFS_BENCH_FILES") "800")))
 
+(defvar diffs-benchmark--virtualization
+  (intern
+   (or (getenv "DIFFS_BENCH_VIRTUALIZATION") "auto")))
+
 (defun diffs-benchmark--input ()
   "Build a representative multi-file Git diff."
   (with-temp-buffer
@@ -43,20 +47,28 @@
           diffs--split-rows)))
     (unless index
       (error "Benchmark input has no split change row"))
-    (goto-char (aref diffs--split-row-positions index))
+    (goto-char (diffs--split-row-position index))
     (when-let* ((window (get-buffer-window (current-buffer))))
       (diffs--split-materialize-window window))))
 
 (let* ((text (diffs-benchmark--input))
-       (buffer (generate-new-buffer " *diffs-benchmark*")))
+       (buffer (generate-new-buffer " *diffs-benchmark*"))
+       (diffs-split-virtualization diffs-benchmark--virtualization)
+       effective-model)
   (unwind-protect
       (progn
         (with-current-buffer buffer
           (insert text)
-          (diff-mode))
+          (diff-mode)
+          ;; Batch Emacs forcibly keeps `font-lock-mode' disabled.  Mark
+          ;; the buffer as font-locked before diffs.el setup so this
+          ;; exercises the lazy interactive path; `jit-lock-register'
+          ;; installs the actual redisplay worker below.
+          (setq-local font-lock-mode t))
         (princ
-         (format "Emacs %s; %d files; %d lines; %d bytes\n"
-                 emacs-version diffs-benchmark--files
+         (format "Emacs %s; %s split policy; %d files; %d lines; %d bytes\n"
+                 emacs-version diffs-benchmark--virtualization
+                 diffs-benchmark--files
                  (with-current-buffer buffer
                    (count-lines (point-min) (point-max)))
                  (string-bytes text)))
@@ -65,8 +77,23 @@
          (lambda ()
            (with-current-buffer buffer
              (diffs--scan))))
-        (with-current-buffer buffer
-          (diffs-minor-mode 1))
+        (diffs-benchmark--measure
+         "stacked setup" 1
+         (lambda ()
+           (with-current-buffer buffer
+             (diffs-minor-mode 1))))
+        (diffs-benchmark--measure
+         "stacked viewport" 1
+         (lambda ()
+           (with-current-buffer buffer
+             (when (memq #'diffs--jit-decorate
+                         jit-lock-functions)
+               (jit-lock-fontify-now
+                (point-min)
+                (save-excursion
+                  (goto-char (point-min))
+                  (forward-line 100)
+                  (point)))))))
         (switch-to-buffer buffer)
         (diffs-benchmark--measure
          "first split" 1
@@ -74,9 +101,16 @@
            (with-current-buffer buffer
              (switch-to-buffer buffer)
              (diffs--split-cache-clear)
-             (diffs-toggle-split))
+             (diffs-toggle-split)
+             (setq effective-model
+                   (if (buffer-local-value
+                        'diffs--split-paged-p
+                        (window-buffer))
+                       'paged
+                     'complete)))
            (with-current-buffer (window-buffer)
              (diffs-split-quit))))
+        (princ (format "effective split model: %s\n" effective-model))
         (diffs-benchmark--measure
          "deep viewport" 1
          (lambda ()
@@ -89,7 +123,7 @@
                (let* ((count (length diffs--split-rows))
                       (index (max 0 (- count 100)))
                       (position
-                       (aref diffs--split-row-positions index)))
+                       (diffs--split-row-position index)))
                  (set-window-start window position)
                  (diffs--split-materialize-window window)
                  (diffs-split-quit))))))
@@ -101,6 +135,17 @@
              (diffs-toggle-split))
            (with-current-buffer (window-buffer)
              (diffs-split-quit))))
+        (when (eq effective-model 'paged)
+          (with-current-buffer buffer
+            (switch-to-buffer buffer)
+            (diffs-toggle-split))
+          (diffs-benchmark--measure
+           "full projection" 1
+           (lambda ()
+             (with-current-buffer (window-buffer)
+               (diffs--split-paged-materialize-all))))
+          (with-current-buffer (window-buffer)
+            (diffs-split-quit)))
         ;; Exercise the installed public commands from the primary split
         ;; workflow.  Each action invalidates and rebuilds the decision-aware
         ;; split, so these timings include the complete interactive path.

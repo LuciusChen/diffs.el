@@ -2,6 +2,37 @@
 
 ## Unreleased (0.13.0)
 
+- Keep stacked decoration lazy above `diffs-lazy-threshold` even when
+  `font-lock-mode` was disabled by `so-long-mode` or another large-buffer
+  policy, preventing project entry from eagerly decorating every hunk
+  before paged split rendering starts.
+- Make `auto` the default split virtualization policy: reviews below
+  5,000 estimated split rows retain the complete-text model, while larger
+  eligible reviews select paged rendering automatically. Explicit
+  `complete` and `paged` values remain available, and wrapping or
+  decision-aware views still use the complete model.
+- Add a paged split model that indexes hunk heights, retains native
+  newline/scrollbar structure, materializes and
+  evicts viewport-adjacent chunks in both columns, and uses logical row
+  coordinates plus a Fenwick length index instead of complete row
+  positions. Content alignment corrects cheap chunk-height estimates
+  atomically when first revealed; retained-chunk indexes keep eviction
+  independent of total hunk count. Standard isearch, copying, and review
+  commands precompute one exact projection before bulk-installing both
+  sides, with pinning left unchanged if projection building fails.
+  Wrapping and decision-aware views fall back to the complete model. First split falls
+  from about 223 to 63 ms at 22,000 lines and from 1.08 seconds to about
+  181 ms at 110,000 lines.
+- Restore linear large-review rendering by tracking physical-row counts
+  directly instead of measuring a growing row list at every hunk, carrying
+  known section ownership into stacked headers, and resolving visible
+  split rows through the existing hunk table. On the 4,000-file /
+  110,000-line benchmark this reduces first split from 6.4 seconds to
+  about 1.1 seconds, deep viewport materialization from 172 ms to about
+  25 ms, and split decision rebuilds from 7–8 seconds to 1.3–1.5 seconds.
+- Benchmark lazy stacked setup and first-viewport rendering explicitly,
+  and add `make benchmark-large` as the reproducible 110,000-line scaling
+  tier.
 - Extend stacked added/removed backgrounds through the line-number
   gutter to the fringe bar, matching split rendering and retaining the
   same coverage after review decisions reproject line prefixes.

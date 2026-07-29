@@ -25,7 +25,7 @@ Alternatively, clone the repository, add its directory to `load-path`, and load 
 
 ## Why diffs.el
 
-- No renderer subprocess and no ANSI parsing. (The commands still use VC/Git or the configured `diff-command` to produce their input.) Opening a diff costs one cheap scan (≈17 ms for 22k lines / 800 files); on large diffs even the decorations are applied lazily through jit-lock, so only what you see is rendered.
+- No renderer subprocess and no ANSI parsing. (The commands still use VC/Git or the configured `diff-command` to produce their input.) A 22k-line / 800-file review scans in about 22 ms and prepares stacked rendering in about 31 ms; on large diffs decorations are applied lazily through jit-lock, so only what you see is rendered.
 - The diff text is never modified: `diff-goto-source` (`RET`), isearch, `diff-apply-hunk`, and the rest of `diff-mode` keep working; line numbers live in `line-prefix`, so copying and searching stay clean.
 - Theme-native: everything inherits from the standard `diff-*` faces.
 - Revision-aware syntax highlighting: the old side is fontified from the file contents at the reference revision.
@@ -190,7 +190,9 @@ The default view splits the frame into two synchronized windows — old on the l
 
 Long lines are truncated by default and support horizontal scrolling. Horizontal offsets, paired cursor rows, and display columns stay synchronized; `C-a` and `C-e` move both sides to their respective line beginnings or ends. Set `diffs-split-wrap-lines` to non-nil to wrap them into aligned physical rows so the two sides never drift apart.
 
-Very large diffs bulk-insert complete old/new text, so normal isearch, copying, source navigation, and scrollbar semantics work immediately. Expensive visual work—line backgrounds, gutters, fringe bars, source syntax, and within-line emphasis—is materialized only for the viewport plus `diffs-split-overscan`, and both columns are updated together while scrolling.  Completed rows and the rendered pair are cached, so returning to a split with the same width is effectively immediate.
+Small split reviews bulk-insert complete old/new text, so normal isearch, copying, source navigation, and scrollbar semantics work immediately. Expensive visual work—line backgrounds, gutters, fringe bars, source syntax, and within-line emphasis—is materialized only for the viewport plus `diffs-split-overscan`, and both columns are updated together while scrolling. Large stacked buffers retain this lazy path even when `so-long-mode` or another large-buffer policy disables `font-lock-mode`. Completed rows and the rendered pair are cached, so returning to a split with the same width is effectively immediate.
+
+`diffs-split-virtualization` defaults to `auto`: non-wrapping unresolved reviews at or above `diffs-split-virtualization-threshold` use the paged model, while smaller reviews use `complete`. Paged rendering cheaply estimates hunk heights, keeps a newline skeleton for native scrolling, and materializes only nearby chunks in both columns; content-based alignment corrects an estimate atomically when that chunk first appears, and cold chunks are evicted again. Standard isearch, copying, and review commands first build and bulk-install one exact complete projection so they continue to see offscreen text. Wrapped and decision-aware views automatically use the complete model. Set the policy explicitly to `complete` or `paged` to override automatic size selection. Direct Lisp consumers that inspect an active paged split with `buffer-string` or `search-forward` before an interactive search/copy command see only materialized chunks.
 
 ## Within-line changes
 
@@ -283,17 +285,27 @@ All options belong to the `diffs` customization group.
 | Option | Default | Purpose |
 |---|---:|---|
 | `diffs-lazy-threshold` | `10000` | Start applying stacked decorations through jit-lock |
+| `diffs-split-virtualization` | `auto` | Choose by estimated split size, or force `complete`/`paged` |
+| `diffs-split-virtualization-threshold` | `5000` | Estimated split rows at which `auto` selects `paged` |
 | `diffs-split-overscan` | `60` | Extra split rows prepared above and below the viewport |
 | `diffs-render-cache-limit` | `64` | Shared syntax-rendered source revisions retained globally |
 | `diffs-syntax-idle-delay` | `0.05` | Idle delay before one queued source revision is fontified |
 
 The Agent installer destinations are controlled by `diffs-review-cli-install-path`, `diffs-review-skill-install-directory`, and `diffs-review-assets-directory`.
 
-On an M-series Mac running Emacs 32, the included synthetic benchmark (800 files, 22,000 lines, 536 KB) measures about 17 ms for scanning, 275 ms for the first side-by-side render, 20 ms to materialize a first deep viewport, and 0.7 ms for a cached toggle.  This includes line numbers, fringe bars, source syntax, and native corresponding-line/word refinement with the default non-wrapping split.  The v0.7 first-split baseline was about 332 ms.  The same fixture also exercises the public split-view `A` and `R` decision path: those rebuilds take about 350 ms and 400 ms respectively, down from about 943 ms and 1,016 ms after deferring hidden stacked-overlay projection until stacked is requested. Run it on your machine with:
+On an M-series Mac running Emacs 32, the included synthetic benchmark (800 files, 22,000 lines, 536 KB) measures about 22 ms for scanning, 32 ms for lazy stacked setup, 2 ms to materialize its first viewport, 64 ms for the first side-by-side render, 23 ms to materialize a first deep split viewport, and 5 ms for a cached toggle. The default `auto` policy selects paged rendering for this fixture. These measurements include line numbers, fringe bars, source syntax, and native corresponding-line/word refinement with the default non-wrapping split. The same fixture exercises the public split-view `A` and `R` decision path at about 261 ms and 311 ms. Run it on your machine with:
 
 ```sh
 make benchmark
 ```
+
+The large tier uses 4,000 files and 110,000 lines to expose scaling defects hidden by the default fixture. The automatic paged path currently measures about 103 ms for scanning, 135 ms for stacked setup, 3 ms for its first viewport, 185 ms for the first split, 32 ms for a deep split viewport, 8 ms for a cached toggle, and 1.32/1.54 seconds for `A`/`R`. Run it after changing row collection, physical indexing, viewport lookup, or decision rebuilding:
+
+```sh
+make benchmark-large
+```
+
+Set `DIFFS_BENCH_VIRTUALIZATION=complete` or `DIFFS_BENCH_VIRTUALIZATION=paged` to force either model. The complete path currently takes about 218 ms / 1.08 seconds for the first split and 1.0/2.6 ms for a cached toggle on the default/large tiers. The automatic paged pair upgrades to its exact searchable projection in about 280 ms / 1.32 seconds; subsequent search and copy operations reuse it. Decision timings remain near the complete model because decisions deliberately fall back to it.
 
 ## Integrations
 

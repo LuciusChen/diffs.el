@@ -235,6 +235,24 @@
      (list string number source kind file nil nil nil)
      width role)))
 
+(defun diffs-tests--many-file-patch (count)
+  "Return a simple Git patch containing COUNT changed files."
+  (with-temp-buffer
+    (dotimes (file count)
+      (insert
+       (format
+        (concat
+         "diff --git a/f%02d.el b/f%02d.el\n"
+         "--- a/f%02d.el\n"
+         "+++ b/f%02d.el\n"
+         "@@ -1,3 +1,3 @@\n"
+         " (message \"context\")\n"
+         "-(message \"old-%02d\")\n"
+         "+(message \"new-%02d\")\n"
+         " (message \"tail\")\n")
+        file file file file file file)))
+    (buffer-string)))
+
 (defun diffs-tests--changed-texts (old new)
   "Return changed OLD and NEW substrings under the current options."
   (pcase-let ((`(,old-ranges . ,new-ranges)
@@ -598,6 +616,7 @@
 
 (ert-deftest diffs-split-virtualizes-visuals-without-hiding-text ()
   (let ((buf (generate-new-buffer " *diffs virtual split test*"))
+        (diffs-split-virtualization 'complete)
         (diffs-split-overscan 2)
         old-buf new-buf)
     (unwind-protect
@@ -621,7 +640,7 @@
           (let* ((count (length diffs--split-rows))
                  (deep-index (- count 8))
                  (deep-position
-                  (aref diffs--split-row-positions deep-index))
+                  (diffs--split-row-position deep-index))
                  (window (get-buffer-window new-buf)))
             (should (> count 100))
             (should
@@ -667,6 +686,329 @@
       (dolist (buffer (list old-buf new-buf buf))
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
+
+(ert-deftest diffs-paged-split-materializes-and-evicts-cold-chunks ()
+  (let ((buffer (generate-new-buffer " *diffs paged split test*"))
+        (diffs-split-virtualization 'paged)
+        (diffs-split-overscan 0)
+        old-buffer new-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (insert (diffs-tests--many-file-patch 30))
+          (diff-mode)
+          (diffs-minor-mode 1)
+          (diffs-toggle-split)
+          (setq new-buffer (current-buffer)
+                old-buffer diffs--split-other)
+          (should diffs--split-paged-p)
+          (should
+           (< (cl-count t diffs--split-materialized-chunks)
+              (length diffs--split-chunks)))
+          (should-not (string-search "new-29" (buffer-string)))
+          (let* ((deep-index (- (length diffs--split-rows) 2))
+                 (window (get-buffer-window new-buffer)))
+            (should-not (aref diffs--split-rows deep-index))
+            (set-window-start
+             window (diffs--split-row-position deep-index))
+            (diffs--split-materialize-window window)
+            (let ((position
+                   (diffs--split-row-position deep-index)))
+              (goto-char position)
+              (should (looking-at "(message \"new-29\")"))
+              (should
+               (equal
+                (diffs--split-property-at 'diffs-file position)
+                "f29.el"))
+              (should
+               (eq (diffs--split-property-at 'diffs-kind position)
+                   'add)))
+            (with-current-buffer old-buffer
+              (goto-char (point-min))
+              (should (search-forward "old-29" nil t)))
+            (should-not (string-search "new-00" (buffer-string)))
+            (let ((copy
+                   (filter-buffer-substring
+                    (point-min) (point-max) nil)))
+              (should (string-search "new-00" copy))
+              (should (string-search "new-29" copy)))
+            (should diffs--split-paged-pinned)
+            (should
+             (= (cl-count t diffs--split-materialized-chunks)
+                (length diffs--split-chunks)))
+            (should
+             (= (length diffs--split-materialized-indexes)
+                (length diffs--split-chunks)))
+            (with-current-buffer old-buffer
+              (should diffs--split-paged-pinned)
+              (should (string-search "old-00" (buffer-string)))))
+          (diffs-split-quit)
+          (with-current-buffer buffer
+            (diffs-minor-mode -1)))
+      (dolist (candidate (list old-buffer new-buffer buffer))
+        (when (buffer-live-p candidate)
+          (kill-buffer candidate))))))
+
+(ert-deftest diffs-paged-split-corrects-inexact-chunk-heights ()
+  (let* ((patch
+          (concat
+           (diffs-tests--many-file-patch 30)
+           diffs-tests--unequal-replacement-before-change))
+         (buffer
+          (generate-new-buffer " *diffs paged height test*"))
+         (diffs-split-virtualization 'paged)
+         (diffs-split-overscan 0)
+         expected-count expected-old expected-new
+         old-buffer new-buffer)
+    (with-temp-buffer
+      (insert patch)
+      (diff-mode)
+      (diffs-minor-mode 1)
+      (pcase-let* ((`(,old ,new . ,_) (diffs--split-collect))
+                    (`(,old-physical ,new-physical . ,_)
+                     (diffs--split-physical-rows old new 80 nil)))
+        (setq expected-count (length old-physical)
+              expected-old
+              (mapconcat
+               (lambda (row) (concat (car row) "\n"))
+               (append old-physical nil) "")
+              expected-new
+              (mapconcat
+               (lambda (row) (concat (car row) "\n"))
+               (append new-physical nil) "")))
+      (diffs-minor-mode -1))
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (insert patch)
+          (diff-mode)
+          (diffs-minor-mode 1)
+          (diffs-toggle-split)
+          (setq new-buffer (current-buffer)
+                old-buffer diffs--split-other)
+          (should (< (length diffs--split-rows) expected-count))
+          (let* ((estimated-count (length diffs--split-rows))
+                 (deep-index (- estimated-count 2))
+                 (window (get-buffer-window new-buffer)))
+            (set-window-start
+             window (diffs--split-row-position deep-index))
+            (diffs--split-materialize-window window)
+            (should (= (length diffs--split-rows) expected-count))
+            (should
+             (equal
+              (diffs--split-row-source-file
+               (diffs--split-row-at-position
+                (window-start window)))
+              "unequal.el"))
+            (goto-char (point-min))
+            (should (search-forward "new combined" nil t))
+            (beginning-of-line)
+            (let ((copy
+                   (filter-buffer-substring
+                    (point-min) (point-max) nil)))
+              (should (equal (substring-no-properties copy) expected-new))
+              (should (looking-at "new combined")))
+            (with-current-buffer old-buffer
+              (should (= (length diffs--split-rows) expected-count))
+              (should
+               (equal
+                (buffer-substring-no-properties
+                 (point-min) (point-max))
+                expected-old)))))
+          (diffs-split-quit)
+          (with-current-buffer buffer
+            (diffs-minor-mode -1)))
+      (dolist (candidate (list old-buffer new-buffer buffer))
+        (when (buffer-live-p candidate)
+          (kill-buffer candidate)))))
+
+(ert-deftest diffs-paged-full-materialization-rolls-back-pinned-state ()
+  (let ((buffer
+         (generate-new-buffer " *diffs paged rollback test*"))
+        (diffs-split-virtualization 'paged)
+        (diffs-split-overscan 0)
+        old-buffer new-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (insert (diffs-tests--many-file-patch 30))
+          (diff-mode)
+          (diffs-minor-mode 1)
+          (diffs-toggle-split)
+          (setq new-buffer (current-buffer)
+                old-buffer diffs--split-other)
+          (let* ((target-index
+                  (cl-position
+                   nil diffs--split-materialized-chunks
+                   :from-end t))
+                 (target
+                  (aref diffs--split-chunks target-index))
+                 (old-function
+                  (symbol-function
+                   'diffs--split-paged-chunk-rows))
+                 (new-range diffs--split-paged-retained-range)
+                 (old-range
+                  (buffer-local-value
+                   'diffs--split-paged-retained-range old-buffer))
+                 (new-text (buffer-string))
+                 (old-text
+                  (with-current-buffer old-buffer
+                    (buffer-string))))
+            (cl-letf
+                (((symbol-function
+                   'diffs--split-paged-chunk-rows)
+                  (lambda (chunk)
+                    (if (eq chunk target)
+                        (error "Synthetic paged materialization failure")
+                      (funcall old-function chunk)))))
+              (should-error
+               (diffs--split-paged-materialize-all)
+               :type 'error))
+            (should-not diffs--split-paged-pinned)
+            (should (equal diffs--split-paged-retained-range new-range))
+            (should (equal (buffer-string) new-text))
+            (with-current-buffer old-buffer
+              (should-not diffs--split-paged-pinned)
+              (should (equal diffs--split-paged-retained-range old-range))
+              (should (equal (buffer-string) old-text)))
+            (should
+             (equal
+              (append diffs--split-materialized-chunks nil)
+              (append
+               (buffer-local-value
+                'diffs--split-materialized-chunks old-buffer)
+               nil)))
+            (dolist (candidate (list new-buffer old-buffer))
+              (with-current-buffer candidate
+                (should
+                 (equal
+                  (sort
+                   (copy-sequence
+                    diffs--split-materialized-indexes)
+                   #'<)
+                  (cl-loop
+                   for flag across diffs--split-materialized-chunks
+                   for index from 0
+                   when flag collect index))))))
+          (diffs-split-quit)
+          (with-current-buffer buffer
+            (diffs-minor-mode -1)))
+      (dolist (candidate (list old-buffer new-buffer buffer))
+        (when (buffer-live-p candidate)
+          (kill-buffer candidate))))))
+
+(ert-deftest diffs-split-auto-selects-model-at-row-threshold ()
+  (let ((buffer
+         (generate-new-buffer " *diffs automatic split test*"))
+        (diffs-split-virtualization 'auto)
+        (diffs-split-virtualization-threshold most-positive-fixnum)
+        old-buffer new-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (insert (diffs-tests--many-file-patch 30))
+          (diff-mode)
+          (diffs-minor-mode 1)
+          (let ((estimate (diffs--split-estimated-row-count)))
+            (should (> estimate 0))
+            (setq diffs-split-virtualization-threshold
+                  (1+ estimate))
+            (diffs-toggle-split)
+            (setq new-buffer (current-buffer)
+                  old-buffer diffs--split-other)
+            (should-not diffs--split-paged-p)
+            (should-not
+             (buffer-local-value
+              'diffs--split-paged-p old-buffer))
+            (diffs-split-quit)
+            (with-current-buffer buffer
+              (setq diffs-split-virtualization-threshold
+                    estimate)
+              (diffs-toggle-split))
+            (set-buffer new-buffer)
+            (should diffs--split-paged-p)
+            (should
+             (buffer-local-value
+              'diffs--split-paged-p old-buffer))
+            (should (eq diffs-split-virtualization 'auto)))
+          (diffs-split-quit)
+          (with-current-buffer buffer
+            (diffs-minor-mode -1)))
+      (dolist (candidate (list old-buffer new-buffer buffer))
+        (when (buffer-live-p candidate)
+          (kill-buffer candidate))))))
+
+(ert-deftest diffs-split-auto-respects-ineligible-view-state ()
+  (let ((diffs-split-virtualization-threshold 0))
+    (diffs-tests--with-diff diffs-tests--normal
+      (diffs-minor-mode 1)
+      (should
+       (diffs--split-use-paged-p
+        'auto nil diffs-split-virtualization-threshold))
+      (should-not
+       (diffs--split-use-paged-p
+        'complete nil diffs-split-virtualization-threshold))
+      (should
+       (diffs--split-use-paged-p
+        'paged nil most-positive-fixnum))
+      (should-not
+       (diffs--split-use-paged-p
+        'auto t diffs-split-virtualization-threshold))
+      (let ((diffs--review-selection '(selection)))
+        (should-not
+         (diffs--split-use-paged-p
+          'auto nil diffs-split-virtualization-threshold)))
+      (let ((diffs--review-annotations '(annotation)))
+        (should-not
+         (diffs--split-use-paged-p
+          'auto nil diffs-split-virtualization-threshold)))
+      (let ((diffs--review-decisions '(decision)))
+        (should-not
+         (diffs--split-use-paged-p
+          'auto nil diffs-split-virtualization-threshold)))
+      (let ((diffs--review-source-actions '(action)))
+        (should-not
+         (diffs--split-use-paged-p
+          'auto nil diffs-split-virtualization-threshold)))
+      (diffs-minor-mode -1))))
+
+(ert-deftest diffs-paged-index-matches-complete-physical-row-count ()
+  (dolist (patch
+           (list diffs-tests--normal
+                 diffs-tests--rename
+                 diffs-tests--two-files
+                 diffs-tests--hidden-context
+                 diffs-tests--two-change-blocks
+                 diffs-tests--context-zero-deletion
+                 diffs-tests--zero-count-addition))
+    (with-temp-buffer
+      (insert patch)
+      (diff-mode)
+      (diffs-minor-mode 1)
+      (pcase-let* ((`(,old ,new . ,_) (diffs--split-collect))
+                    (`(,old-physical ,new-physical . ,_)
+                     (diffs--split-physical-rows old new 80 nil))
+                    (`(,_chunks ,_anchors ,count)
+                     (diffs--split-paged-index)))
+        (should (= (length old-physical) (length new-physical)))
+        (should (= count (length old-physical))))
+      (diffs-minor-mode -1))))
+
+(ert-deftest diffs-large-stacked-rendering-stays-lazy-without-font-lock ()
+  (let ((diffs-lazy-threshold 1))
+    (diffs-tests--with-diff diffs-tests--normal
+      (font-lock-mode -1)
+      (diffs-minor-mode 1)
+      (should-not font-lock-mode)
+      (should (memq #'diffs--jit-decorate jit-lock-functions))
+      (goto-char (point-min))
+      (re-search-forward "(message \"same\")")
+      (let ((begin (line-beginning-position))
+            (end (min (point-max) (1+ (line-end-position)))))
+        (should-not (get-text-property begin 'diffs-kind))
+        (diffs--jit-decorate begin end)
+        (should (eq (get-text-property begin 'diffs-kind) 'ctx)))
+      (diffs-minor-mode -1))))
 
 (ert-deftest diffs-minor-mode-restores-emacs-refinement-setting ()
   (let ((diff-refine 'navigation))
@@ -1179,7 +1521,10 @@
       (puthash section old-lines diffs--old-content-cache)
       (puthash section new-lines diffs--new-content-cache)
       (goto-char (car hunk))
-      (should (string-search "e +4" (diffs--hunk-label hunk)))
+      (should
+       (string-search
+        "e +4"
+        (diffs--hunk-separator section hunk 'stacked)))
       (diffs--set-context-visible gap 2)
       (should (equal (buffer-string) text))
       (let ((display (overlay-get (plist-get gap :overlay)
@@ -1422,7 +1767,7 @@
                               when (eq (nth 3 row) kind)
                               return row-index)))
                         (goto-char
-                         (aref diffs--split-row-positions index))
+                         (diffs--split-row-position index))
                         (diffs--split-materialize-range
                          index (1+ index))
                         (should
@@ -1555,7 +1900,7 @@
                (string-match-p "unmodified lines" (buffer-string)))))
           (let* ((anchor (car diffs--split-anchors))
                  (position
-                  (aref diffs--split-row-positions (1- anchor)))
+                  (diffs--split-row-position (1- anchor)))
                  (row (diffs--split-row-at-position position)))
             (should (eq (nth 3 row) 'ctx))
             (should (nth 5 row)))
@@ -1883,6 +2228,10 @@
 (ert-deftest diffs-defaults-to-non-wrapping-split-view ()
   (should (eq (default-value 'diffs-default-view) 'split))
   (should-not (default-value 'diffs-split-wrap-lines))
+  (should
+   (eq (default-value 'diffs-split-virtualization) 'auto))
+  (should
+   (= (default-value 'diffs-split-virtualization-threshold) 5000))
   (should (eq (lookup-key diffs-split-mode-map (kbd "q"))
               #'diffs-split-quit-all))
   (should (eq (lookup-key diffs-split-mode-map (kbd "s"))

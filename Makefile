@@ -1,7 +1,7 @@
 EMACS ?= emacs
 EMACSCLIENT ?= emacsclient
 
-.PHONY: test session-cli-test compile check benchmark
+.PHONY: test session-cli-test compile check benchmark benchmark-large
 
 test:
 	$(EMACS) -Q --batch -L . -L test -l diffs-tests \
@@ -23,3 +23,7 @@ check: test session-cli-test compile
 
 benchmark:
 	$(EMACS) -Q --batch -L . -l test/diffs-benchmark.el
+
+benchmark-large:
+	DIFFS_BENCH_FILES=4000 \
+	  $(EMACS) -Q --batch -L . -l test/diffs-benchmark.el

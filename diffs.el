@@ -114,9 +114,35 @@ decorate eagerly."
 
 (defcustom diffs-split-overscan 60
   "Number of extra split rows decorated above and below the viewport.
-The complete split text remains searchable and copyable; this controls
-only how far expensive visual properties are prepared ahead of scrolling."
+The complete model always retains its text.  The paged model also uses
+this distance when retaining materialized chunks around the viewport."
   :type 'natnum)
+
+(defcustom diffs-split-virtualization 'auto
+  "Data model used to prepare non-wrapping side-by-side views.
+`auto' uses `paged' when the estimated split row count reaches
+`diffs-split-virtualization-threshold', and `complete' otherwise.
+`complete' always builds searchable text and row metadata before
+displaying the view.  `paged' always requests the first-frame path that
+indexes hunks cheaply, corrects their exact heights on first
+materialization, and materializes their text when they enter the
+viewport.
+Standard isearch, copying, and review commands materialize and retain
+the complete projection before inspecting offscreen rows.  Wrapping and
+decision-aware views continue to use the complete model."
+  :type '(choice (const :tag "Choose from estimated size" auto)
+                 (const :tag "Complete searchable buffer" complete)
+                 (const :tag "Paged visible hunks" paged))
+  :group 'diffs)
+
+(defcustom diffs-split-virtualization-threshold 5000
+  "Estimated split rows at which `auto' uses paged rendering.
+This threshold applies only when `diffs-split-virtualization' is
+`auto'.  Set it to zero to request paged rendering for every eligible
+split view.  Wrapping and decision-aware views always use the complete
+model."
+  :type 'natnum
+  :group 'diffs)
 
 (defcustom diffs-split-wrap-lines nil
   "When non-nil, wrap long side-by-side rows while preserving alignment.
@@ -2015,13 +2041,6 @@ NEW-LINE, SIDE, CONTINUATION, and FACE describe its presentation."
     side continuation face)
    "`diffs-gutter-function'"))
 
-(defun diffs--section-for-hunk (hunk)
-  "Return the scanned section that owns HUNK."
-  (cl-find-if
-   (lambda (section)
-     (memq hunk (plist-get section :hunks)))
-   diffs--sections))
-
 (defun diffs--hunk-separator-context (section hunk view)
   "Return public hunk-separator context for HUNK in SECTION and VIEW."
   (let* ((gap (diffs--gap-for-hunk hunk))
@@ -2110,15 +2129,8 @@ NEW-LINE, SIDE, CONTINUATION, and FACE describe its presentation."
   "Return the end position of HUNK in section SEC."
   (or (nth 3 hunk) (plist-get sec :end)))
 
-(defun diffs--hunk-label (hunk)
-  "Return the compact display label for HUNK."
-  (or
-   (when-let* ((section (diffs--section-for-hunk hunk)))
-     (diffs--hunk-separator section hunk 'stacked))
-   ""))
-
-(defun diffs--decorate-hunk-header (hunk)
-  "Refresh the compact header displayed for HUNK."
+(defun diffs--decorate-hunk-header (hunk section)
+  "Refresh the compact header for HUNK owned by SECTION."
   (when diffs-prettify-headers
     (save-excursion
       (goto-char (car hunk))
@@ -2129,7 +2141,9 @@ NEW-LINE, SIDE, CONTINUATION, and FACE describe its presentation."
            'display
            (if (and gap (> (plist-get gap :visible) 0))
                ""
-             (propertize (diffs--hunk-label hunk)
+             (propertize (or (diffs--hunk-separator
+                              section hunk 'stacked)
+                             "")
                          'face 'diffs-hunk-separator))))))))
 
 (defun diffs--context-before-string (gap)
@@ -2184,7 +2198,8 @@ NEW-LINE, SIDE, CONTINUATION, and FACE describe its presentation."
                     "\n"
                     context)
                  context)))))
-        (diffs--decorate-hunk-header hunk)))))
+        (diffs--decorate-hunk-header
+         hunk (plist-get gap :section))))))
 
 (defun diffs--context-gap-at-point ()
   "Return the expandable unchanged gap for the hunk at point."
@@ -2243,7 +2258,7 @@ non-nil, only apply properties to lines intersecting that region."
                  (or (null rend) (and (< (point) rend)
                                       (>= (line-end-position) (or rbeg 0))))
                  (looking-at diffs--hunk-re))
-        (diffs--decorate-hunk-header hunk))
+        (diffs--decorate-hunk-header hunk section))
       (forward-line 1)
       (while (and (< (point) end) (not (eobp)))
         (let* ((c (char-after))
@@ -2331,8 +2346,11 @@ non-nil, only apply properties to lines intersecting that region."
     (when diffs-prettify-headers
       (dolist (sec diffs--sections)
         (diffs--decorate-header sec))))
-  (if (and font-lock-mode
-           (> (count-lines (point-min) (point-max)) diffs-lazy-threshold))
+  ;; `so-long-mode' and similar large-buffer policies may disable
+  ;; `font-lock-mode'.  Jit-lock remains the viewport scheduler for our
+  ;; decorator, so eager work here would defeat large-diff virtualization
+  ;; before split rendering starts.
+  (if (> (count-lines (point-min) (point-max)) diffs-lazy-threshold)
       (jit-lock-register #'diffs--jit-decorate)
     (diffs--decorate-eagerly)))
 
@@ -3408,9 +3426,8 @@ integers before refresh adoption begins."
     (dolist (spec (plist-get state :intraline-overlays))
       (diffs--make-intraline-overlay
        (nth 0 spec) (nth 1 spec) (nth 2 spec)))
-    (when (and font-lock-mode
-               (> (count-lines (point-min) (point-max))
-                  diffs-lazy-threshold))
+    (when (> (count-lines (point-min) (point-max))
+             diffs-lazy-threshold)
       (jit-lock-register #'diffs--jit-decorate))
     (setq diffs--split-cache
           (plist-get state :split-cache)
@@ -3520,6 +3537,27 @@ its session state, and its window layout remain untouched."
   "Vector mapping split row indexes to buffer positions.
 The final slot is the position immediately after the last row.")
 
+(defvar-local diffs--split-paged-p nil
+  "Non-nil when this split buffer uses the paged row model.")
+
+(defvar-local diffs--split-chunks []
+  "Vector of indexed chunks shared by a paged split pair.")
+
+(defvar-local diffs--split-materialized-chunks []
+  "Boolean vector recording chunks whose text is present.")
+
+(defvar-local diffs--split-materialized-indexes nil
+  "Indexes of chunks whose text is present in this paged split side.")
+
+(defvar-local diffs--split-paged-pinned nil
+  "Non-nil when every paged chunk must remain materialized.")
+
+(defvar-local diffs--split-paged-retained-range nil
+  "Last paged split row range retained around the viewport.")
+
+(defvar-local diffs--split-row-length-tree []
+  "Fenwick tree of materialized text lengths for paged split rows.")
+
 (defvar-local diffs--split-decorated []
   "Boolean vector recording split rows with materialized visuals.")
 
@@ -3527,6 +3565,47 @@ The final slot is the position immediately after the last row.")
   "Line-number width used to decorate this split buffer.")
 
 (defvar diffs--split-syncing nil)
+
+(defun diffs--split-row-length-prefix (end)
+  "Return materialized text length in paged rows before END."
+  (let ((index end)
+        (total 0))
+    (while (> index 0)
+      (cl-incf total (aref diffs--split-row-length-tree index))
+      (cl-decf index (logand index (- index))))
+    total))
+
+(defun diffs--split-row-length-add (index delta)
+  "Add DELTA characters to paged row INDEX."
+  (let ((slot (1+ index))
+        (limit (length diffs--split-row-length-tree)))
+    (while (< slot limit)
+      (cl-incf (aref diffs--split-row-length-tree slot) delta)
+      (cl-incf slot (logand slot (- slot))))))
+
+(defun diffs--split-row-length-rebuild ()
+  "Rebuild the paged row-length tree from `diffs--split-rows'."
+  (let* ((count (length diffs--split-rows))
+         (tree (make-vector (1+ count) 0)))
+    (dotimes (index count)
+      (when-let* ((row (aref diffs--split-rows index)))
+        (aset tree (1+ index) (length (car row)))))
+    (let ((slot 1))
+      (while (<= slot count)
+        (let ((parent (+ slot (logand slot (- slot)))))
+          (when (<= parent count)
+            (cl-incf (aref tree parent) (aref tree slot))))
+        (cl-incf slot)))
+    (setq-local diffs--split-row-length-tree tree)))
+
+(defun diffs--split-row-position (index)
+  "Return the buffer position at the start of split row INDEX.
+INDEX may equal the row count, in which case return `point-max'."
+  (if diffs--split-paged-p
+      (+ (point-min)
+         index
+         (diffs--split-row-length-prefix index))
+    (aref diffs--split-row-positions index)))
 
 (defun diffs--split-row-index-at-position (position)
   "Return the zero-based split row index containing POSITION."
@@ -3536,7 +3615,7 @@ The final slot is the position immediately after the last row.")
             (high count))
         (while (< low high)
           (let ((middle (/ (+ low high) 2)))
-            (if (> (aref diffs--split-row-positions middle) position)
+            (if (> (diffs--split-row-position middle) position)
                 (setq high middle)
               (setq low (1+ middle)))))
         (max 0 (min (1- count) (1- low)))))))
@@ -3558,7 +3637,7 @@ The final slot is the position immediately after the last row.")
 
 (defun diffs--split-row-resolution-key (row)
   "Return the review resolution key carried by split ROW."
-  (let ((text (car row)))
+  (when-let* ((text (car row)))
     (and (not (string-empty-p text))
          (get-text-property 0 'diffs-resolution-key text))))
 
@@ -3773,6 +3852,128 @@ the hunk's logical separator as the first row."
           (forward-line 1))
         (flush)))
     (list (nreverse old-rows) (nreverse new-rows))))
+
+(defun diffs--split-hunk-row-count (section hunk)
+  "Return the non-wrapping physical row count for HUNK in SECTION."
+  (let* ((gap (diffs--gap-for-hunk hunk))
+         (separator
+          (and
+           (not (diffs--context-gap-fully-visible-p gap))
+           (diffs--hunk-separator section hunk 'split)))
+         (count
+          (+ (if (and separator
+                      (not (string-empty-p separator)))
+                 1
+               0)
+             (or (and gap (plist-get gap :visible)) 0)))
+         (end (diffs--hunk-end hunk section))
+         (deletions 0)
+         (additions 0))
+    (cl-labels
+        ((flush
+          ()
+          (cl-incf count (max deletions additions))
+          (setq deletions 0
+                additions 0)))
+      (save-excursion
+        (goto-char (car hunk))
+        (forward-line 1)
+        (while (and (< (point) end) (not (eobp)))
+          (pcase (char-after)
+            ((or ?\s ?\n)
+             (flush)
+             (cl-incf count))
+            (?-
+             (cl-incf deletions))
+            (?+
+             (cl-incf additions)))
+          (forward-line 1))
+        (flush)))
+    count))
+
+(defun diffs--split-estimated-row-count ()
+  "Return a cheap approximate row count for an automatic split.
+The estimate uses parsed hunk ranges instead of collecting or aligning
+row text.  It is only a policy threshold; paged rendering builds its own
+chunk index and corrects each chunk's exact height when materialized."
+  (let ((count 0))
+    (dolist (section diffs--sections)
+      ;; The normal and public custom header paths may suppress a header,
+      ;; but counting one keeps this policy computation hook-free and
+      ;; slightly conservative around the threshold.
+      (cl-incf count)
+      (if-let* ((hunks (plist-get section :hunks)))
+          (dolist (hunk hunks)
+            (let ((gap (diffs--gap-for-hunk hunk)))
+              (cl-incf count
+                       (+ (max (nth 5 hunk) (nth 6 hunk))
+                          (or (and gap (plist-get gap :visible)) 0)
+                          (if (diffs--context-gap-fully-visible-p gap)
+                              0
+                            1)))))
+        ;; Metadata-only sections are normally tiny, but counting their
+        ;; actual lines avoids selecting the complete model for a large
+        ;; binary or externally supplied patch item.
+        (cl-incf count
+                 (max 0
+                      (1-
+                       (count-lines
+                        (plist-get section :beg)
+                        (plist-get section :end)))))))
+    count))
+
+(defun diffs--split-paged-eligible-p (wrap-lines)
+  "Return non-nil when current split state permits paging.
+WRAP-LINES is the current wrapping setting."
+  (and (not wrap-lines)
+       (null diffs--review-selection)
+       (null diffs--review-annotations)
+       (null diffs--review-decisions)
+       (null diffs--review-source-actions)))
+
+(defun diffs--split-use-paged-p
+    (virtualization wrap-lines threshold &optional estimated-row-count)
+  "Return non-nil when this split should use paged rendering.
+VIRTUALIZATION is the configured policy, WRAP-LINES is the current
+wrapping setting, and THRESHOLD is the automatic row threshold.
+ESTIMATED-ROW-COUNT reuses a valid cached estimate when supplied."
+  (and (diffs--split-paged-eligible-p wrap-lines)
+       (or (eq virtualization 'paged)
+           (and (eq virtualization 'auto)
+                (>= (or estimated-row-count
+                        (diffs--split-estimated-row-count))
+                    threshold)))))
+
+(defun diffs--split-paged-index ()
+  "Return a lightweight non-wrapping split index for the current diff.
+The result is (CHUNKS ANCHORS ROW-COUNT).  Each chunk is a vector
+\(KIND SECTION PAYLOAD START COUNT), where PAYLOAD is a rendered header
+or hunk depending on KIND."
+  (let ((row 0)
+        chunks anchors)
+    (dolist (section diffs--sections)
+      (let ((header (diffs--file-header section 'split)))
+        (when header
+          (push (vector 'header section header row 1) chunks)
+          (cl-incf row))
+        (unless (plist-get section :hunks)
+          (let ((count
+                 (save-excursion
+                   (goto-char (plist-get section :beg))
+                   (forward-line 1)
+                   (count-lines (point) (plist-get section :end)))))
+            (when (> count 0)
+              (push (vector 'meta section nil row count) chunks)
+              (cl-incf row count))))
+        (dolist (hunk (plist-get section :hunks))
+          (let ((count (diffs--split-hunk-row-count section hunk)))
+            (push (1+ row) anchors)
+            (when (> count 0)
+              (push (vector 'hunk section hunk row count) chunks)
+              (cl-incf row count))))))
+    (list (vconcat (nreverse chunks))
+          (nreverse anchors)
+          row)))
 
 (defun diffs--split-collect ()
   "Collect aligned row lists from the current unified diffs buffer.
@@ -4053,7 +4254,8 @@ of rendered hunk starts.  A hidden complete-context separator anchors
 its first context row.  Physical rows append the immutable patch-side
 source number, source-character offset, original old/new source side,
 and live-worktree target number."
-  (let (old-physical new-physical anchors)
+  (let (old-physical new-physical anchors
+        (physical-count 0))
     (cl-labels
         ((physical-row (source part first role paired-offset)
            (let ((offset (if part (cdr part) paired-offset)))
@@ -4080,7 +4282,7 @@ and live-worktree target number."
        (lambda (old new)
          (let ((separator (eq (nth 3 old) 'sep)))
            (when separator
-             (push (length old-physical) anchors))
+             (push physical-count anchors))
            (unless (and separator
                         (string-empty-p (car old))
                         (string-empty-p (car new)))
@@ -4108,11 +4310,640 @@ and live-worktree target number."
                          old-physical)
                    (push (physical-row
                           new new-part (zerop index) 'new paired-offset)
-                         new-physical)))))))
+                         new-physical)
+                   (cl-incf physical-count)))))))
        old-rows new-rows))
     (list (vconcat (nreverse old-physical))
           (vconcat (nreverse new-physical))
           (nreverse anchors))))
+
+(defun diffs--split-paged-chunk-index-at-row (row)
+  "Return the paged chunk index containing split ROW."
+  (let ((low 0)
+        (high (1- (length diffs--split-chunks)))
+        found)
+    (while (and (not found) (<= low high))
+      (let* ((middle (/ (+ low high) 2))
+             (chunk (aref diffs--split-chunks middle))
+             (start (aref chunk 3))
+             (end (+ start (aref chunk 4))))
+        (cond
+         ((< row start)
+          (setq high (1- middle)))
+         ((>= row end)
+          (setq low (1+ middle)))
+         (t
+          (setq found middle)))))
+    found))
+
+(defun diffs--split-paged-pair ()
+  "Return the current paged split buffers as (OLD . NEW)."
+  (if (eq diffs--split-role 'old)
+      (cons (current-buffer) diffs--split-other)
+    (cons diffs--split-other (current-buffer))))
+
+(defun diffs--split-paged-position-anchor (position)
+  "Return a stable paged coordinate for buffer POSITION."
+  (if (= position (point-max))
+      'end
+    (when-let* ((row (diffs--split-row-index-at-position position))
+                (chunk-index
+                 (diffs--split-paged-chunk-index-at-row row)))
+      (let ((chunk (aref diffs--split-chunks chunk-index)))
+        (vector chunk-index
+                (- row (aref chunk 3))
+                (- position (diffs--split-row-position row)))))))
+
+(defun diffs--split-paged-resolve-position (anchor)
+  "Resolve stable paged position ANCHOR in the current projection."
+  (if (eq anchor 'end)
+      (point-max)
+    (if (not (vectorp anchor))
+        (point-min)
+      (let* ((chunk (aref diffs--split-chunks (aref anchor 0)))
+             (count (aref chunk 4))
+             (row
+              (+ (aref chunk 3)
+                 (min (aref anchor 1) (max 0 (1- count))))))
+        (if (zerop count)
+            (diffs--split-row-position row)
+          (let ((begin (diffs--split-row-position row))
+                (end (diffs--split-row-position (1+ row))))
+            (min end (+ begin (aref anchor 2)))))))))
+
+(defun diffs--split-paged-resize-side (boundary delta)
+  "Resize one paged split side by DELTA rows at BOUNDARY.
+Positive DELTA inserts skeleton rows.  Negative DELTA removes the
+trailing overestimate immediately before BOUNDARY."
+  (let* ((old-rows diffs--split-rows)
+         (old-decorated diffs--split-decorated)
+         (old-count (length old-rows))
+         (new-count (+ old-count delta))
+         (prefix-count (if (< delta 0)
+                           (+ boundary delta)
+                         boundary))
+         (suffix-start boundary)
+         (suffix-target (+ boundary delta))
+         (new-rows (make-vector new-count nil))
+         (new-decorated (make-bool-vector new-count nil)))
+    (when (or (< new-count 0)
+              (< prefix-count 0)
+              (> boundary old-count))
+      (error "Invalid paged split resize at %d by %d"
+             boundary delta))
+    (when (< delta 0)
+      (cl-loop
+       for index from prefix-count below boundary
+       when (aref old-rows index)
+       do
+       (error "Cannot remove a materialized paged split row")))
+    (dotimes (index prefix-count)
+      (aset new-rows index (aref old-rows index))
+      (when (aref old-decorated index)
+        (aset new-decorated index t)))
+    (dotimes (offset (- old-count suffix-start))
+      (let ((old-index (+ suffix-start offset))
+            (new-index (+ suffix-target offset)))
+        (aset new-rows new-index (aref old-rows old-index))
+        (when (aref old-decorated old-index)
+          (aset new-decorated new-index t))))
+    (let ((inhibit-read-only t))
+      (save-excursion
+        (with-silent-modifications
+          (if (> delta 0)
+              (progn
+                (goto-char (diffs--split-row-position boundary))
+                (insert (make-string delta ?\n)))
+            (delete-region
+             (diffs--split-row-position (+ boundary delta))
+             (diffs--split-row-position boundary))))))
+    (setq-local diffs--split-rows new-rows)
+    (setq-local diffs--split-decorated new-decorated)
+    (setq-local diffs--split-paged-retained-range nil)
+    (diffs--split-row-length-rebuild)))
+
+(defun diffs--split-paged-store-anchors
+    (anchors old-buffer new-buffer)
+  "Store ANCHORS for OLD-BUFFER, NEW-BUFFER, and their owner cache."
+  (dolist (buffer (list old-buffer new-buffer))
+    (with-current-buffer buffer
+      (setq-local diffs--split-anchors anchors)))
+  (when-let* ((owner
+               (buffer-local-value
+                'diffs--split-unified old-buffer))
+              ((buffer-live-p owner)))
+    (with-current-buffer owner
+      (setq diffs--split-cache
+            (plist-put diffs--split-cache :anchors anchors)))))
+
+(defun diffs--split-paged-adjust-anchors
+    (boundary delta old-buffer new-buffer)
+  "Shift anchors after BOUNDARY by DELTA in OLD-BUFFER and NEW-BUFFER."
+  (diffs--split-paged-store-anchors
+   (mapcar
+    (lambda (anchor)
+      (if (> anchor boundary) (+ anchor delta) anchor))
+    (buffer-local-value 'diffs--split-anchors old-buffer))
+   old-buffer new-buffer))
+
+(defun diffs--split-paged-correct-chunk-height
+    (index actual-count old-buffer new-buffer)
+  "Correct chunk INDEX to ACTUAL-COUNT in OLD-BUFFER and NEW-BUFFER.
+Return the signed row-count adjustment."
+  (let* ((chunks
+          (buffer-local-value 'diffs--split-chunks old-buffer))
+         (chunk (aref chunks index))
+         (old-count (aref chunk 4))
+         (delta (- actual-count old-count))
+         (boundary (+ (aref chunk 3) old-count))
+         (old-range
+          (buffer-local-value
+           'diffs--split-paged-retained-range old-buffer))
+         (new-range
+          (buffer-local-value
+           'diffs--split-paged-retained-range new-buffer))
+         old-resized)
+    (unless (zerop delta)
+      (when (or
+             (aref
+              (buffer-local-value
+               'diffs--split-materialized-chunks old-buffer)
+              index)
+             (aref
+              (buffer-local-value
+               'diffs--split-materialized-chunks new-buffer)
+              index))
+        (error "Cannot resize a materialized paged split chunk"))
+      (condition-case error-data
+          (progn
+            (with-current-buffer old-buffer
+              (diffs--split-paged-resize-side boundary delta))
+            (setq old-resized t)
+            (with-current-buffer new-buffer
+              (diffs--split-paged-resize-side boundary delta)))
+        (error
+         (when old-resized
+           (with-current-buffer old-buffer
+             (diffs--split-paged-resize-side
+              (+ boundary delta) (- delta))
+             (setq-local diffs--split-paged-retained-range old-range)))
+         (with-current-buffer new-buffer
+           (setq-local diffs--split-paged-retained-range new-range))
+         (signal (car error-data) (cdr error-data))))
+      (aset chunk 4 actual-count)
+      (cl-loop
+       for later from (1+ index) below (length chunks)
+       do
+       (let ((later-chunk (aref chunks later)))
+         (aset later-chunk 3 (+ (aref later-chunk 3) delta))))
+      (diffs--split-paged-adjust-anchors
+       boundary delta old-buffer new-buffer))
+    delta))
+
+(defun diffs--split-paged-chunk-rows (chunk)
+  "Return paired non-wrapping physical row vectors for CHUNK."
+  (let ((section (aref chunk 1))
+        (payload (aref chunk 2)))
+    (pcase (aref chunk 0)
+      ('header
+       (let* ((file (plist-get section :file))
+              (row (list payload nil nil 'header file nil nil nil))
+              (rows (vector row)))
+         (list rows (vector (copy-sequence row)))))
+      ('meta
+       (let ((file (plist-get section :file))
+             old new)
+         (save-excursion
+           (goto-char (plist-get section :beg))
+           (forward-line 1)
+           (while (< (point) (plist-get section :end))
+             (let* ((text
+                     (buffer-substring
+                      (line-beginning-position)
+                      (line-end-position)))
+                    (row
+                     (list text nil nil 'meta file nil nil nil)))
+               (push row old)
+               (push (copy-sequence row) new))
+             (forward-line 1)))
+         (list (vconcat (nreverse old))
+               (vconcat (nreverse new)))))
+      ('hunk
+       (pcase-let* ((`(,old ,new)
+                      (diffs--split-collect-hunk
+                       section payload t))
+                    (`(,old-physical ,new-physical . ,_)
+                     (diffs--split-physical-rows
+                      old new nil)))
+         (list old-physical new-physical))))))
+
+(defun diffs--split-paged-complete-projection (chunks)
+  "Return an exact complete projection for paged CHUNKS.
+The result is \(CHUNKS ANCHORS OLD-ROWS NEW-ROWS)."
+  (let ((row 0)
+        exact-chunks anchors old-rows new-rows)
+    (dotimes (index (length chunks))
+      (let* ((chunk (aref chunks index))
+             (rows (diffs--split-paged-chunk-rows chunk))
+             (old (nth 0 rows))
+             (new (nth 1 rows))
+             (count (length old))
+             (exact (copy-sequence chunk)))
+        (unless (= count (length new))
+          (error "Paged split sides disagree for chunk %d" index))
+        (aset exact 3 row)
+        (aset exact 4 count)
+        (when (eq (aref exact 0) 'hunk)
+          (push (1+ row) anchors))
+        (dotimes (offset count)
+          (push (aref old offset) old-rows)
+          (push (aref new offset) new-rows))
+        (push exact exact-chunks)
+        (cl-incf row count)))
+    (list
+     (vconcat (nreverse exact-chunks))
+     (nreverse anchors)
+     (vconcat (nreverse old-rows))
+     (vconcat (nreverse new-rows)))))
+
+(defun diffs--split-paged-install-complete (chunks rows)
+  "Bulk-install exact paged CHUNKS and one side's complete ROWS."
+  (let* ((count (length rows))
+         (point-anchor
+          (diffs--split-paged-position-anchor (point)))
+         (window-states
+          (mapcar
+           (lambda (window)
+             (list
+              window
+              (diffs--split-paged-position-anchor
+               (window-start window))
+              (diffs--split-paged-position-anchor
+               (window-point window))))
+           (get-buffer-window-list (current-buffer) nil t)))
+         (text
+          (mapconcat
+           (lambda (row) (concat (car row) "\n"))
+           rows ""))
+         (inhibit-read-only t))
+    (with-silent-modifications
+      (erase-buffer)
+      (insert text))
+    (setq-local diffs--split-chunks chunks)
+    (setq-local diffs--split-rows rows)
+    (setq-local diffs--split-row-positions [])
+    (setq-local diffs--split-decorated
+                (make-bool-vector count nil))
+    (setq-local diffs--split-materialized-chunks
+                (make-bool-vector (length chunks) t))
+    (setq-local diffs--split-materialized-indexes
+                (when (> (length chunks) 0)
+                  (number-sequence 0 (1- (length chunks)))))
+    (setq-local diffs--split-paged-retained-range nil)
+    (diffs--split-row-length-rebuild)
+    (goto-char
+     (diffs--split-paged-resolve-position point-anchor))
+    (dolist (state window-states)
+      (let ((window (nth 0 state)))
+        (when (and (window-live-p window)
+                   (eq (window-buffer window) (current-buffer)))
+          (set-window-start
+           window
+           (diffs--split-paged-resolve-position (nth 1 state))
+           t)
+          (set-window-point
+           window
+           (diffs--split-paged-resolve-position (nth 2 state))))))))
+
+(defun diffs--split-install-skeleton (count chunks width)
+  "Install a paged skeleton with COUNT rows indexed by CHUNKS.
+WIDTH is the line-number width used to decorate visible rows."
+  (let ((inhibit-read-only t))
+    (insert (make-string count ?\n))
+    (setq-local diffs--split-paged-p t)
+    (setq-local diffs--split-chunks chunks)
+    (setq-local diffs--split-materialized-chunks
+                (make-bool-vector (length chunks) nil))
+    (setq-local diffs--split-materialized-indexes nil)
+    (setq-local diffs--split-paged-pinned nil)
+    (setq-local diffs--split-paged-retained-range nil)
+    (setq-local diffs--split-row-length-tree
+                (make-vector (1+ count) 0))
+    (setq-local diffs--split-rows (make-vector count nil))
+    (setq-local diffs--split-row-positions [])
+    (setq-local diffs--split-decorated
+                (make-bool-vector count nil))
+    (setq-local diffs--split-render-width width)
+    (setq-local filter-buffer-substring-function
+                #'diffs--split-filter-buffer-substring)))
+
+(defun diffs--split-paged-insert-chunk (index rows)
+  "Insert one side's ROWS for paged chunk INDEX."
+  (let* ((chunk (aref diffs--split-chunks index))
+         (start (aref chunk 3))
+         (count (aref chunk 4)))
+    (unless (= count (length rows))
+      (error "Paged split chunk expected %d rows, got %d"
+             count (length rows)))
+    (let ((begin (diffs--split-row-position start))
+          (end (diffs--split-row-position (+ start count)))
+          (inhibit-read-only t)
+          pieces point-anchor)
+      (when (and (>= (point) begin) (< (point) end))
+        (setq point-anchor
+              (diffs--split-paged-position-anchor (point))))
+      (dotimes (offset count)
+        (let* ((row (aref rows offset))
+               (text (car row)))
+          (push (concat text "\n") pieces)))
+      (save-excursion
+        (with-silent-modifications
+          (delete-region begin end)
+          (goto-char begin)
+          (insert (apply #'concat (nreverse pieces)))))
+      (dotimes (offset count)
+        (aset diffs--split-rows
+              (+ start offset) (aref rows offset))
+        (diffs--split-row-length-add
+         (+ start offset)
+         (length (car (aref rows offset)))))
+      (aset diffs--split-materialized-chunks index t)
+      (push index diffs--split-materialized-indexes)
+      (when point-anchor
+        (goto-char
+         (diffs--split-paged-resolve-position point-anchor))))))
+
+(defun diffs--split-paged-remove-chunk (index)
+  "Replace materialized paged chunk INDEX with its row skeleton."
+  (let* ((chunk (aref diffs--split-chunks index))
+         (start (aref chunk 3))
+         (count (aref chunk 4))
+         (begin (diffs--split-row-position start))
+         (end (diffs--split-row-position (+ start count)))
+         (inhibit-read-only t)
+         point-anchor)
+    (when (and (>= (point) begin) (< (point) end))
+      (setq point-anchor
+            (diffs--split-paged-position-anchor (point))))
+    (save-excursion
+      (with-silent-modifications
+        (delete-region begin end)
+        (goto-char begin)
+        (insert (make-string count ?\n))))
+    (dotimes (offset count)
+      (let* ((row-index (+ start offset))
+             (row (aref diffs--split-rows row-index)))
+        (when row
+          (diffs--split-row-length-add
+           row-index (- (length (car row)))))
+        (aset diffs--split-rows row-index nil)
+        (aset diffs--split-decorated row-index nil)))
+    (aset diffs--split-materialized-chunks index nil)
+    (setq-local diffs--split-materialized-indexes
+                (delq index diffs--split-materialized-indexes))
+    (when point-anchor
+      (goto-char
+       (diffs--split-paged-resolve-position point-anchor)))))
+
+(defun diffs--split-paged-materialize-range (start end)
+  "Materialize paged chunks intersecting split rows START through END.
+Return (START END RESIZED), adjusting the range when exact alignment
+changes a chunk's cheap indexed height."
+  (let ((range-start start)
+        (range-end end)
+        resized)
+    (when (and diffs--split-paged-p
+               (< start end)
+               (> (length diffs--split-chunks) 0))
+      (let* ((first
+              (diffs--split-paged-chunk-index-at-row
+               (max 0 start)))
+             (last
+              (diffs--split-paged-chunk-index-at-row
+               (min (1- (length diffs--split-rows))
+                    (1- end))))
+             (owner diffs--split-unified)
+             (pair (diffs--split-paged-pair))
+             (old-buffer (car pair))
+             (new-buffer (cdr pair))
+             (chunks diffs--split-chunks))
+        (when (and first last
+                   (buffer-live-p owner)
+                   (buffer-live-p old-buffer)
+                   (buffer-live-p new-buffer))
+          (cl-loop
+           for index from first to last
+           do
+           (let ((old-present
+                  (aref
+                   (buffer-local-value
+                    'diffs--split-materialized-chunks old-buffer)
+                   index))
+                 (new-present
+                  (aref
+                   (buffer-local-value
+                    'diffs--split-materialized-chunks new-buffer)
+                   index)))
+             (unless (and old-present new-present)
+               ;; Repair a stale one-sided cache before replacing the pair.
+               (when old-present
+                 (with-current-buffer old-buffer
+                   (diffs--split-paged-remove-chunk index)))
+               (when new-present
+                 (with-current-buffer new-buffer
+                   (diffs--split-paged-remove-chunk index)))
+               (let* ((chunk (aref chunks index))
+                      (old-count (aref chunk 4))
+                      (boundary (+ (aref chunk 3) old-count))
+                      (rows
+                       (with-current-buffer owner
+                         (diffs--split-paged-chunk-rows chunk)))
+                      (old-rows (nth 0 rows))
+                      (new-rows (nth 1 rows))
+                      (actual-count (length old-rows)))
+                 (unless (= actual-count (length new-rows))
+                   (error
+                    "Paged split sides disagree for chunk %d" index))
+                 (unless (= actual-count old-count)
+                   (let ((delta
+                          (diffs--split-paged-correct-chunk-height
+                           index actual-count
+                           old-buffer new-buffer)))
+                     (when (>= range-start boundary)
+                       (cl-incf range-start delta))
+                     (when (>= range-end boundary)
+                       (cl-incf range-end delta))
+                     (setq resized t)))
+                 (with-current-buffer old-buffer
+                   (diffs--split-paged-insert-chunk index old-rows))
+                 (condition-case error-data
+                     (with-current-buffer new-buffer
+                       (diffs--split-paged-insert-chunk index new-rows))
+                   (error
+                    (with-current-buffer old-buffer
+                      (diffs--split-paged-remove-chunk index))
+                    (signal
+                     (car error-data) (cdr error-data)))))))))))
+    (list range-start range-end resized)))
+
+(defun diffs--split-paged-materialize-hunk (hunk)
+  "Materialize the paged chunk that owns HUNK."
+  (when (and diffs--split-paged-p hunk)
+    (when-let* ((index
+                 (cl-position-if
+                  (lambda (chunk)
+                    (and (eq (aref chunk 0) 'hunk)
+                         (eq (aref chunk 2) hunk)))
+                  diffs--split-chunks)))
+      (let* ((chunk (aref diffs--split-chunks index))
+             (start (aref chunk 3)))
+        (diffs--split-paged-materialize-range
+         start (+ start (aref chunk 4)))))))
+
+(defun diffs--split-paged-retain-range (start end)
+  "Retain paged chunks intersecting rows START through END.
+Materialized chunks outside the range are returned to their lightweight
+row skeleton in both columns."
+  (unless (or diffs--split-paged-pinned
+              (equal diffs--split-paged-retained-range
+                     (cons start end)))
+    (let* ((pair (diffs--split-paged-pair))
+           (old-buffer (car pair))
+           (new-buffer (cdr pair)))
+      (when (and (buffer-live-p old-buffer)
+                 (buffer-live-p new-buffer))
+        (dolist (index
+                 (copy-sequence diffs--split-materialized-indexes))
+          (let* ((chunk (aref diffs--split-chunks index))
+                 (chunk-start (aref chunk 3))
+                 (chunk-end (+ chunk-start (aref chunk 4))))
+            (when (or (<= chunk-end start)
+                      (>= chunk-start end))
+              (when (aref
+                     (buffer-local-value
+                      'diffs--split-materialized-chunks old-buffer)
+                     index)
+                (with-current-buffer old-buffer
+                  (diffs--split-paged-remove-chunk index)))
+              (when (aref
+                     (buffer-local-value
+                      'diffs--split-materialized-chunks new-buffer)
+                     index)
+                (with-current-buffer new-buffer
+                  (diffs--split-paged-remove-chunk index))))))
+        (dolist (buffer (list old-buffer new-buffer))
+          (with-current-buffer buffer
+            (setq-local diffs--split-paged-retained-range
+                        (cons start end))))))))
+
+(defun diffs--split-paged-materialize-all ()
+  "Materialize and retain every chunk in the current split pair."
+  (when diffs--split-paged-p
+    (let* ((calling-buffer (current-buffer))
+           (pair (diffs--split-paged-pair))
+           (old-buffer (car pair))
+           (new-buffer (cdr pair))
+           (old-pinned
+            (buffer-local-value
+             'diffs--split-paged-pinned old-buffer))
+           (new-pinned
+            (buffer-local-value
+             'diffs--split-paged-pinned new-buffer))
+           (old-range
+            (buffer-local-value
+             'diffs--split-paged-retained-range old-buffer))
+           (new-range
+            (buffer-local-value
+             'diffs--split-paged-retained-range new-buffer))
+           (owner diffs--split-unified)
+           (chunks diffs--split-chunks)
+           projection)
+      (unless
+          (and
+           old-pinned new-pinned
+           (not
+            (cl-position
+             nil
+             (buffer-local-value
+              'diffs--split-materialized-chunks old-buffer)))
+           (not
+            (cl-position
+             nil
+             (buffer-local-value
+              'diffs--split-materialized-chunks new-buffer))))
+        ;; Exact alignment happens before either derived buffer changes.
+        ;; A loader or renderer error therefore leaves the visible pair and
+        ;; its pinning policy untouched.
+        (setq projection
+              (with-current-buffer owner
+                (diffs--split-paged-complete-projection chunks)))
+        (condition-case error-data
+            (pcase-let ((`(,exact-chunks ,anchors
+                          ,old-rows ,new-rows)
+                         projection))
+              (with-current-buffer old-buffer
+                (diffs--split-paged-install-complete
+                 exact-chunks old-rows))
+              (with-current-buffer new-buffer
+                (diffs--split-paged-install-complete
+                 exact-chunks new-rows))
+              (diffs--split-paged-store-anchors
+               anchors old-buffer new-buffer)
+              (dolist (buffer (list old-buffer new-buffer))
+                (with-current-buffer buffer
+                  (setq-local diffs--split-paged-pinned t)
+                  (setq-local diffs--split-paged-retained-range nil)))
+              (when-let* ((window
+                           (get-buffer-window calling-buffer t)))
+                (diffs--split-materialize-window window)))
+          (error
+           (with-current-buffer old-buffer
+             (setq-local diffs--split-paged-pinned old-pinned)
+             (setq-local diffs--split-paged-retained-range old-range))
+           (with-current-buffer new-buffer
+             (setq-local diffs--split-paged-pinned new-pinned)
+             (setq-local diffs--split-paged-retained-range new-range))
+           (signal (car error-data) (cdr error-data))))))))
+
+(defun diffs--split-filter-buffer-substring (begin end delete)
+  "Return paged split text between BEGIN and END.
+Materialize the complete projection before copying so normal `kill-ring'
+commands never observe skeleton rows.  Delete the range when DELETE is
+non-nil."
+  (let ((begin-anchor
+         (diffs--split-paged-position-anchor begin))
+        (end-anchor
+         (diffs--split-paged-position-anchor end)))
+    (diffs--split-paged-materialize-all)
+    (let* ((new-begin
+            (diffs--split-paged-resolve-position begin-anchor))
+           (new-end
+            (diffs--split-paged-resolve-position end-anchor))
+           (start (min new-begin new-end))
+           (finish (max new-begin new-end))
+           (text (buffer-substring start finish)))
+      (when delete
+        (delete-region start finish))
+      text)))
+
+(defun diffs--split-pre-command ()
+  "Prepare complete paged text for commands that inspect offscreen rows."
+  (when (and diffs--split-paged-p
+             (or
+              (and
+               (symbolp this-command)
+               (string-prefix-p
+                "isearch-" (symbol-name this-command)))
+              (memq this-command
+                    '(occur
+                      multi-occur
+                      query-replace
+                      query-replace-regexp
+                      diffs-review-select
+                      diffs-review-add-annotation
+                      diffs-review-previous-annotation
+                      diffs-review-next-annotation))))
+    (diffs--split-paged-materialize-all)))
 
 (defun diffs--split-source-face-runs (row)
   "Return source face runs corresponding to split ROW.
@@ -4278,8 +5109,8 @@ Each run is (START END FACE), with offsets relative to ROW's text."
                    (eq section
                        (diffs--token-section-for-row owner row)))
                 (diffs--split-apply-source-faces
-                 (aref diffs--split-row-positions index)
-                 (aref diffs--split-row-positions (1+ index))
+                 (diffs--split-row-position index)
+                 (diffs--split-row-position (1+ index))
                  row))))
           (force-window-update buffer))))))
 
@@ -4395,10 +5226,21 @@ WIDTH is retained for later incremental decoration."
         (cl-incf position (length piece))))
     (aset positions count position)
     (insert (mapconcat #'identity pieces ""))
+    (setq-local diffs--split-paged-p nil)
+    (setq-local diffs--split-chunks [])
+    (setq-local diffs--split-materialized-chunks [])
+    (setq-local diffs--split-materialized-indexes nil)
+    (setq-local diffs--split-paged-pinned nil)
+    (setq-local diffs--split-paged-retained-range nil)
+    (setq-local diffs--split-row-length-tree [])
     (setq-local diffs--split-rows rows)
     (setq-local diffs--split-row-positions positions)
-    (setq-local diffs--split-decorated (make-vector count nil))
-    (setq-local diffs--split-render-width width)))
+    (setq-local diffs--split-decorated
+                (make-bool-vector count nil))
+    (setq-local diffs--split-render-width width)
+    (when (eq filter-buffer-substring-function
+              #'diffs--split-filter-buffer-substring)
+      (kill-local-variable 'filter-buffer-substring-function))))
 
 (defun diffs--split-render-pair
     (old-rows new-rows width content-width old-buffer new-buffer)
@@ -4415,22 +5257,45 @@ the rendered hunk anchor line numbers."
       (diffs--split-install-rows new width))
     (mapcar #'1+ anchor-indexes)))
 
+(defun diffs--split-render-paged
+    (index width old-buffer new-buffer)
+  "Install paged split INDEX into OLD-BUFFER and NEW-BUFFER.
+WIDTH is the gutter width.  Return the indexed hunk anchor line numbers."
+  (pcase-let ((`(,chunks ,anchors ,count) index))
+    (with-current-buffer old-buffer
+      (diffs--split-install-skeleton
+       count chunks width))
+    (with-current-buffer new-buffer
+      (diffs--split-install-skeleton
+       count chunks width))
+    anchors))
+
 (defun diffs--split-materialize-range (start end)
-  "Decorate split rows in the half-open index range START..END."
-  (let ((limit (min end (length diffs--split-rows)))
-        (inhibit-read-only t))
+  "Decorate split rows in the half-open index range START..END.
+Return (START END RESIZED) using corrected paged row coordinates."
+  (pcase-let* ((range
+                (if diffs--split-paged-p
+                    (diffs--split-paged-materialize-range start end)
+                  (list start end nil)))
+               (`(,range-start ,range-end ,resized) range)
+               (limit
+                (min range-end (length diffs--split-rows)))
+               (inhibit-read-only t))
     (with-silent-modifications
       (cl-loop
-       for index from (max 0 start) below limit
-       unless (aref diffs--split-decorated index)
+       for index from (max 0 range-start) below limit
+       for row = (aref diffs--split-rows index)
+       when (and row
+                 (not (aref diffs--split-decorated index)))
        do
        (diffs--split-decorate-row
-        (aref diffs--split-row-positions index)
-        (aref diffs--split-row-positions (1+ index))
-        (aref diffs--split-rows index)
+        (diffs--split-row-position index)
+        (diffs--split-row-position (1+ index))
+        row
         diffs--split-render-width
         diffs--split-role)
-       (aset diffs--split-decorated index t)))))
+       (aset diffs--split-decorated index t)))
+    (list range-start range-end resized)))
 
 (defun diffs--split-materialize-window (window &optional start)
   "Materialize WINDOW's visible split rows plus overscan.
@@ -4441,28 +5306,106 @@ columns materialize the same row interval."
       (with-current-buffer buffer
         (when (> (length diffs--split-rows) 0)
           (let* ((position (or start (window-start window)))
-                 (first (diffs--split-row-index-at-position position))
-                 (visible-end
-                  (save-excursion
-                    (goto-char position)
-                    ;; `window-end' may still be point-max before the
-                    ;; first redisplay.  Physical split rows are lines,
-                    ;; so the body height gives a stable viewport bound.
-                    (forward-line (1+ (window-body-height window)))
-                    (point)))
-                 (last
-                  (1+ (or (diffs--split-row-index-at-position visible-end)
-                          first)))
-                 (range-start (max 0 (- first diffs-split-overscan)))
-                 (range-end
-                  (min (length diffs--split-rows)
-                       (+ last diffs-split-overscan)))
                  (other diffs--split-other))
-            (diffs--split-materialize-range range-start range-end)
-            (when (buffer-live-p other)
-              (with-current-buffer other
-                (diffs--split-materialize-range
-                 range-start range-end)))))))))
+            (if (not diffs--split-paged-p)
+                (let* ((first
+                        (diffs--split-row-index-at-position position))
+                       (visible-end
+                        (save-excursion
+                          (goto-char position)
+                          (forward-line
+                           (1+ (window-body-height window)))
+                          (point)))
+                       (last
+                        (1+
+                         (or
+                          (diffs--split-row-index-at-position visible-end)
+                          first)))
+                       (range-start
+                        (max 0 (- first diffs-split-overscan)))
+                       (range-end
+                        (min
+                         (length diffs--split-rows)
+                         (+ last diffs-split-overscan))))
+                  (diffs--split-materialize-range
+                   range-start range-end)
+                  (when (buffer-live-p other)
+                    (with-current-buffer other
+                      (diffs--split-materialize-range
+                       range-start range-end)))
+                  position)
+              (let ((position-anchor
+                     (diffs--split-paged-position-anchor position))
+                    (vscroll (window-vscroll window t))
+                    resized
+                    first range-start range-end)
+                (cl-labels
+                    ((visible-range
+                      ()
+                      (let* ((resolved
+                              (diffs--split-paged-resolve-position
+                               position-anchor))
+                             (row
+                              (diffs--split-row-index-at-position
+                               resolved))
+                             (visible-end
+                              (save-excursion
+                                (goto-char resolved)
+                                ;; `window-end' may still be point-max
+                                ;; before the first redisplay.
+                                (forward-line
+                                 (1+ (window-body-height window)))
+                                (point)))
+                             (last
+                              (1+
+                               (or
+                                (diffs--split-row-index-at-position
+                                 visible-end)
+                                row))))
+                        (list
+                         row
+                         (max 0 (- row diffs-split-overscan))
+                         (min
+                          (length diffs--split-rows)
+                          (+ last diffs-split-overscan))))))
+                  (setq resized t)
+                  (while resized
+                    (pcase-let
+                        ((`(,visible-first ,desired-start ,desired-end)
+                          (visible-range)))
+                      (setq first visible-first)
+                      (pcase-let
+                          ((`(,actual-start ,actual-end ,changed)
+                            (diffs--split-materialize-range
+                             desired-start desired-end)))
+                        (setq range-start actual-start
+                              range-end actual-end
+                              resized changed)
+                        (when (buffer-live-p other)
+                          (with-current-buffer other
+                            (pcase-let
+                                ((`(,peer-start ,peer-end ,peer-changed)
+                                  (diffs--split-materialize-range
+                                   range-start range-end)))
+                              (setq range-start peer-start
+                                    range-end peer-end
+                                    resized
+                                    (or resized peer-changed)))))))))
+                  (diffs--split-paged-retain-range
+                   (max 0 (- range-start diffs-split-overscan))
+                   (min
+                    (length diffs--split-rows)
+                    (+ range-end diffs-split-overscan)))
+                  (setq position
+                        (diffs--split-paged-resolve-position
+                         position-anchor)
+                        first
+                        (diffs--split-row-index-at-position position))
+                  (let ((canonical
+                         (diffs--split-row-position first)))
+                    (set-window-start window canonical t)
+                    (set-window-vscroll window vscroll t)
+                    canonical)))))))))
 
 (defun diffs--split-sync-from (window &optional start)
   "Align the window(s) paired with WINDOW to its scroll position.
@@ -4484,12 +5427,12 @@ axes stay in lockstep."
         (unless (equal state (window-parameter window 'diffs--sync))
           (set-window-parameter window 'diffs--sync state)
           (let* ((row
-                  (with-current-buffer buf
+                 (with-current-buffer buf
                     (or (diffs--split-row-index-at-position start) 0)))
                  (pos
                   (with-current-buffer other
-                    (aref diffs--split-row-positions
-                          (min row (1- (length diffs--split-rows)))))))
+                    (diffs--split-row-position
+                     (min row (1- (length diffs--split-rows)))))))
             (dolist (w (get-buffer-window-list other nil t))
               (set-window-start w pos)
               (set-window-vscroll w vscroll t)
@@ -4537,8 +5480,8 @@ commands retain their logical meaning independently on both sides."
               (with-current-buffer other
                 (save-excursion
                   (goto-char
-                   (aref diffs--split-row-positions
-                         (min row (1- (length diffs--split-rows)))))
+                   (diffs--split-row-position
+                    (min row (1- (length diffs--split-rows)))))
                   (pcase edge
                     ('beginning (line-beginning-position))
                     ('end (line-end-position))
@@ -4591,9 +5534,11 @@ and treat the peer as the horizontal source of truth."
   (unless diffs--split-syncing
     (let ((diffs--split-syncing t))
       (with-demoted-errors "diffs split sync: %S"
-        (diffs--split-materialize-window window start)
-        (diffs--split-sync-from window start)
-        (diffs--split-sync-index start)))))
+        (let ((position
+               (or (diffs--split-materialize-window window start)
+                   start)))
+          (diffs--split-sync-from window position)
+          (diffs--split-sync-index position))))))
 
 (defun diffs--split-post-command ()
   "Sync the paired window after commands in a split buffer."
@@ -4637,6 +5582,7 @@ and treat the peer as the horizontal source of truth."
   (setq truncate-lines t)
   (setq-local cursor-in-non-selected-windows nil)
   (add-hook 'text-scale-mode-hook #'diffs--define-fringe-bitmap nil t)
+  (add-hook 'pre-command-hook #'diffs--split-pre-command nil t)
   (add-hook 'post-command-hook #'diffs--split-post-command nil t)
   (add-hook 'window-scroll-functions #'diffs--split-scroll-hook nil t)
   (add-hook 'eldoc-documentation-functions
@@ -4651,11 +5597,11 @@ and treat the peer as the horizontal source of truth."
                    (cl-find-if (lambda (l) (< l line))
                                (reverse diffs--split-anchors)))))
     (unless target (user-error "No more hunks"))
-    (goto-char (aref diffs--split-row-positions (1- target)))
+    (goto-char (diffs--split-row-position (1- target)))
     (dolist (w (get-buffer-window-list diffs--split-other nil t))
       (set-window-point
        w (with-current-buffer diffs--split-other
-           (aref diffs--split-row-positions (1- target)))))
+           (diffs--split-row-position (1- target)))))
     (recenter)
     (diffs--split-materialize-window (selected-window))
     (diffs--split-sync-from (selected-window))))
@@ -4676,6 +5622,7 @@ and treat the peer as the horizontal source of truth."
 PHYSICAL-OFFSET identifies the exact wrapped chunk within the logical
 row.  Fall back to the logical row, then the hunk, if a resize means
 that exact chunk no longer exists."
+  (diffs--split-paged-materialize-hunk hunk)
   (let (fallback logical-fallback found)
     (cl-loop
      for row across diffs--split-rows
@@ -4686,14 +5633,14 @@ that exact chunk no longer exists."
           (eq (nth 3 row) kind)
           (equal (diffs--split-row-source-number row) number))
      when (and (not fallback) (eq (nth 5 row) hunk))
-     do (setq fallback (aref diffs--split-row-positions index))
+     do (setq fallback (diffs--split-row-position index))
      when logical-match
      do
      (unless logical-fallback
-       (setq logical-fallback (aref diffs--split-row-positions index)))
+       (setq logical-fallback (diffs--split-row-position index)))
      when (and logical-match
                (equal (nth 9 row) physical-offset))
-     do (setq found (aref diffs--split-row-positions index))
+     do (setq found (diffs--split-row-position index))
      and return found)
     (or found logical-fallback fallback)))
 
@@ -4726,7 +5673,7 @@ restore."
               (set-window-point
                other-window
                (with-current-buffer diffs--split-other
-                 (aref diffs--split-row-positions row))))))
+                 (diffs--split-row-position row))))))
         (diffs--split-materialize-window window)
         (diffs--split-sync-from window)))))
 
@@ -4912,6 +5859,9 @@ error never strands the user in the unified view."
          (show-fringe-bars diffs-fringe-bars)
          (fringe-bar-width diffs-fringe-bar-width)
          (full-width-backgrounds diffs-split-full-width-backgrounds)
+         (virtualization diffs-split-virtualization)
+         (virtualization-threshold
+          diffs-split-virtualization-threshold)
          (overscan diffs-split-overscan)
          (source-tab-width tab-width))
     (let* ((cached diffs--split-cache)
@@ -4936,13 +5886,39 @@ error never strands the user in the unified view."
                    (set-window-buffer w1 old-buf)
                    (split-window w1 nil 'right))))
         (set-window-buffer w2 new-buf)
-        (let* ((content-width
+        (let* ((paged-eligible
+                (with-current-buffer unified
+                  (diffs--split-paged-eligible-p wrap-lines)))
+               (cached-estimate
+                (and
+                 paged-eligible
+                 (eq virtualization 'auto)
+                 (equal modified-tick
+                        (plist-get diffs--split-cache
+                                   :estimate-tick))
+                 (plist-get diffs--split-cache
+                            :estimated-row-count)))
+               (estimated-row-count
+                (and
+                 paged-eligible
+                 (eq virtualization 'auto)
+                 (or cached-estimate
+                     (with-current-buffer unified
+                       (diffs--split-estimated-row-count)))))
+               (paged
+                (with-current-buffer unified
+                  (diffs--split-use-paged-p
+                   virtualization wrap-lines
+                   virtualization-threshold
+                   estimated-row-count)))
+               (content-width
                 (max 8 (- (min (window-body-width w1)
                                (window-body-width w2))
                           width 1)))
                (key (list modified-tick
                           content-width width
                           wrap-lines
+                          paged
                           show-line-numbers
                           show-fringe-bars
                           fringe-bar-width
@@ -4966,22 +5942,36 @@ error never strands the user in the unified view."
                   (setq buffer-read-only nil)
                   (erase-buffer)
                   (diffs-split-mode))))
-            (let ((collected (with-current-buffer unified
-                               (diffs--split-collect))))
-              (let ((diffs-split-wrap-lines wrap-lines)
-                    (diffs-line-numbers show-line-numbers)
-                    (diffs-fringe-bars show-fringe-bars)
-                    (diffs-fringe-bar-width fringe-bar-width)
-                    (diffs-split-full-width-backgrounds
-                     full-width-backgrounds)
-                    (tab-width source-tab-width))
-                (setq anchors
-                      (diffs--split-render-pair
-                       (nth 0 collected) (nth 1 collected)
-                       width content-width old-buf new-buf))))
+            (let ((diffs-split-wrap-lines wrap-lines)
+                  (diffs-line-numbers show-line-numbers)
+                  (diffs-fringe-bars show-fringe-bars)
+                  (diffs-fringe-bar-width fringe-bar-width)
+                  (diffs-split-full-width-backgrounds
+                   full-width-backgrounds)
+                  (tab-width source-tab-width))
+              (if paged
+                  (setq anchors
+                        (diffs--split-render-paged
+                         (with-current-buffer unified
+                           (diffs--split-paged-index))
+                         width old-buf new-buf))
+                (let ((collected
+                       (with-current-buffer unified
+                         (diffs--split-collect))))
+                  (setq anchors
+                        (diffs--split-render-pair
+                         (nth 0 collected) (nth 1 collected)
+                         width content-width old-buf new-buf)))))
             (setq diffs--split-cache
                   (list :key key :anchors anchors
                         :old old-buf :new new-buf)))
+          (when estimated-row-count
+            (setq diffs--split-cache
+                  (plist-put
+                   (plist-put
+                    diffs--split-cache
+                    :estimated-row-count estimated-row-count)
+                   :estimate-tick modified-tick)))
           (dolist (spec (list (list old-buf 'old new-buf)
                               (list new-buf 'new old-buf)))
             (with-current-buffer (nth 0 spec)
@@ -4993,6 +5983,7 @@ error never strands the user in the unified view."
               (setq-local diffs-line-numbers show-line-numbers)
               (setq-local diffs-fringe-bars show-fringe-bars)
               (setq-local diffs-fringe-bar-width fringe-bar-width)
+              (setq-local diffs-split-virtualization virtualization)
               (setq-local diffs-split-overscan overscan)
               (setq-local tab-width source-tab-width)
               (setq default-directory dir)
@@ -5075,10 +6066,8 @@ error never strands the user in the unified view."
     (with-current-buffer owner
       (or
        (and hunk
-            (cl-find-if
-             (lambda (section)
-               (memq hunk (plist-get section :hunks)))
-             diffs--sections))
+            (when-let* ((gap (diffs--gap-for-hunk hunk)))
+              (plist-get gap :section)))
        (cl-find-if
         (lambda (section)
           (equal file (plist-get section :file)))
@@ -5981,6 +6970,8 @@ from its immutable patch SIDE and source LINE."
   "Return the rebuilt split row index best matching ANCHOR.
 Both columns are searched because a pure insertion or deletion is a
 filler in the column whose display role is preserved."
+  (diffs--split-paged-materialize-hunk
+   (plist-get anchor :hunk))
   (let ((other-rows
          (and (buffer-live-p diffs--split-other)
               (buffer-local-value
@@ -6057,7 +7048,7 @@ filler in the column whose display role is preserved."
       (select-window window)
       (with-current-buffer buffer
         (when-let* ((index (diffs--resolution-anchor-row-index anchor)))
-          (goto-char (aref diffs--split-row-positions index))
+          (goto-char (diffs--split-row-position index))
           (move-to-column (or (plist-get anchor :column) 0))
           (set-window-point window (point))
           (let ((start
@@ -6072,7 +7063,7 @@ filler in the column whose display role is preserved."
               (set-window-point
                other-window
                (with-current-buffer diffs--split-other
-                 (aref diffs--split-row-positions index)))))
+                 (diffs--split-row-position index)))))
           (diffs--split-materialize-window window)
           (diffs--split-sync-from window)
           t)))))
@@ -6119,7 +7110,7 @@ When KEY disappears after reset, restore the stable split row ANCHOR."
                               key
                               (diffs--split-row-resolution-key row))
                         return row-index))))
-            (goto-char (aref diffs--split-row-positions index))
+            (goto-char (diffs--split-row-position index))
             (diffs--split-materialize-window window)
             (setq restored t))))
       (unless restored
@@ -6674,8 +7665,8 @@ The result is a plist containing `:file', `:side', and `:line'."
                (<= line finish))
      do
      (diffs--review-add-selection-overlay
-      (aref diffs--split-row-positions index)
-      (aref diffs--split-row-positions (1+ index))))))
+      (diffs--split-row-position index)
+      (diffs--split-row-position (1+ index))))))
 
 (defun diffs--review-unified-line-position (file side target-line)
   "Return unified buffer position for FILE, SIDE, and TARGET-LINE."
@@ -6803,7 +7794,7 @@ The result is a plist containing `:file', `:side', and `:line'."
                          (make-string height ?\n)
                          'face 'diffs-filler))))
           (diffs--review-add-annotation-overlay
-           (aref diffs--split-row-positions index)
+           (diffs--split-row-position index)
            string))))))
 
 (defun diffs--review-add-decision-overlay (begin end &rest properties)
@@ -7226,7 +8217,7 @@ Restore the prior state when view projection fails."
                             (plist-get annotation :file)
                             (car target)
                             (cdr target))))
-                (goto-char (aref diffs--split-row-positions index))
+                (goto-char (diffs--split-row-position index))
                 (recenter))))
         (when-let* ((position
                      (with-current-buffer owner
