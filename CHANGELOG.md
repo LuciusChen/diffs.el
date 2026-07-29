@@ -30,6 +30,10 @@
   action rows, section-colored marker lines, explicit Current/Incoming
   labels, stronger marker backgrounds, and matching fringe bars while
   preserving raw marker text.
+- Collapse a resolved conflict row to its result and Reset action, and
+  keep descriptive Current/Incoming marker labels at normal weight.
+- Consume Emacs's translated mouse-2 event on conflict action links so
+  a mouse-1 choice cannot fall through to primary-selection paste.
 - Delegate standard conflict matching and Current/Incoming resolution
   to smerge's public engine. Keep diffs.el's strict validation,
   persistent Reset, diff3 Both-without-Base operation, and extended
@@ -55,6 +59,20 @@
   root even if its buffer directory later changes, retry stale negative
   caches after a package reload, and retain old/new loader errors for
   actionable failure messages.
+- Add stable stacked, split, and wrapped token coordinates plus exact
+  source visits. Public source, hover, and click hooks feed
+  source-buffer Eldoc and Xref backends while preserving existing live
+  Eglot/lsp-mode ownership and using safe read-only historical buffers.
+- Move source-revision fontification out of context-expansion commands
+  into an idle queue. Publish generation-checked immutable line vectors
+  and share them through a bounded repository/file/side/revision or
+  content/language/theme render cache; theme changes retain raw source.
+- Add `diffs-items` for ordered unchanged source-file and patch items in
+  one searchable owner, section index, navigation model, and stacked or
+  split presentation, with optional stable ids and versions.
+- Add public `diffs-file-header-function`, `diffs-gutter-function`, and
+  `diffs-hunk-separator-function` presentation boundaries shared by
+  stacked and split views without advice or alternate parsers.
 
 ## 0.12.0 — 2026-07-28
 

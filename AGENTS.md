@@ -231,6 +231,6 @@ Elisp and package-development rules adapted from the clutch development guide fo
 
 7. Confirm no external package private APIs were introduced and no generated `.elc` or temporary artifacts entered the worktree.
 
-8. Update tests, README, ROADMAP, changelog, and any required design record in the same change.
+8. Update tests, README, changelog, and any required design record in the same change.
 
 9. Do not commit or push until the user has completed the requested hands-on version test and explicitly approved it.

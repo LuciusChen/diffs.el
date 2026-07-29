@@ -37,15 +37,16 @@ Run `M-x diffs-file` in a tracked file or `M-x diffs-project` anywhere inside a 
 
 ### Entry points
 
-| Command | Description |
-|---|---|
-| `diffs-file` | Current file vs the reference revision, including staged and unsaved changes when diff-hl is available |
-| `diffs-project` | Saved project working tree vs the reference revision |
-| `diffs-commit` | Show a commit (Git) |
-| `diffs-commit-at-line` | Show the commit that last touched the current line |
-| `diffs-conflicts` | Resolve merge markers in place with Current, Incoming, Both, and Reset |
-| `diffs-minor-mode` | Use the renderer in any diff-mode buffer |
-| `diffs-diff-hl-mode` | Render diff-hl's current inline or posframe hunk with diffs.el |
+| Entry point | Kind | Description |
+|---|---|---|
+| `diffs-file` | Command | Current file vs the reference revision, including staged and unsaved changes when diff-hl is available |
+| `diffs-project` | Command | Saved project working tree vs the reference revision |
+| `diffs-commit` | Command | Show a commit (Git) |
+| `diffs-commit-at-line` | Command | Show the commit that last touched the current line |
+| `diffs-items` | Elisp API | Show unchanged source-file items and patch items in one review |
+| `diffs-conflicts` | Command | Resolve merge markers in place with Current, Incoming, Both, and Reset |
+| `diffs-minor-mode` | Command | Use the renderer in any diff-mode buffer |
+| `diffs-diff-hl-mode` | Command | Render diff-hl's current inline or posframe hunk with diffs.el |
 
 ### Review keys
 
@@ -54,6 +55,8 @@ Run `M-x diffs-file` in a tracked file or `M-x diffs-project` anywhere inside a 
 | `n` / `p` | Next / previous hunk |
 | `N` / `P` | Next / previous file in stacked view |
 | `RET` | Visit the source line |
+| `M-RET` | Visit the exact source token |
+| `S-mouse-1` | Run token click hooks, or visit the exact source token |
 | `i` | Toggle the changed-file index |
 | `e` | Reveal more unchanged context |
 | `TAB` | Fold or unfold a hunk in stacked view |
@@ -163,7 +166,7 @@ Annotation plists use `:id`, `:file`, inclusive one-based `:old-range`/`:new-ran
 
 Collapsed hunk separators report how many unchanged lines they hide. On a separator or anywhere in its hunk, press `e` repeatedly to reveal `diffs-context-step` more lines. Expansion is one-way within a review; once every hidden line is visible, the separator disappears. `TAB` remains available for Emacs's separate hunk/outline folding. The same `e` command works directly in the side-by-side view, where both columns rebuild together.
 
-Expanded lines are display overlays backed by the complete old and new file contents; the underlying patch is unchanged, so applying hunks, searching, and copying retain normal `diff-mode` behavior.  Expanded lines use the file's source-language syntax faces above the context background.  Complete file contents are fontified lazily and cached per file.
+Expanded lines are display overlays backed by the complete old and new file contents; the underlying patch is unchanged, so applying hunks, searching, and copying retain normal `diff-mode` behavior. Expanded lines appear immediately from raw source. Source-mode fontification runs from an idle queue and publishes faces afterward; rendered line vectors are shared through a bounded cache keyed by repository, file, side, revision or worktree content, language mode, and theme generation. Theme changes invalidate rendered faces without discarding review-owned raw source.
 
 ## Changed-file index and sticky context
 
@@ -185,6 +188,52 @@ Consecutive removed and added lines are globally aligned by normalized edit dist
 
 Lines over 1,000 characters skip within-line comparison by default, and change blocks over 64 lines per side use bounded ordinal fallback. Both limits are configurable.
 
+## Token coordinates and language tools
+
+`diffs-token-at-point` and `diffs-token-at-position` expose the source token under a stacked or split position without parsing decorated display text. The returned plist includes repository-relative and absolute file names, old/new side, revision, one-based line, zero-based character column, end-exclusive token columns, token text, and the owning review buffer. Wrapped split rows retain their logical source columns.
+
+`M-RET` resolves that token through `diffs-token-source-position` and visits the exact character. New-side worktree tokens reuse an existing visiting source buffer, so its ordinary Eldoc, Xref, Eglot, or lsp-mode backends remain authoritative. Old-side and commit tokens use safe read-only historical buffers with file-local variables, local eval, and mode hooks disabled; diffs.el does not pretend those buffers are live LSP documents. `M-.` uses the same source-buffer Xref backend, and `diffs-eldoc-function` delegates when Eldoc is active in the review.
+
+Three public abnormal hooks provide integration points:
+
+| Hook | Contract |
+|---|---|
+| `diffs-token-source-functions` | Receive a token plist; the first non-nil `(BUFFER . POSITION)` overrides source resolution |
+| `diffs-token-hover-functions` | Receive a token plist; the first non-nil documentation result precedes source-buffer Eldoc |
+| `diffs-token-click-functions` | Receive a token plist and input event when `S-mouse-1` is used |
+
+Whitespace is not interactive by default. Set `diffs-token-interactions-on-whitespace` to non-nil when an integration needs whitespace tokens.
+
+## Mixed items and layout functions
+
+`diffs-items` accepts unchanged source files and patches in one ordered owner model. File items are searchable, indexed, syntax-highlighted, navigable, and duplicated as unchanged rows in split view; diff items retain normal change semantics. Stable `:id` and `:version` values are optional but recommended when a caller refreshes the same review:
+
+```elisp
+(diffs-items
+ (list
+  (list :type 'file
+        :id "guide"
+        :version "worktree-17"
+        :file "docs/guide.el"
+        :content guide-source)
+  (list :type 'diff
+        :id "implementation"
+        :patch patch-text))
+ (list :directory project-root
+       :backend 'Git
+       :revision "HEAD"))
+```
+
+File items use a repository-relative `:file` and string `:content`. Diff items use string `:patch`. Options accept `:directory`, `:buffer-name`, `:backend`, `:revision`, and `:target-revision`.
+
+File headers, line gutters, and hunk separators have one public presentation function each. Every function receives a copied context plist and returns a string or nil; returning nil suppresses that element. The same functions receive `:view` as `stacked` or `split`, so one configuration covers both layouts. Gutter functions run on materialized rows and should remain pure and fast.
+
+| Option | Default function |
+|---|---|
+| `diffs-file-header-function` | `diffs-default-file-header` |
+| `diffs-gutter-function` | `diffs-default-gutter` |
+| `diffs-hunk-separator-function` | `diffs-default-hunk-separator` |
+
 ## Configuration
 
 All options belong to the `diffs` customization group.
@@ -204,6 +253,9 @@ All options belong to the `diffs` customization group.
 | `diffs-split-full-width-backgrounds` | `t` | Extend split change backgrounds across each row |
 | `diffs-index-width` | `36` | Changed-file index width in columns |
 | `diffs-buffer-name` | `"*diffs*"` | First-party review buffer name |
+| `diffs-file-header-function` | `diffs-default-file-header` | Render file/source item headers in both layouts |
+| `diffs-gutter-function` | `diffs-default-gutter` | Render stacked and split gutters |
+| `diffs-hunk-separator-function` | `diffs-default-hunk-separator` | Render collapsed hunk/context separators |
 
 ### Context and within-line refinement
 
@@ -222,6 +274,8 @@ All options belong to the `diffs` customization group.
 |---|---:|---|
 | `diffs-lazy-threshold` | `10000` | Start applying stacked decorations through jit-lock |
 | `diffs-split-overscan` | `60` | Extra split rows prepared above and below the viewport |
+| `diffs-render-cache-limit` | `64` | Shared syntax-rendered source revisions retained globally |
+| `diffs-syntax-idle-delay` | `0.05` | Idle delay before one queued source revision is fontified |
 
 The Agent installer destinations are controlled by `diffs-review-cli-install-path`, `diffs-review-skill-install-directory`, and `diffs-review-assets-directory`.
 
@@ -274,5 +328,3 @@ Run the ERT suite with:
 ```sh
 make test
 ```
-
-See [ROADMAP.md](ROADMAP.md) for the current feature-gap audit against diffs.com and the planned development order.

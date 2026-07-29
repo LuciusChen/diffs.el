@@ -4,12 +4,24 @@
 (require 'cl-lib)
 (require 'diffs)
 (require 'vc-git)
+(require 'xref)
 
 (defvar diff-hl-show-staged-changes)
 (defvar diff-hl-reference-revision)
 (defvar diff-hl-reference-revision-projects-cache)
 (defvar diff-hl-show-hunk-function)
 (defvar diff-hl-show-hunk-inline-smart-lines t)
+
+(cl-defmethod xref-backend-identifier-at-point
+  ((_backend (eql diffs-tests)))
+  (thing-at-point 'symbol t))
+
+(cl-defmethod xref-backend-definitions
+  ((_backend (eql diffs-tests)) identifier)
+  (list
+   (xref-make
+    identifier
+    (xref-make-buffer-location (current-buffer) (point)))))
 
 (defconst diffs-tests--normal
   (concat
@@ -744,6 +756,390 @@
        (equal (diffs--fontified-lines "plain source\n" "sample.fail")
               ["plain source"])))
     (should (equal cleanup-state '(nil nil nil nil)))))
+
+(ert-deftest diffs-source-syntax-renders-from-the-idle-queue ()
+  (let ((diffs--render-cache (make-hash-table :test #'equal))
+        (diffs--render-cache-order nil)
+        (diffs--render-jobs (make-hash-table :test #'equal))
+        (diffs--render-queue nil)
+        (diffs--render-idle-timer nil)
+        scheduled)
+    (diffs-tests--with-diff diffs-tests--normal
+      (diffs--scan)
+      (setq diffs--revision "HEAD")
+      (let ((section (car diffs--sections))
+            (raw ["(defun cached-source () nil)"]))
+        (cl-letf
+            (((symbol-function 'diffs--revision-lines)
+              (lambda (_file _revision) raw))
+             ((symbol-function 'run-with-idle-timer)
+              (lambda (_seconds _repeat function &rest arguments)
+                (setq scheduled (cons function arguments))
+                'diffs-tests-idle-timer)))
+          (let ((immediate (diffs--section-lines section 'old)))
+            (should (eq immediate raw))
+            (should-not
+             (get-text-property 1 'face (aref immediate 0)))
+            (should scheduled)
+            (apply (car scheduled) (cdr scheduled))
+            (let ((rendered
+                   (gethash section diffs--old-content-cache)))
+              (should (vectorp rendered))
+              (should-not (eq rendered raw))
+              (should
+               (diffs-tests--face-includes-p
+                (get-text-property 1 'face (aref rendered 0))
+                'font-lock-keyword-face))
+              (should (eq (diffs--section-lines section 'old)
+                          rendered)))))))))
+
+(ert-deftest diffs-source-render-cache-keys-all-render-inputs ()
+  (let ((diffs--render-theme-generation 7)
+        (root "/tmp/repository/")
+        (lines ["(defun key-test () nil)"]))
+    (let ((base
+           (diffs--source-render-key
+            root "sample.el" 'old "rev-a" lines 'emacs-lisp-mode)))
+      (should
+       (equal
+        base
+        (diffs--source-render-key
+         root "sample.el" 'old "rev-a" lines 'emacs-lisp-mode)))
+      (should-not
+       (equal
+        base
+        (diffs--source-render-key
+         root "sample.el" 'old "rev-b" lines 'emacs-lisp-mode)))
+      (should-not
+       (equal
+        base
+        (diffs--source-render-key
+         root "sample.el" 'old "rev-a" lines 'fundamental-mode)))
+      (let ((diffs--render-theme-generation 8))
+        (should-not
+         (equal
+          base
+          (diffs--source-render-key
+           root "sample.el" 'old "rev-a" lines
+           'emacs-lisp-mode))))
+      (should-not
+       (equal
+        base
+       (diffs--source-render-key
+         root "sample.el" 'old "rev-a"
+         ["(defun changed-content () nil)"]
+         'emacs-lisp-mode)))))
+  (let ((diffs-render-cache-limit 0)
+        (diffs--render-cache (make-hash-table :test #'equal))
+        (diffs--render-cache-order '((old-key))))
+    (puthash '(old-key) ["old"] diffs--render-cache)
+    (should-not (diffs--render-cache-get '(old-key)))
+    (should (zerop (hash-table-count diffs--render-cache)))
+    (should-not diffs--render-cache-order)
+    (diffs--render-cache-put '(new-key) ["new"])
+    (should (zerop (hash-table-count diffs--render-cache)))))
+
+(ert-deftest diffs-theme-change-invalidates-render-not-raw-source ()
+  (let ((diffs--render-cache (make-hash-table :test #'equal))
+        (diffs--render-cache-order nil)
+        (diffs--render-theme-generation 4))
+    (puthash '(render-key) ["rendered"] diffs--render-cache)
+    (setq diffs--render-cache-order '((render-key)))
+    (diffs--render-theme-changed)
+    (should (= diffs--render-theme-generation 5))
+    (should (= (hash-table-count diffs--render-cache) 0))
+    (should-not diffs--render-cache-order)))
+
+(ert-deftest diffs-mixed-items-share-one-searchable-owner-model ()
+  (let ((diffs-default-view 'stacked)
+        (diffs-fullscreen nil)
+        (buffer-name
+         (generate-new-buffer-name " *diffs mixed items test*"))
+        owner)
+    (unwind-protect
+        (save-window-excursion
+          (setq owner
+                (diffs-items
+                 (list
+                  (list :type 'file
+                        :id "guide"
+                        :file "guide.el"
+                        :version "worktree-7"
+                        :content
+                        "(defun guide-entry () t)\n(message \"guide\")\n")
+                  (list :type 'diff
+                        :id "change"
+                        :patch diffs-tests--normal))
+                 (list :directory default-directory
+                       :buffer-name buffer-name)))
+          (with-current-buffer owner
+            (should (equal (buffer-name) buffer-name))
+            (should (= (length diffs--sections) 2))
+            (should
+             (equal
+              (mapcar
+               (lambda (section)
+                 (list (plist-get section :item-type)
+                       (plist-get section :item-id)))
+               diffs--sections)
+              '((file "guide") (diff "change"))))
+            (goto-char (point-min))
+            (should (search-forward "guide-entry" nil t))
+            (goto-char (1- (plist-get (car diffs--sections) :end)))
+            (diff-file-next)
+            (should
+             (eq (diffs--section-at-pos (point))
+                 (cadr diffs--sections)))
+            (let* ((file-section (car diffs--sections))
+                   (lines
+                    (diffs--section-raw-lines
+                     file-section 'new)))
+              (should
+               (equal lines
+                      ["(defun guide-entry () t)"
+                       "(message \"guide\")"])))
+            (pcase-let ((`(,old ,new . ,_)
+                         (diffs--split-collect)))
+              (should
+               (cl-some
+                (lambda (row)
+                  (string-match-p "guide-entry" (car row)))
+                old))
+              (should
+               (cl-some
+                (lambda (row)
+                  (string-match-p "guide-entry" (car row)))
+                new)))
+            (diffs-refresh)
+            (should (equal (buffer-name) buffer-name))
+            (should
+             (equal
+              (mapcar
+               (lambda (section)
+                 (list (plist-get section :item-type)
+                       (plist-get section :item-id)))
+               diffs--sections)
+              '((file "guide") (diff "change"))))))
+      (when (buffer-live-p owner)
+        (with-current-buffer owner
+          (diffs--split-cache-clear)
+          (when diffs-minor-mode
+            (diffs-minor-mode -1)))
+        (kill-buffer owner)))))
+
+(ert-deftest diffs-token-coordinates-cover-unicode-and-whitespace ()
+  (let ((patch
+         (concat
+          "diff --git a/unicode.ts b/unicode.ts\n"
+          "--- a/unicode.ts\n"
+          "+++ b/unicode.ts\n"
+          "@@ -4 +4 @@\n"
+          "-const title = \"旧值\";\n"
+          "+const title = \"新值🙂\";\n")))
+    (diffs-tests--with-diff patch
+      (diffs-minor-mode 1)
+      (goto-char (point-min))
+      (search-forward "新值")
+      (backward-char 1)
+      (let ((token (diffs-token-at-point)))
+        (should (equal (plist-get token :text) "值"))
+        (should (= (plist-get token :line) 4))
+        (should (= (plist-get token :start-column)
+                   (string-match "值" "const title = \"新值🙂\";")))
+        (should (= (plist-get token :end-column)
+                   (1+ (plist-get token :start-column)))))
+      (goto-char (point-min))
+      (search-forward "+const")
+      (should-not (diffs-token-at-point))
+      (setq-local diffs-token-interactions-on-whitespace t)
+      (let ((token (diffs-token-at-point)))
+        (should (equal (plist-get token :text) " "))
+        (should (= (plist-get token :column) 5)))
+      (diffs-minor-mode -1))))
+
+(ert-deftest diffs-public-layout-functions-cover-stacked-and-split ()
+  (let (header-contexts gutter-contexts separator-contexts)
+    (let ((diffs-file-header-function
+           (lambda (context)
+             (push context header-contexts)
+             (format "HEADER:%s:%s"
+                     (plist-get context :view)
+                     (plist-get context :file))))
+          (diffs-gutter-function
+           (lambda (context)
+             (push context gutter-contexts)
+             (format "G:%s:%s:%s "
+                     (plist-get context :view)
+                     (or (plist-get context :old-line) "-")
+                     (or (plist-get context :new-line) "-"))))
+          (diffs-hunk-separator-function
+           (lambda (context)
+             (push context separator-contexts)
+             (format "SEP:%s" (plist-get context :view)))))
+      (diffs-tests--with-diff diffs-tests--normal
+        (diffs-minor-mode 1)
+        (let* ((section (car diffs--sections))
+               (hunk (car (plist-get section :hunks))))
+          (goto-char (plist-get section :beg))
+          (should
+           (string-match-p
+            "HEADER:stacked:foo.el"
+            (get-text-property (point) 'display)))
+          (goto-char (car hunk))
+          (should
+           (equal (get-text-property (point) 'display)
+                  "SEP:stacked"))
+          (forward-line 1)
+          (should
+           (string-match-p
+            "G:stacked:"
+            (get-text-property (point) 'line-prefix)))
+          (pcase-let ((`(,old ,_new . ,_)
+                       (diffs--split-collect)))
+            (should
+             (string-match-p "HEADER:split:foo.el"
+                             (caar old)))
+            (should
+             (string-match-p "SEP:split"
+                             (car (nth 1 old))))))
+        (diffs-minor-mode -1)))
+    (should
+     (cl-some
+      (lambda (context)
+        (eq (plist-get context :view) 'stacked))
+      header-contexts))
+    (should
+     (cl-some
+      (lambda (context)
+        (eq (plist-get context :view) 'split))
+      separator-contexts))
+    (should
+     (cl-some
+      (lambda (context)
+        (and (eq (plist-get context :view) 'stacked)
+             (eq (plist-get context :kind) 'ctx)))
+      gutter-contexts))))
+
+(ert-deftest diffs-token-coordinates-cover-stacked-old-and-new-lines ()
+  (let ((patch
+         (concat
+          "diff --git a/token.ts b/token.ts\n"
+          "--- a/token.ts\n"
+          "+++ b/token.ts\n"
+          "@@ -7 +7 @@\n"
+          "-const displayName = oldValue;\n"
+          "+const displayName = newValue;\n")))
+    (diffs-tests--with-diff patch
+      (diffs-minor-mode 1)
+      (goto-char (point-min))
+      (search-forward "oldValue")
+      (backward-char 2)
+      (let ((token (diffs-token-at-point)))
+        (should (equal (plist-get token :file) "token.ts"))
+        (should (eq (plist-get token :side) 'old))
+        (should (= (plist-get token :line) 7))
+        (should (= (plist-get token :column) 26))
+        (should (= (plist-get token :start-column) 20))
+        (should (= (plist-get token :end-column) 28))
+        (should (equal (plist-get token :text) "oldValue")))
+      (goto-char (point-min))
+      (search-forward "newValue")
+      (backward-char 4)
+      (let ((token (diffs-token-at-point)))
+        (should (eq (plist-get token :side) 'new))
+        (should (= (plist-get token :line) 7))
+        (should (equal (plist-get token :text) "newValue")))
+      (diffs-minor-mode -1))))
+
+(ert-deftest diffs-token-coordinates-preserve-wrapped-split-columns ()
+  (let* ((prefix (make-string 90 ?x))
+         (new-line (concat "const " prefix " targetToken = 2;"))
+         (patch
+          (concat
+           "diff --git a/token.ts b/token.ts\n"
+           "--- a/token.ts\n"
+           "+++ b/token.ts\n"
+           "@@ -3 +3 @@\n"
+           "-const oldToken = 1;\n"
+           "+" new-line "\n"))
+         (buffer (generate-new-buffer " *diffs token split test*"))
+         (diffs-split-wrap-lines t)
+         old-buffer new-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (insert patch)
+          (diff-mode)
+          (diffs-minor-mode 1)
+          (diffs-toggle-split)
+          (setq new-buffer (current-buffer)
+                old-buffer diffs--split-other)
+          (goto-char (point-min))
+          (search-forward "targetToken")
+          (backward-char 5)
+          (let ((token (diffs-token-at-point)))
+            (should (eq (plist-get token :side) 'new))
+            (should (= (plist-get token :line) 3))
+            (should (= (plist-get token :column)
+                       (+ (string-match "targetToken" new-line) 6)))
+            (should (equal (plist-get token :text) "targetToken"))))
+      (dolist (item (list old-buffer new-buffer buffer))
+        (when (buffer-live-p item)
+          (kill-buffer item))))))
+
+(ert-deftest diffs-token-language-hooks-delegate-to-the-source-buffer ()
+  (let* ((directory (make-temp-file "diffs-token-source-" t))
+         (file (expand-file-name "foo.el" directory))
+         source-buffer)
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "(message \"same\")\n"
+                    "(message \"new\")\n"
+                    "(message \"extra\")\n"))
+          (setq source-buffer (find-file-noselect file))
+          (with-current-buffer source-buffer
+            (emacs-lisp-mode)
+            (setq-local eldoc-documentation-functions
+                        (list
+                         (lambda (_callback)
+                           (format "source:%s:%d"
+                                   (thing-at-point 'symbol t)
+                                   (line-number-at-pos)))))
+            (setq-local xref-backend-functions
+                        (list (lambda () 'diffs-tests))))
+          (diffs-tests--with-diff diffs-tests--normal
+            (setq default-directory directory)
+            (diffs-minor-mode 1)
+            (goto-char (point-min))
+            (search-forward "\"new\"")
+            (backward-char 3)
+            (let* ((token (diffs-token-at-point))
+                   (source (diffs-token-source-position token)))
+              (should (eq (car source) source-buffer))
+              (with-current-buffer (car source)
+                (should (= (line-number-at-pos (cdr source)) 2))
+                (should (= (save-excursion
+                             (goto-char (cdr source))
+                             (current-column))
+                           (plist-get token :column)))))
+            (should (equal (diffs-eldoc-function #'ignore)
+                           "source:new:2"))
+            (should (eq (diffs-xref-backend) 'diffs))
+            (let* ((identifier
+                    (xref-backend-identifier-at-point 'diffs))
+                   (definitions
+                    (xref-backend-definitions 'diffs identifier))
+                   (location (xref-item-location (car definitions))))
+              (should (equal identifier "new"))
+              (should (eq (xref-buffer-location-buffer location)
+                          source-buffer)))
+            (diffs-minor-mode -1)))
+      (when (buffer-live-p source-buffer)
+        (with-current-buffer source-buffer
+          (set-buffer-modified-p nil))
+        (kill-buffer source-buffer))
+      (delete-directory directory t))))
 
 (ert-deftest diffs-scan-counts-files-and-lines ()
   (diffs-tests--with-diff diffs-tests--normal
@@ -4060,7 +4456,18 @@
       (should
        (string-match-p
         "<<<<<<< HEAD  (Current Change)"
-        (overlay-get marker 'display))))
+        (overlay-get marker 'display)))
+      (let* ((display (overlay-get marker 'display))
+             (label-start
+              (string-match "(Current Change)" display)))
+        (should label-start)
+        (should
+         (eq (get-text-property label-start 'face display)
+             'diffs-conflict-marker-label))
+        (should
+         (eq (face-attribute
+              'diffs-conflict-marker-label :weight nil 'default)
+             'normal))))
     (goto-char (point-min))
     (re-search-forward "^>>>>>>> feature/value$")
     (let ((marker
@@ -4086,7 +4493,19 @@
       (should (string-match-p "Accept both" row))
       (should-not (string-match-p "\\[" row))
       (should-not (string-match-p "Reset" row))
-      (should-not (string-match-p "C-c C-d" row)))))
+      (should-not (string-match-p "C-c C-d" row)))
+    (diffs-conflict-current)
+    (let* ((action
+            (cl-find-if
+             (lambda (overlay)
+               (overlay-get overlay 'before-string))
+             diffs--conflict-overlays))
+           (row (and action (overlay-get action 'before-string))))
+      (should (string-match-p "Resolved: Current" row))
+      (should (string-match-p "Reset" row))
+      (should-not (string-match-p "Accept current change" row))
+      (should-not (string-match-p "Accept incoming change" row))
+      (should-not (string-match-p "Accept both" row)))))
 
 (ert-deftest diffs-conflict-resolutions-track-multiple-blocks-and-reset ()
   (diffs-tests--with-conflict-source diffs-tests--two-conflicts
@@ -4357,7 +4776,18 @@
                     (text-property-any
                      0 (length row)
                      'diffs-conflict-action 'current row))
+                   (button-map
+                    (get-text-property index 'keymap row))
                    (fake-position (list 'fake-position)))
+              (should
+               (eq (lookup-key button-map [mouse-1])
+                   #'diffs-conflict-mouse-action))
+              ;; `follow-link' translates the normal mouse-1 click to
+              ;; mouse-2.  This binding prevents the global primary-
+              ;; selection yank from receiving the translated event.
+              (should
+               (eq (lookup-key button-map [mouse-2])
+                   #'diffs-conflict-mouse-action))
               (cl-letf
                   (((symbol-function 'event-start)
                     (lambda (_) fake-position))
