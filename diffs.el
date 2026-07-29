@@ -21,12 +21,14 @@
 ;; truth, so `diff-goto-source', isearch, `diff-apply-hunk', and the rest
 ;; of the diff-mode machinery keep working.  Indexed split buffers and
 ;; review overlays derive from that owner state.  Syntax and decorations
-;; stay viewport-bounded on large reviews.  VC or Git produces patches;
-;; no external renderer is required.  Merge-conflict actions are
-;; separate guarded edits in the original language source buffer.
+;; stay viewport-bounded on large reviews.  VC, Git, or Emacs's built-in
+;; diff frontend produces patches; no external renderer is required.
+;; Merge-conflict actions are separate guarded edits in the original
+;; language source buffer.
 ;;
 ;; Entry points:
 ;; - `diffs-file': current file against the reference revision.
+;; - `diffs-files': compare two independently selected files.
 ;; - `diffs-project': whole project against the reference revision.
 ;; - `diffs-commit': show a commit.
 ;; - `diffs-commit-at-line': show the commit that last touched the
@@ -67,6 +69,7 @@
 
 (declare-function vc-git-command "vc-git")
 (declare-function vc-git-root "vc-git")
+(declare-function diff-no-select "diff")
 (declare-function diff-hl-diff-buffer-with-reference "diff-hl")
 (declare-function diff-hl-diff-skip-to "diff-hl")
 (declare-function diff-hl-show-hunk-inline "diff-hl-show-hunk-inline")
@@ -451,6 +454,9 @@ Each element: (:beg N :block-end N :end N :file S :adds N :dels N
 (defvar-local diffs--target-revision nil
   "Target revision for commit views, or nil for the working tree.")
 
+(defvar-local diffs--independent-sources nil
+  "Non-nil when old and new sides are independently selected files.")
+
 (defvar-local diffs--context-gaps nil
   "Expandable unchanged gaps preceding hunks in this diff.")
 
@@ -513,6 +519,9 @@ Each element: (:beg N :block-end N :end N :file S :adds N :dels N
 (defvar diffs--render-theme-generation 0
   "Generation included in source render cache keys.")
 
+(defconst diffs--file-header-path-width 72
+  "Maximum display width used for paths in default file headers.")
+
 (defconst diffs--hunk-re "^@@ -\\([0-9]+\\)\\(?:,\\([0-9]+\\)\\)? \\+\\([0-9]+\\)\\(?:,\\([0-9]+\\)\\)? @@\\(.*\\)$")
 
 ;;;; Scanning
@@ -573,24 +582,34 @@ Return (PATH . END), where END is the next position in TEXT."
         (list (diffs--strip-git-prefix (car old))
               (diffs--strip-git-prefix (car new)))))))
 
-(defun diffs--file-name-from-marker (block-end)
-  "Return the new pathname from a +++ marker before BLOCK-END."
-  (save-excursion
-    (when (re-search-forward "^\\+\\+\\+ \\(.+\\)$" block-end t)
-      (let* ((text (match-string-no-properties 1))
-             (path (if (string-prefix-p "\"" text)
-                       (car (diffs--git-path-token text))
-                     (car (split-string text "\t")))))
-        (unless (equal path "/dev/null")
-          (diffs--strip-git-prefix path))))))
+(defun diffs--marker-path (text)
+  "Return the pathname encoded by diff marker TEXT."
+  (let ((path
+         (if (string-prefix-p "\"" text)
+             (car (diffs--git-path-token text))
+           (car (split-string text "\t")))))
+    (unless (equal path "/dev/null")
+      (diffs--strip-git-prefix path))))
 
-(defun diffs--file-name-at-header (block-end)
-  "Extract the file name from the header block between point and BLOCK-END."
+(defun diffs--marker-header-paths (block-end)
+  "Return old and new marker paths before BLOCK-END."
+  (save-excursion
+    (when (re-search-forward "^--- \\(.+\\)$" block-end t)
+      (let ((old
+             (diffs--marker-path
+              (match-string-no-properties 1))))
+        (when (re-search-forward "^\\+\\+\\+ \\(.+\\)$" block-end t)
+          (list
+           old
+           (diffs--marker-path
+            (match-string-no-properties 1))))))))
+
+(defun diffs--file-name-at-header ()
+  "Extract the file name from the diff header at point."
   (save-excursion
     (let ((git-paths (diffs--git-header-paths)))
       (cond
        (git-paths (cadr git-paths))
-       ((diffs--file-name-from-marker block-end))
        ((looking-at "^diff --\\(?:cc\\|combined\\) \\(.+\\)$")
         (let ((path (car (diffs--git-path-token
                           (match-string-no-properties 1)))))
@@ -620,9 +639,15 @@ Return a section plist; see `diffs--sections'."
   (let* ((beg (point))
          (block-end (diffs--header-block-end section-end))
          (git-paths (diffs--git-header-paths))
+         (marker-paths (diffs--marker-header-paths block-end))
          (file (or (cadr git-paths)
-                   (diffs--file-name-at-header block-end)))
-         (old-file (or (car git-paths) file))
+                   (cadr marker-paths)
+                   (car git-paths)
+                   (car marker-paths)
+                   (diffs--file-name-at-header)))
+         (old-file (or (car git-paths)
+                       (car marker-paths)
+                       file))
          (adds 0) (dels 0) (max-line 1) hunks)
     (save-excursion
       (while (re-search-forward diffs--hunk-re section-end t)
@@ -1096,8 +1121,12 @@ Return cached rendered lines immediately when available, otherwise nil."
                  (if (eq (plist-get section :item-type) 'file)
                      (or (plist-get section :item-lines) [])
                    (if old
-                     (diffs--revision-lines
-                      (plist-get section :old-file) diffs--revision)
+                     (if diffs--independent-sources
+                         (diffs--worktree-lines
+                          (or (plist-get section :old-file)
+                              (plist-get section :file)))
+                       (diffs--revision-lines
+                        (plist-get section :old-file) diffs--revision))
                    (if diffs--target-revision
                        (diffs--revision-lines
                         (plist-get section :file)
@@ -1798,6 +1827,60 @@ within-line ranges can be computed only when the row becomes visible."
 
 ;;;; Rendering
 
+(defun diffs--string-tail-to-width (string width)
+  "Return the trailing portion of STRING no wider than WIDTH."
+  (let ((total (string-width string)))
+    (if (<= total width)
+        string
+      (truncate-string-to-width
+       string total (max 0 (- total width))))))
+
+(defun diffs--short-display-path (path width)
+  "Return PATH with middle directories elided to fit WIDTH."
+  (if (<= (string-width path) width)
+      path
+    (let* ((path (abbreviate-file-name path))
+           (ellipsis "…/")
+           (available
+            (max 1 (- width (string-width ellipsis)))))
+      (if (<= (string-width path) width)
+          path
+        (let* ((trimmed (directory-file-name path))
+               (tail (file-name-nondirectory trimmed))
+               (directory (file-name-directory trimmed)))
+          (when (> (string-width tail) available)
+            (setq tail (diffs--string-tail-to-width tail available)
+                  directory nil))
+          (while directory
+            (let* ((trimmed-directory
+                    (directory-file-name directory))
+                   (component
+                    (file-name-nondirectory trimmed-directory))
+                   (parent (file-name-directory trimmed-directory))
+                   (candidate
+                    (and (not (string-empty-p component))
+                         (concat component "/" tail))))
+              (if (and candidate
+                       (<= (string-width candidate) available))
+                  (setq tail candidate
+                        directory parent)
+                (setq directory nil))))
+          (concat ellipsis tail))))))
+
+(defun diffs--display-file-label (old-file file width)
+  "Return OLD-FILE and FILE as one path label no wider than WIDTH."
+  (if (equal old-file file)
+      (diffs--short-display-path file width)
+    (let* ((separator " → ")
+           (available
+            (max 2 (- width (string-width separator))))
+           (old-width (/ available 2))
+           (new-width (- available old-width)))
+      (concat
+       (diffs--short-display-path old-file old-width)
+       separator
+       (diffs--short-display-path file new-width)))))
+
 (defun diffs--put (beg end &rest props)
   "Set PROPS on BEG..END, marking them as owned by diffs."
   (add-text-properties beg end (append '(diffs t) props)))
@@ -1838,12 +1921,20 @@ within-line ranges can be computed only when the row becomes visible."
 ;;;###autoload
 (defun diffs-default-file-header (context)
   "Return the default file header for layout CONTEXT."
-  (let ((file (or (plist-get context :file) "?")))
+  (let* ((file (or (plist-get context :file) "?"))
+         (old-file (or (plist-get context :old-file) file))
+         (label
+          (diffs--display-file-label
+           old-file file diffs--file-header-path-width)))
     (if (eq (plist-get context :item-type) 'file)
-        (propertize (concat "── " file)
-                    'face 'diffs-file-header)
+        (propertize
+         (concat
+          "── "
+          (diffs--short-display-path
+           file diffs--file-header-path-width))
+         'face 'diffs-file-header)
       (concat
-       (propertize (concat "── " file "  ")
+       (propertize (concat "── " label "  ")
                    'face 'diffs-file-header)
        (propertize
         (format "+%d" (or (plist-get context :adds) 0))
@@ -2641,6 +2732,8 @@ Use `diffs-minor-mode' to decorate an arbitrary external diff buffer."
                     (list revision target-revision)))
       (setq-local diffs--revision revision)
       (setq-local diffs--target-revision target-revision))
+    (setq-local diffs--independent-sources
+                (plist-get diffs--mode-context :independent-sources))
     (setq-local diffs--regenerator
                 (plist-get diffs--mode-context :regenerator)))
   (diffs-minor-mode 1))
@@ -2807,6 +2900,7 @@ integers before refresh adoption begins."
           :vc-revisions (copy-tree diff-vc-revisions)
           :revision diffs--revision
           :target-revision diffs--target-revision
+          :independent-sources diffs--independent-sources
           :regenerator diffs--regenerator
           :item-ranges (copy-tree diffs--item-ranges)
           :read-only buffer-read-only
@@ -3147,6 +3241,8 @@ integers before refresh adoption begins."
           (buffer-local-value 'diff-vc-revisions staged)))
         (revision (buffer-local-value 'diffs--revision staged))
         (target (buffer-local-value 'diffs--target-revision staged))
+        (independent-sources
+         (buffer-local-value 'diffs--independent-sources staged))
         (item-ranges
          (copy-tree
           (buffer-local-value 'diffs--item-ranges staged)))
@@ -3173,6 +3269,7 @@ integers before refresh adoption begins."
             diff-vc-revisions vc-revisions
             diffs--revision revision
             diffs--target-revision target
+            diffs--independent-sources independent-sources
             diffs--regenerator regenerator
             diffs--item-ranges item-ranges
             buffer-read-only t
@@ -3234,6 +3331,8 @@ integers before refresh adoption begins."
           (plist-get state :revision)
           diffs--target-revision
           (plist-get state :target-revision)
+          diffs--independent-sources
+          (plist-get state :independent-sources)
           diffs--regenerator
           (plist-get state :regenerator)
           diffs--item-ranges
@@ -3442,8 +3541,7 @@ The final slot is the position immediately after the last row.")
   "Return data-bearing PROPERTY from split ROW."
   (pcase property
     ('diffs-src
-     (when-let* ((target (diffs--split-row-target-number row)))
-       (cons (nth 4 row) target)))
+     (diffs--split-row-source-location row))
     ('diffs-file (nth 4 row))
     ('diffs-hunk (nth 5 row))
     ('diffs-kind (nth 3 row))
@@ -3467,6 +3565,34 @@ The final slot is the position immediately after the last row.")
   "Return the current live-worktree target number represented by split ROW."
   (or (nth 11 row) (nth 2 row)))
 
+(defun diffs--split-row-source-file (row)
+  "Return the physical source file represented by split ROW."
+  (let ((file (nth 4 row))
+        (owner diffs--split-unified))
+    (if (and (buffer-live-p owner)
+             (buffer-local-value 'diffs--independent-sources owner))
+        (when-let* ((section (diffs--token-section-for-row owner row)))
+          (if (eq (diffs--split-row-source-side row) 'old)
+              (or (plist-get section :old-file)
+                  (plist-get section :file))
+            (plist-get section :file)))
+      file)))
+
+(defun diffs--split-row-source-location (row)
+  "Return the physical source location represented by split ROW."
+  (let* ((owner diffs--split-unified)
+         (independent
+          (and (buffer-live-p owner)
+               (buffer-local-value
+                'diffs--independent-sources owner)))
+         (line
+          (if independent
+              (diffs--split-row-source-number row)
+            (diffs--split-row-target-number row))))
+    (when-let* ((file (diffs--split-row-source-file row))
+                (line line))
+      (cons file line))))
+
 (defun diffs--split-property-at (property position)
   "Return PROPERTY at or immediately before POSITION."
   (or (get-text-property position property)
@@ -3481,7 +3607,13 @@ The final slot is the position immediately after the last row.")
          (position (if (window-live-p window)
                        (window-start window)
                      (point)))
-         (file (diffs--split-property-at 'diffs-file position))
+         (path-width
+          (if (window-live-p window)
+              (max 20 (- (window-width window) 24))
+            diffs--file-header-path-width))
+         (row (diffs--split-row-at-position position))
+         (file (or (and row (diffs--split-row-source-file row))
+                   (diffs--split-property-at 'diffs-file position)))
          (hunk (diffs--split-property-at 'diffs-hunk position))
          (side (if (eq diffs--split-role 'old)
                    (or (and (buffer-live-p diffs--split-unified)
@@ -3494,7 +3626,9 @@ The final slot is the position immediately after the last row.")
      (when file
        (concat
         "  │  "
-        (propertize file 'face 'diffs-file-header)
+        (propertize
+         (diffs--short-display-path file path-width)
+         'face 'diffs-file-header)
         (when hunk
           (let ((context (nth 4 hunk)))
             (concat
@@ -4230,9 +4364,7 @@ WIDTH is the number-column width and ROLE is `old' or `new'."
       (add-text-properties
        begin end
        (list 'diffs-src
-             (when-let* ((target
-                          (diffs--split-row-target-number row)))
-               (cons file target))
+             (diffs--split-row-source-location row)
              'diffs-file file
              'diffs-hunk hunk
              'diffs-kind kind
@@ -4825,6 +4957,7 @@ error never strands the user in the unified view."
                           fringe-bar-width
                           full-width-backgrounds
                           source-tab-width
+                          diffs--independent-sources
                           diffs-line-diff-type
                           diffs-max-line-diff-length
                           diffs-line-pair-threshold
@@ -5252,8 +5385,10 @@ offsets, with the end excluded.  The plist also records `:file',
               (line (plist-get token :line))
               (column (plist-get token :column))
               (worktree
-               (and (eq (plist-get token :side) 'new)
-                    (null (plist-get token :revision))
+               (and (null (plist-get token :revision))
+                    (or (eq (plist-get token :side) 'new)
+                        (buffer-local-value
+                         'diffs--independent-sources owner))
                     (not
                      (eq
                       (plist-get
@@ -9281,6 +9416,23 @@ command saves or stages the file."
 
 ;;;; Diff generation
 
+(defun diffs--common-parent-directory (files)
+  "Return the deepest common parent directory containing FILES."
+  (let ((directory (file-name-directory (car files))))
+    (while
+        (and directory
+             (not
+              (cl-every
+               (lambda (file)
+                 (file-in-directory-p file directory))
+               files)))
+      (let ((parent
+             (file-name-directory
+              (directory-file-name directory))))
+        (setq directory
+              (unless (equal parent directory) parent))))
+    (or directory (file-name-directory (car files)))))
+
 (defun diffs--cached-reference-revision (directory)
   "Return diff-hl's most specific cached revision for DIRECTORY."
   (when (and directory
@@ -9318,14 +9470,20 @@ project-cache entry before falling back to diff-hl's global default."
            (position (if (window-live-p window)
                          (window-start window)
                        (point)))
+           (path-width
+            (if (window-live-p window)
+                (max 20 (- (window-width window) 48))
+              diffs--file-header-path-width))
            (section (diffs--section-at-pos position))
            (hunk (and section (diffs--hunk-at-pos section position))))
       (concat
        " "
        (when section
          (concat
-          (propertize (or (plist-get section :file) "?")
-                      'face 'diffs-file-header)
+          (propertize
+           (diffs--short-display-path
+            (or (plist-get section :file) "?") path-width)
+           'face 'diffs-file-header)
           (format "  [%d/%d]  "
                   (plist-get section :index) files)
           (propertize (format "+%d" (plist-get section :adds))
@@ -9350,7 +9508,7 @@ project-cache entry before falling back to diff-hl's global default."
 
 (defun diffs--present
     (buf backend rev &optional line regenerator target-revision
-         entry-restorer return-marker item-ranges)
+         entry-restorer return-marker item-ranges independent-sources)
   "Set up and display the diff in BUF.
 BACKEND and REV are used for revision-aware syntax highlighting.
 LINE, if non-nil, is the source line to move to.  REGENERATOR is
@@ -9358,7 +9516,8 @@ stored for `diffs-refresh'.  TARGET-REVISION is the new side of a
 commit diff; nil means the working tree.  ENTRY-RESTORER, when
 non-nil, restores source state after review initialization.
 RETURN-MARKER independently preserves the source point for quit.
-ITEM-RANGES carries mixed-item identity from `diffs-items'."
+ITEM-RANGES carries mixed-item identity from `diffs-items'.
+INDEPENDENT-SOURCES means the old and new paths are separate files."
   (with-current-buffer buf
     (goto-char (point-min))
     (let ((diffs--mode-context
@@ -9366,6 +9525,7 @@ ITEM-RANGES carries mixed-item identity from `diffs-items'."
                  :backend backend
                  :revision rev
                  :target-revision target-revision
+                 :independent-sources independent-sources
                  :regenerator regenerator)))
       (diffs-mode))
     (unless diffs--sections
@@ -9574,6 +9734,69 @@ unchanged source in the same owner/index/navigation model as diffs."
       (erase-buffer)
       (setq default-directory dir))
     buf))
+
+;;;###autoload
+(defun diffs-files (old new)
+  "Compare saved files OLD and NEW in one native review.
+OLD is the left side and NEW is the right side.  Refresh rereads both
+paths.  Review decisions, when applied explicitly, target NEW."
+  (interactive
+   (let* ((current
+           (and buffer-file-name
+                (file-regular-p buffer-file-name)
+                buffer-file-name))
+          (old
+           (read-file-name
+            (format-prompt
+             "Old file"
+             (and current (file-name-nondirectory current)))
+            nil current t))
+          (new
+           (read-file-name
+            "New file: " (file-name-directory old) nil t)))
+     (list old new)))
+  (setq old (expand-file-name old)
+        new (expand-file-name new))
+  (dolist (file (list old new))
+    (unless (and (file-regular-p file) (file-readable-p file))
+      (user-error "Comparison source is not a readable file: %s" file)))
+  (when (file-equal-p old new)
+    (user-error "Choose two different files"))
+  (require 'diff)
+  (let* ((entry-marker (copy-marker (point)))
+         (directory (diffs--common-parent-directory (list old new)))
+         (buffer (diffs--prepare-buffer directory))
+         (default-directory directory))
+    (condition-case error-data
+        (progn
+          (diff-no-select old new '("-u") t buffer)
+          (with-current-buffer buffer
+            (let ((case-fold-search nil)
+                  (inhibit-read-only t))
+              (goto-char (point-min))
+              (if (re-search-forward "^--- " nil t)
+                  (progn
+                    (delete-region
+                     (point-min) (line-beginning-position))
+                    (goto-char (point-max))
+                    (when (re-search-backward "^Diff finished" nil t)
+                      (delete-region
+                       (line-beginning-position) (point-max))))
+                (when (save-excursion
+                        (goto-char (point-min))
+                        (search-forward
+                         "Diff finished (diff error)" nil t))
+                  (user-error "File comparison command failed"))
+                (erase-buffer))))
+          (diffs--present
+           buffer nil nil nil
+           (lambda () (diffs-files old new))
+           nil nil entry-marker nil t))
+      (error
+       (set-marker entry-marker nil)
+       (when (buffer-live-p buffer)
+         (kill-buffer buffer))
+       (signal (car error-data) (cdr error-data))))))
 
 ;;;###autoload
 (defun diffs-file ()

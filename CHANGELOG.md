@@ -2,6 +2,13 @@
 
 ## Unreleased (0.13.0)
 
+- Add `diffs-files` for comparing any two saved files in the native
+  stacked or split review. Independent old/new source ownership keeps
+  context expansion, token tools, `RET`, and refresh pointed at the
+  correct physical file while comments and decisions retain the
+  canonical target-section identity, including when the two files live
+  in different directories. Default headers elide middle directories
+  from long display paths without changing source identity or navigation.
 - Route `.diff` and `.patch` files directly through the self-contained
   `diffs-mode`, while retaining `diffs-minor-mode` only as the renderer
   boundary for externally owned diff-mode buffers. First-party

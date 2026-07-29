@@ -1318,6 +1318,171 @@
       (should diffs--sections)
       (should buffer-read-only))))
 
+(ert-deftest diffs-files-compares-independent-sources-in-one-review ()
+  (let* ((directory (make-temp-file "diffs-files-test-" t))
+         (old-directory (expand-file-name "old/" directory))
+         (new-directory (expand-file-name "new/" directory))
+         (old (expand-file-name "sample.el" old-directory))
+         (new (expand-file-name "sample.el" new-directory))
+         (source (generate-new-buffer " *diffs files source*"))
+         owner
+         target-buffer
+         (calls 0)
+         (diffs-default-view 'split))
+    (unwind-protect
+        (progn
+          (make-directory old-directory)
+          (make-directory new-directory)
+          (with-temp-file old
+            (insert "before\n(setq value 'old)\nafter\n"))
+          (with-temp-file new
+            (insert "before\n(setq value 'new)\nafter\n"))
+          (require 'diff)
+          (cl-letf
+              (((symbol-function 'diff-no-select)
+                (lambda (actual-old actual-new switches no-async buffer)
+                  (cl-incf calls)
+                  (should (equal actual-old old))
+                  (should (equal actual-new new))
+                  (should (equal switches '("-u")))
+                  (should no-async)
+                  (with-current-buffer buffer
+                    (insert
+                     (format
+                      (concat
+                       "diff -u %s %s\n"
+                       "--- %s\tdate\n"
+                       "+++ %s\tdate\n"
+                       "@@ -1,3 +1,3 @@\n"
+                       " before\n"
+                       "-(setq value 'old)\n"
+                       "+(setq value 'new)\n"
+                       " after\n\n"
+                       "Diff finished.  date\n")
+                      old new old new)))
+                  buffer)))
+            (save-window-excursion
+              (switch-to-buffer source)
+              (insert "entry")
+              (goto-char 3)
+              (set-window-point (selected-window) (point))
+              (diffs-files old new)
+              (setq owner (diffs--review-owner-buffer))
+              (should (= calls 1))
+              (should (derived-mode-p 'diffs-split-mode))
+              (should
+               (buffer-local-value
+                'diffs--independent-sources owner))
+              (should
+               (equal
+                (buffer-local-value
+                 'diffs--review-repository owner)
+                (file-name-as-directory directory)))
+              (with-current-buffer owner
+                (should (= (length diffs--sections) 1))
+                (let ((section (car diffs--sections)))
+                  (should (equal (plist-get section :old-file) old))
+                  (should (equal (plist-get section :file) new))
+                  (should
+                   (equal
+                    (append (diffs--section-lines section 'old) nil)
+                    '("before" "(setq value 'old)" "after")))
+                  (should
+                   (equal
+                    (append (diffs--section-lines section 'new) nil)
+                    '("before" "(setq value 'new)" "after")))
+                  (should
+                   (string-match-p
+                    (regexp-quote
+                     "…/old/sample.el → …/new/sample.el")
+                    (diffs--file-header section 'split)))))
+              (let* ((cache
+                      (buffer-local-value 'diffs--split-cache owner))
+                     (old-view (plist-get cache :old))
+                     (new-view (plist-get cache :new)))
+                (dolist (spec
+                         (list (list old-view 'del old)
+                               (list new-view 'add new)))
+                  (pcase-let ((`(,view ,kind ,file) spec))
+                    (with-current-buffer view
+                      (let ((index
+                             (cl-loop
+                              for row across diffs--split-rows
+                              for row-index from 0
+                              when (eq (nth 3 row) kind)
+                              return row-index)))
+                        (goto-char
+                         (aref diffs--split-row-positions index))
+                        (diffs--split-materialize-range
+                         index (1+ index))
+                        (should
+                         (equal
+                          (diffs--split-property-at
+                           'diffs-src (point))
+                          (cons file 2)))))))
+                (with-current-buffer old-view
+                  (goto-char (point-min))
+                  (search-forward "(setq value 'old)")
+                  (beginning-of-line)
+                  (diffs-review-select)
+                  (diffs-review-add-annotation
+                   "Keep the old-side review identity." "")
+                  (should
+                   (cl-some
+                    (lambda (overlay)
+                      (when-let* ((text
+                                   (overlay-get overlay 'after-string)))
+                        (string-match-p
+                         "Keep the old-side review identity" text)))
+                    diffs--review-overlays)))
+                (let ((annotation
+                       (car
+                        (buffer-local-value
+                         'diffs--review-annotations owner))))
+                  (should (equal (plist-get annotation :file) new))
+                  (should
+                   (equal (plist-get annotation :old-range) '(2 2)))))
+              (diffs-refresh)
+              (should (= calls 2))
+              (should
+               (buffer-local-value
+                'diffs--independent-sources owner))
+              (let* ((cache
+                      (buffer-local-value 'diffs--split-cache owner))
+                     (new-view (plist-get cache :new)))
+                (with-current-buffer new-view
+                  (goto-char (point-min))
+                  (search-forward "(setq value 'new)")
+                  (beginning-of-line)
+                  (diffs-review-reject-change)
+                  (cl-letf (((symbol-function 'yes-or-no-p)
+                             (lambda (&rest _) t)))
+                    (diffs-review-apply-decisions))))
+              (setq target-buffer (find-buffer-visiting new))
+              (should (buffer-live-p target-buffer))
+              (with-current-buffer target-buffer
+                (should (buffer-modified-p))
+                (should
+                 (equal
+                  (buffer-string)
+                  "before\n(setq value 'old)\nafter\n")))
+              (with-temp-buffer
+                (insert-file-contents new)
+                (should
+                 (equal
+                  (buffer-string)
+                  "before\n(setq value 'new)\nafter\n")))
+              (diffs-split-quit-all)
+              (let ((return-window (get-buffer-window source)))
+                (should (window-live-p return-window))
+                (should (= (window-point return-window) 3))))))
+      (dolist (buffer (list owner source target-buffer))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (set-buffer-modified-p nil))
+          (kill-buffer buffer)))
+      (delete-directory directory t))))
+
 (ert-deftest diffs-minor-mode-keeps-an-external-diff-editable ()
   (diffs-tests--with-diff diffs-tests--hidden-context
     (diffs-minor-mode 1)

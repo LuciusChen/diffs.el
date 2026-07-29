@@ -6,7 +6,7 @@ It adds aligned old/new line numbers, full-width change backgrounds, fringe bars
 
 ![A split diffs.el review with syntax-aware word-level changes and an inline comment](docs/screenshots/split-word-diff-review.png)
 
-Diffs.el requires Emacs 29.1 or newer. Rendering is pure Elisp; VC or Git is used only to produce the input patch.
+Diffs.el requires Emacs 29.1 or newer. Rendering is pure Elisp; VC, Git, or Emacs's built-in diff frontend is used only to produce the input patch.
 
 ## Installation
 
@@ -25,7 +25,7 @@ Alternatively, clone the repository, add its directory to `load-path`, and load 
 
 ## Why diffs.el
 
-- No renderer subprocess and no ANSI parsing. (The commands still use VC/Git to produce their input.) Opening a diff costs one cheap scan (≈17 ms for 22k lines / 800 files); on large diffs even the decorations are applied lazily through jit-lock, so only what you see is rendered.
+- No renderer subprocess and no ANSI parsing. (The commands still use VC/Git or the configured `diff-command` to produce their input.) Opening a diff costs one cheap scan (≈17 ms for 22k lines / 800 files); on large diffs even the decorations are applied lazily through jit-lock, so only what you see is rendered.
 - The diff text is never modified: `diff-goto-source` (`RET`), isearch, `diff-apply-hunk`, and the rest of `diff-mode` keep working; line numbers live in `line-prefix`, so copying and searching stay clean.
 - Theme-native: everything inherits from the standard `diff-*` faces.
 - Revision-aware syntax highlighting: the old side is fontified from the file contents at the reference revision.
@@ -33,7 +33,7 @@ Alternatively, clone the repository, add its directory to `load-path`, and load 
 
 ## Quick start
 
-Run `M-x diffs-file` in a tracked file or `M-x diffs-project` anywhere inside a project. The first view is split; `s` switches layouts and `q` returns to the previous window configuration.
+Run `M-x diffs-file` in a tracked file, `M-x diffs-files` to compare any two saved files, or `M-x diffs-project` anywhere inside a project. The first view is split; `s` switches layouts and `q` returns to the previous window configuration.
 
 Opening a `.diff` or `.patch` file enters `diffs-mode` directly, so no separate patch-view command is needed. File-backed patch buffers start with the native stacked owner because major-mode selection happens before Emacs displays the buffer; press `s` for the same split renderer. An externally generated buffer that already uses `diff-mode` can opt into the same renderer with `M-x diffs-minor-mode`.
 
@@ -42,6 +42,7 @@ Opening a `.diff` or `.patch` file enters `diffs-mode` directly, so no separate 
 | Entry point | Kind | Description |
 |---|---|---|
 | `diffs-file` | Command | Current file vs the reference revision, including staged and unsaved changes when diff-hl is available |
+| `diffs-files` | Command | Any two saved files, with the first on the old/left side and the second on the new/right side |
 | `diffs-project` | Command | Saved project working tree vs the reference revision |
 | `diffs-commit` | Command | Show a commit (Git) |
 | `diffs-commit-at-line` | Command | Show the commit that last touched the current line |
@@ -50,6 +51,12 @@ Opening a `.diff` or `.patch` file enters `diffs-mode` directly, so no separate 
 | `diffs-conflict-mode` | Minor mode | Resolve merge markers in place with Current, Incoming, Both, and Reset |
 | `diffs-minor-mode` | Integration | Use the renderer in an externally owned diff-mode buffer |
 | `diffs-diff-hl-mode` | Command | Render diff-hl's current inline or posframe hunk with diffs.el |
+
+### Compare two files
+
+`M-x diffs-files` first prompts for the old/left file and then the new/right file. The files may have different names and live in different directories or outside version control. The command uses Emacs's configured `diff-command` to compare their saved contents, then opens the same stacked or split review used by every other diffs.el entry. Long header paths elide middle directories while retaining their identifying suffixes; source coordinates always keep the complete paths.
+
+Source navigation remains side-specific: `RET` or `M-RET` on the left visits the first file, while the same commands on the right visit the second. Comments from either side stay in one comparison section: left comments carry old ranges, while the second file is the canonical file path exposed to review agents. `e` loads unchanged context from both files, `g` rereads the same paths, and `q` restores the entry layout and position. Review decisions are previews until explicitly applied with `C-c C-c`; application targets only the second file and never saves or stages it.
 
 ### Review keys
 
