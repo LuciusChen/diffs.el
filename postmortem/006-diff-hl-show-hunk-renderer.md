@@ -43,6 +43,8 @@ The adapter does not open a file-level review, replace windows, or
 change source point.  Full-file review remains the separate
 `diffs-file` workflow.
 
+The presentation implementation lives in the optional `diffs-diff-hl.el` module. The package entry file retains only public autoloads and the configuration declaration needed to preserve `require` behavior for package and manual `load-path` installations. Core diff-hl reference-revision and unsaved-file input handling remain in `diffs.el` because they are data-source behavior of `diffs-file` and `diffs-project`, not show-hunk presentation.
+
 ## Superseded alternatives
 
 - Replacing diff-hl's four mouse bindings made a click fast to route but

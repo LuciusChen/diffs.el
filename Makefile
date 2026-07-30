@@ -13,7 +13,8 @@ compile:
 	    (let ((byte-compile-dest-file-function \
 	           (lambda (_file) (make-temp-file "diffs-" nil ".elc")))) \
 	      (mapc (function byte-compile-file) \
-	            (quote ("diffs.el" "diffs-cli.el" "diffs-assets.el")))))'
+	            (quote ("diffs.el" "diffs-diff-hl.el" \
+	                    "diffs-cli.el" "diffs-assets.el")))))'
 
 session-cli-test:
 	EMACS="$(EMACS)" EMACSCLIENT="$(EMACSCLIENT)" \

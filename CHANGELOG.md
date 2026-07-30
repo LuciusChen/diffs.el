@@ -2,6 +2,14 @@
 
 ## Unreleased (0.13.0)
 
+- Add a standard Imenu file → hunk hierarchy to project, commit, mixed-item, and other multi-file reviews. Selecting an entry preserves stacked or split layout, paged splits materialize only the target chunk, and repeated mixed-item paths retain exact stable item identity.
+- Make sticky file/hunk headers truly per-window, restore any replaced window header when diffs.el releases it, and restore the complete external diff-buffer state when `diffs-minor-mode` is disabled. Split rows now carry their exact owning section so duplicate mixed-item paths, refresh restoration, token lookup, and navigation cannot collapse onto the first file match.
+- Prevent a transient source-mode fontification failure from permanently poisoning the shared render cache with unhighlighted text, version cache identities so stale live reviews retry, repaint expanded context with syntax faces when its idle render completes, and publish those faces into read-only split buffers without signaling or changing their modified state.
+- Lead default file headers directly with their file-type icon instead of a decorative horizontal rule, make stacked and split sticky headers reuse the same public file-header renderer, and give collapsed unchanged-context rows compact directional Octicons chevrons with Unicode fallbacks, `up`/`down` public context, and an understated `press [e] +N` hint.
+- Show the sticky file/hunk header only after the in-content file header scrolls away, reclaiming the header-line row at each visible file boundary in stacked and split views.
+- Add optional, width-aware nerd-icons file-type icons to default file headers, sticky headers, renamed paths, and the changed-file index, with text-only fallback and a `diffs-file-icons` toggle.
+- Preserve source-language syntax foregrounds on changed split rows instead of copying diff-mode's added/removed presentation face above them.
+- Move the optional diff-hl show-hunk presentation adapter into the lazily loaded `diffs-diff-hl.el` module. Requiring `diffs` still installs the same public command autoloads, while core file/project reference handling remains available without loading presentation integration code.
 - Keep stacked decoration lazy above `diffs-lazy-threshold` even when
   `font-lock-mode` was disabled by `so-long-mode` or another large-buffer
   policy, preventing project entry from eagerly decorating every hunk

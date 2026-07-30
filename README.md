@@ -25,7 +25,7 @@ Alternatively, clone the repository, add its directory to `load-path`, and load 
 
 ## Why diffs.el
 
-- No renderer subprocess and no ANSI parsing. (The commands still use VC/Git or the configured `diff-command` to produce their input.) A 22k-line / 800-file review scans in about 22 ms and prepares stacked rendering in about 31 ms; on large diffs decorations are applied lazily through jit-lock, so only what you see is rendered.
+- No renderer subprocess and no ANSI parsing. (The commands still use VC/Git or the configured `diff-command` to produce their input.) A 22k-line / 800-file review scans in about 21 ms and prepares stacked rendering in about 33 ms; on large diffs decorations are applied lazily through jit-lock, so only what you see is rendered.
 - The diff text is never modified: `diff-goto-source` (`RET`), isearch, `diff-apply-hunk`, and the rest of `diff-mode` keep working; line numbers live in `line-prefix`, so copying and searching stay clean.
 - Theme-native: everything inherits from the standard `diff-*` faces.
 - Revision-aware syntax highlighting: the old side is fontified from the file contents at the reference revision.
@@ -174,15 +174,17 @@ Annotation plists use `:id`, `:file`, inclusive one-based `:old-range`/`:new-ran
 
 ## Expandable context
 
-Collapsed hunk separators report how many unchanged lines they hide. On a separator or anywhere in its hunk, press `e` repeatedly to reveal `diffs-context-step` more lines. Expansion is one-way within a review; once every hidden line is visible, the separator disappears. `TAB` remains available for Emacs's separate hunk/outline folding. The same `e` command works directly in the side-by-side view, where both columns rebuild together.
+Collapsed hunk separators report how many unchanged lines they hide. A leading region uses the compact Octicons `nf-oct-chevron_up`; an inter-hunk region below an earlier change uses `nf-oct-chevron_down`, with `↑` and `↓` text fallbacks. The understated `press [e] +N` hint inherits the separator styling: on a separator or anywhere in its hunk, press `e` repeatedly to reveal `diffs-context-step` more lines. Expansion is one-way within a review; once every hidden line is visible, the separator disappears. `TAB` remains available for Emacs's separate hunk/outline folding. The same `e` command works directly in the side-by-side view, where both columns rebuild together.
 
-Expanded lines are display overlays backed by the complete old and new file contents; the underlying patch is unchanged, so applying hunks, searching, and copying retain normal `diff-mode` behavior. Expanded lines appear immediately from raw source. Source-mode fontification runs from an idle queue and publishes faces afterward; rendered line vectors are shared through a bounded cache keyed by repository, file, side, revision or worktree content, language mode, and theme generation. Theme changes invalidate rendered faces without discarding review-owned raw source.
+Expanded lines are display overlays backed by the complete old and new file contents; the underlying patch is unchanged, so applying hunks, searching, and copying retain normal `diff-mode` behavior. Expanded lines appear immediately from raw source. Source-mode fontification runs from an idle queue and publishes faces afterward; rendered line vectors are shared through a bounded cache keyed by renderer version, repository, file, side, revision or worktree content, language mode, and theme generation. A transient source-mode fontification failure leaves the immediately available raw lines visible but is not cached as a successful render, so a later context read can retry. Theme changes invalidate rendered faces without discarding review-owned raw source.
 
 ## Changed-file index and sticky context
 
-The header line stays pinned to the file and hunk at the top of the window.  It shows the current file position (`[3/42]`), per-file addition/deletion counts, hunk line starts, and the hunk's function context when available.
+Once the in-content file header scrolls out of view, a sticky header takes its place instead of duplicating it on the first row. It reuses `diffs-file-header-function`, so its icon-first file label and statistics match the in-content header in stacked and split views, then adds the current file position (`[3/42]` in stacked), hunk line starts, and the hunk's function context when available. Sticky state belongs to each window, so two windows showing the same review can remain at different files without changing one another's header.
 
-Press `i` to open a left side window containing only files present in the diff—not the complete repository tree.  Each entry includes addition/deletion counts and follows the current file while the diff scrolls.  In the index, `n`/`p` preview adjacent files without moving focus, `RET` or mouse-1 visits a file, and `i`/`q` hides the index. The index remains available with the side-by-side view.
+Press `i` to open a left side window containing only files present in the diff—not the complete repository tree. Each entry includes addition/deletion counts and follows the current file while the diff scrolls. When the optional `nerd-icons` package is available, default file headers, sticky headers, and index entries lead directly with each path's file-type icon instead of a decorative horizontal rule; renamed old/new paths use their respective types. Set `diffs-file-icons` to nil for text-only labels. In the index, `n`/`p` preview adjacent files without moving focus, `RET` or mouse-1 visits a file, and `i`/`q` hides the index. The index remains available with the side-by-side view.
+
+Project, commit, and mixed-item reviews also expose a standard file → hunk hierarchy through `M-x imenu` and any package that consumes Imenu. Selecting an entry keeps the current stacked or split layout; paged splits materialize only the target chunk. Repeated mixed-item paths are disambiguated by their stable item ids instead of collapsing onto the first matching file.
 
 ## Side-by-side view
 
@@ -238,7 +240,7 @@ Whitespace is not interactive by default. Set `diffs-token-interactions-on-white
 
 File items use a repository-relative `:file` and string `:content`. Diff items use string `:patch`. Options accept `:directory`, `:buffer-name`, `:backend`, `:revision`, and `:target-revision`.
 
-File headers, line gutters, and hunk separators have one public presentation function each. Every function receives a copied context plist and returns a string or nil; returning nil suppresses that element. The same functions receive `:view` as `stacked` or `split`, so one configuration covers both layouts. Gutter functions run on materialized rows and should remain pure and fast.
+File headers, line gutters, and hunk separators have one public presentation function each. Every function receives a copied context plist and returns a string or nil; returning nil suppresses that element. The same functions receive `:view` as `stacked` or `split`, so one configuration covers both layouts. Hunk separator contexts include `:direction` as `up` or `down` together with `:count`, `:visible`, `:hidden`, and `:context-step`. Gutter functions run on materialized rows and should remain pure and fast.
 
 | Option | Default function |
 |---|---|
@@ -260,6 +262,7 @@ All options belong to the `diffs` customization group.
 | `diffs-line-numbers` | `t` | Show old and new line-number columns |
 | `diffs-hide-markers` | `t` | Hide leading unified-diff markers |
 | `diffs-prettify-headers` | `t` | Replace raw file/hunk headers with compact headers |
+| `diffs-file-icons` | `t` | Show nerd-icons file-type icons when the optional package is available |
 | `diffs-fringe-bars` | `t` | Show theme-native added/removed fringe bars |
 | `diffs-fringe-bar-width` | `2` | Fringe-bar width in pixels, clamped to 1–8 |
 | `diffs-split-full-width-backgrounds` | `t` | Extend split change backgrounds across each row |
@@ -293,19 +296,19 @@ All options belong to the `diffs` customization group.
 
 The Agent installer destinations are controlled by `diffs-review-cli-install-path`, `diffs-review-skill-install-directory`, and `diffs-review-assets-directory`.
 
-On an M-series Mac running Emacs 32, the included synthetic benchmark (800 files, 22,000 lines, 536 KB) measures about 22 ms for scanning, 32 ms for lazy stacked setup, 2 ms to materialize its first viewport, 64 ms for the first side-by-side render, 23 ms to materialize a first deep split viewport, and 5 ms for a cached toggle. The default `auto` policy selects paged rendering for this fixture. These measurements include line numbers, fringe bars, source syntax, and native corresponding-line/word refinement with the default non-wrapping split. The same fixture exercises the public split-view `A` and `R` decision path at about 261 ms and 311 ms. Run it on your machine with:
+On an M-series Mac running Emacs 32, the included synthetic benchmark (800 files, 22,000 lines, 536 KB) measures about 21 ms for scanning, 33 ms for lazy stacked setup, 2 ms to materialize its first viewport, 60 ms for the first side-by-side render, 21 ms to materialize a first deep split viewport, and 5 ms for a cached toggle. The default `auto` policy selects paged rendering for this fixture. These measurements include line numbers, fringe bars, source syntax, and native corresponding-line/word refinement with the default non-wrapping split. The same fixture exercises the public split-view `A` and `R` decision path at about 269 ms and 326 ms. Run it on your machine with:
 
 ```sh
 make benchmark
 ```
 
-The large tier uses 4,000 files and 110,000 lines to expose scaling defects hidden by the default fixture. The automatic paged path currently measures about 103 ms for scanning, 135 ms for stacked setup, 3 ms for its first viewport, 185 ms for the first split, 32 ms for a deep split viewport, 8 ms for a cached toggle, and 1.32/1.54 seconds for `A`/`R`. Run it after changing row collection, physical indexing, viewport lookup, or decision rebuilding:
+The large tier uses 4,000 files and 110,000 lines to expose scaling defects hidden by the default fixture. The automatic paged path currently measures about 102 ms for scanning, 141 ms for stacked setup, 3 ms for its first viewport, 182 ms for the first split, 22 ms for a deep split viewport, 6 ms for a cached toggle, and 1.23/1.54 seconds for `A`/`R`. Run it after changing row collection, physical indexing, viewport lookup, or decision rebuilding:
 
 ```sh
 make benchmark-large
 ```
 
-Set `DIFFS_BENCH_VIRTUALIZATION=complete` or `DIFFS_BENCH_VIRTUALIZATION=paged` to force either model. The complete path currently takes about 218 ms / 1.08 seconds for the first split and 1.0/2.6 ms for a cached toggle on the default/large tiers. The automatic paged pair upgrades to its exact searchable projection in about 280 ms / 1.32 seconds; subsequent search and copy operations reuse it. Decision timings remain near the complete model because decisions deliberately fall back to it.
+Set `DIFFS_BENCH_VIRTUALIZATION=complete` or `DIFFS_BENCH_VIRTUALIZATION=paged` to force either model. The complete path currently takes about 218 ms / 1.08 seconds for the first split and 1.0/2.6 ms for a cached toggle on the default/large tiers. The automatic paged pair upgrades to its exact searchable projection in about 280 ms / 1.36 seconds; subsequent search and copy operations reuse it. Decision timings remain near the complete model because decisions deliberately fall back to it.
 
 ## Integrations
 
@@ -322,7 +325,7 @@ Set `DIFFS_BENCH_VIRTUALIZATION=complete` or `DIFFS_BENCH_VIRTUALIZATION=paged` 
 
   Content layout follows `diffs-default-view`: the default `split` renders the current hunk as aligned old/new columns inside the inline popup or posframe, while `stacked` uses the unified presentation. This is independent of `diffs-diff-hl-display-function`, which decides where that content is displayed.
 
-  The integration mode changes no mouse bindings and does not enable diff-hl or its mouse mode. By default it preserves the inline, posframe, or other public backend that it replaces; disabling it restores that backend. Set `diffs-diff-hl-display-function` to choose placement explicitly:
+  The presentation adapter lives in `diffs-diff-hl.el` and loads on first use; requiring `diffs` remains sufficient when the package files share one `load-path`. The integration mode changes no mouse bindings and does not enable diff-hl or its mouse mode. By default it preserves the inline, posframe, or other public backend that it replaces; disabling it restores that backend. Set `diffs-diff-hl-display-function` to choose placement explicitly:
 
   ```elisp
   (setq diffs-diff-hl-display-function
@@ -345,8 +348,10 @@ Metadata-only Git changes such as renames and mode changes remain visible instea
 
 ## Development
 
-Run the ERT suite with:
+Run the complete ERT, live-session CLI, and zero-warning byte-compilation checks with:
 
 ```sh
-make test
+make check
 ```
+
+Rendering, row-model, or viewport changes also require `make benchmark`; changes to physical indexing or decision rebuilding require `make benchmark-large`. Before committing, follow the complete diff, checkdoc, package-lint, documentation, and hands-on approval checklist in [AGENTS.md](AGENTS.md).

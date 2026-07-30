@@ -1,6 +1,7 @@
 ;;; diffs-assets.el --- Packaged assets for diffs.el -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 Lucius Chen
+;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;; Author: Lucius Chen
 ;; URL: https://github.com/LuciusChen/diffs.el

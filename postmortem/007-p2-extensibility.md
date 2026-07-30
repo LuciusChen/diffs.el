@@ -22,15 +22,19 @@ The review surface has stable file, side, source-line, and logical-row identitie
 
 ### Asynchronous syntax and render caching
 
-Source retrieval and syntax rendering are separate states. Raw file contents become usable immediately; source-mode fontification runs from an idle queue and publishes an immutable line vector afterward. Cache identity includes repository root, file, side revision or worktree content identity, language mode, and a theme generation. Theme changes invalidate rendered entries without discarding reusable raw source.
+Source retrieval and syntax rendering are separate states. Raw file contents become usable immediately; source-mode fontification runs from an idle queue and publishes an immutable line vector afterward. Cache identity includes an explicit renderer version, repository root, file, side revision or worktree content identity, language mode, and a theme generation. Theme changes invalidate rendered entries without discarding reusable raw source.
 
-The cache is bounded and shared across reviews. Review buffers register generation-checked waiters; completed work may update visible context or rebuild a visible split only while the same owner generation and source identity remain current.
+The cache is bounded and shared across reviews. Review buffers register generation-checked waiters; completed work may update visible context or rebuild a visible split only while the same owner generation and source identity remain current. A recoverable source-mode fontification failure keeps raw source visible but never enters the successful-render cache. Its waiter releases the failed identity, allowing a later context read to retry instead of treating the raw vector as a permanent syntax result; renderer-version changes similarly make live stale identities retry.
 
 ### Mixed items and public presentation hooks
 
 The owner buffer remains the sole state owner. A mixed review item is either a scanned diff section or an explicit unchanged source-file item with a stable id and revision/content identity. Split and stacked presentations consume the same item sequence.
 
 Public header, gutter, and separator functions receive immutable context plists and return strings or nil. Defaults preserve the current appearance. Hooks replace only presentation; scanning, row identity, navigation, decisions, comments, and source application continue to use the existing models.
+
+### Standard navigation
+
+Every review publishes the owner's file and hunk index through the standard buffer-local Imenu protocol. Split entries use Imenu's supported special-item dispatch to resolve the same stable section/hunk identity and remain in split view; paged splits materialize only the selected chunk. Duplicate mixed-item paths use their item ids for disambiguation and row ownership, so navigation does not introduce a second file lookup or view-specific index.
 
 ## Rejected alternatives
 
@@ -39,12 +43,13 @@ Public header, gutter, and separator functions receive immutable context plists 
 - Running source major-mode hooks or local variables for historical contents.
 - Caching rendered faces only by file name or revision while ignoring language and theme.
 - Introducing a second parser or state owner for mixed items.
+- Adding another package-specific file/hunk navigator instead of implementing Imenu.
 - Making header, gutter, or separator callbacks responsible for navigation or mutation.
 
 ## Completion evidence
 
 - Stacked, split, wrapped, Unicode, old-side, and new-side token coordinate tests.
 - Eldoc and Xref delegation tests against a real source-buffer position.
-- Deterministic idle-render tests covering cache reuse and revision/language/theme invalidation.
-- Mixed unchanged-file/diff ordering, navigation, search, and public renderer tests.
+- Deterministic idle-render tests covering expanded-overlay repainting, failure retry, cache reuse, and renderer/revision/language/theme invalidation.
+- Mixed unchanged-file/diff ordering, navigation, search, exact duplicate-path identity, Imenu dispatch, and public renderer tests.
 - Full ERT, byte compilation, checkdoc, package-lint, and the large-review benchmark.

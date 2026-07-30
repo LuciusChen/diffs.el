@@ -1,6 +1,7 @@
 ;;; diffs.el --- Fast, pretty file-level diff viewing -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2026 Lucius Chen
+;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;; Author: Lucius Chen
 ;; Assisted-by: OpenAI Codex:gpt-5.6-sol, Claude code:fable-5
@@ -8,6 +9,21 @@
 ;; Version: 0.13.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: vc, tools
+;;
+;; This file is part of diffs.el.
+;;
+;; Diffs.el is free software: you can redistribute it and/or modify it
+;; under the terms of the GNU General Public License as published by the
+;; Free Software Foundation, either version 3 of the License, or (at your
+;; option) any later version.
+;;
+;; Diffs.el is distributed in the hope that it will be useful, but
+;; WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+;; General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with diffs.el.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
 
@@ -66,23 +82,26 @@
 (require 'smerge-mode)
 (require 'eldoc)
 (require 'xref)
+(require 'imenu)
 
 (declare-function vc-git-command "vc-git")
 (declare-function vc-git-root "vc-git")
 (declare-function diff-no-select "diff")
 (declare-function diff-hl-diff-buffer-with-reference "diff-hl")
 (declare-function diff-hl-diff-skip-to "diff-hl")
-(declare-function diff-hl-show-hunk-inline "diff-hl-show-hunk-inline")
-(declare-function diff-hl-show-hunk-posframe "diff-hl-show-hunk-posframe")
+(declare-function nerd-icons-icon-for-file "nerd-icons"
+                  (file &rest arg-overrides))
+(declare-function nerd-icons-octicon "nerd-icons"
+                  (icon-name &rest args))
 (defvar vc-git-program)
 (defvar diff-hl-update-async)
 (defvar diff-hl-show-staged-changes)
 (defvar diff-hl-reference-revision)
 (defvar diff-hl-reference-revision-projects-cache)
-(defvar diff-hl-show-hunk-function)
-(defvar diff-hl-show-hunk-inline-smart-lines)
 (defvar smerge-auto-leave)
 (defvar diffs-minor-mode)
+(defvar diffs-diff-hl-mode nil
+  "Non-nil when diffs.el renders diff-hl show-hunk previews.")
 (defvar diffs-conflict-mode)
 (defvar diffs--split-unified)
 (defvar diffs--review-skill-content)
@@ -93,30 +112,47 @@
   "Pretty file-level diff viewing."
   :group 'vc)
 
+(autoload 'diffs-diff-hl-show-hunk "diffs-diff-hl"
+  "Render diff-hl's current hunk with diffs.el." nil)
+(autoload 'diffs-diff-hl-mode "diffs-diff-hl"
+  "Use diffs.el as diff-hl's show-hunk renderer." t)
+
 (defcustom diffs-line-numbers t
   "When non-nil, show old and new line numbers beside diff lines."
-  :type 'boolean)
+  :type 'boolean
+  :group 'diffs)
 
 (defcustom diffs-hide-markers t
   "When non-nil, hide the leading +/-/space markers of diff lines."
-  :type 'boolean)
+  :type 'boolean
+  :group 'diffs)
 
 (defcustom diffs-prettify-headers t
   "When non-nil, replace file and hunk headers with a compact form."
-  :type 'boolean)
+  :type 'boolean
+  :group 'diffs)
+
+(defcustom diffs-file-icons t
+  "When non-nil, prefix file labels with nerd-icons file-type icons.
+The integration is optional.  When nerd-icons is unavailable, diffs.el
+keeps the same text-only labels without signaling an error."
+  :type 'boolean
+  :group 'diffs)
 
 (defcustom diffs-lazy-threshold 10000
   "Decorate lazily via jit-lock when the diff has more lines than this.
 Lazy decoration makes huge diffs open instantly.  Set to 0 to
 always decorate lazily, or to `most-positive-fixnum' to always
 decorate eagerly."
-  :type 'natnum)
+  :type 'natnum
+  :group 'diffs)
 
 (defcustom diffs-split-overscan 60
   "Number of extra split rows decorated above and below the viewport.
 The complete model always retains its text.  The paged model also uses
 this distance when retaining materialized chunks around the viewport."
-  :type 'natnum)
+  :type 'natnum
+  :group 'diffs)
 
 (defcustom diffs-split-virtualization 'auto
   "Data model used to prepare non-wrapping side-by-side views.
@@ -148,22 +184,26 @@ model."
   "When non-nil, wrap long side-by-side rows while preserving alignment.
 Both sides receive the same number of physical rows, with filler
 rows added to the shorter side as necessary."
-  :type 'boolean)
+  :type 'boolean
+  :group 'diffs)
 
 (defcustom diffs-default-view 'split
   "Layout used for new diffs views and diff-hl hunk previews.
 Choose `split' for side-by-side columns or `stacked' for a unified diff."
   :type '(choice (const :tag "Side by side" split)
-                 (const :tag "Unified/stacked" stacked)))
+                 (const :tag "Unified/stacked" stacked))
+  :group 'diffs)
 
 (defcustom diffs-fringe-bars t
   "When non-nil, show colored fringe bars on added and removed lines."
-  :type 'boolean)
+  :type 'boolean
+  :group 'diffs)
 
 (defcustom diffs-fringe-bar-width 2
   "Width in pixels of added and removed line bars in the left fringe.
 Values outside the range 1 through 8 are clamped."
-  :type 'integer)
+  :type 'integer
+  :group 'diffs)
 
 (defcustom diffs-diff-hl-display-function nil
   "Public diff-hl backend used to display a diffs-rendered hunk.
@@ -182,25 +222,30 @@ Direct uses of `diffs-diff-hl-show-hunk' fall back to
 The line-number gutter receives the same theme-native background.
 Word-level `diff-refine-added' and `diff-refine-removed' faces
 remain layered above it."
-  :type 'boolean)
+  :type 'boolean
+  :group 'diffs)
 
 (defcustom diffs-index-width 36
   "Width in columns of the changed-file index side window."
-  :type 'integer)
+  :type 'integer
+  :group 'diffs)
 
 (defcustom diffs-context-step 10
   "Number of unchanged lines revealed by `diffs-expand-context'."
-  :type 'natnum)
+  :type 'natnum
+  :group 'diffs)
 
 (defcustom diffs-review-cli-install-path
   (expand-file-name "diffs" "~/.local/bin/")
   "File where `diffs-review-install-agent-tools' installs the CLI."
-  :type 'file)
+  :type 'file
+  :group 'diffs)
 
 (defcustom diffs-review-skill-install-directory
   (expand-file-name "diffs-review" "~/.agents/skills/")
   "Directory where `diffs-review-install-agent-tools' installs the skill."
-  :type 'directory)
+  :type 'directory
+  :group 'diffs)
 
 (defcustom diffs-review-assets-directory
   (locate-user-emacs-file "diffs-assets/")
@@ -208,7 +253,8 @@ remain layered above it."
 Package-manager build directories need contain only root-level Elisp
 files; these copies therefore remain usable independently of a source
 checkout or package upgrade."
-  :type 'directory)
+  :type 'directory
+  :group 'diffs)
 
 (defcustom diffs-line-diff-type 'word-alt
   "Granularity used to emphasize changes within paired lines.
@@ -219,39 +265,46 @@ Unicode characters, and `none' disables within-line emphasis."
   :type '(choice (const :tag "Word, visually grouped" word-alt)
                  (const :tag "Exact word tokens" word)
                  (const :tag "Characters" char)
-                 (const :tag "Disabled" none)))
+                 (const :tag "Disabled" none))
+  :group 'diffs)
 
 (defcustom diffs-max-line-diff-length 1000
   "Maximum line length eligible for within-line emphasis.
 Longer lines retain their full-line added or removed background but
 skip the more expensive token comparison.  Zero means no limit."
-  :type 'natnum)
+  :type 'natnum
+  :group 'diffs)
 
 (defcustom diffs-line-pair-threshold 0.6
   "Maximum normalized edit distance for pairing removed and added lines.
 Zero pairs only identical lines; one allows any two lines to pair."
-  :type 'float)
+  :type 'float
+  :group 'diffs)
 
 (defcustom diffs-line-pair-limit 64
   "Maximum number of lines per side for global change-block alignment.
 Larger blocks fall back to ordinal pairing, bounding render latency."
-  :type 'natnum)
+  :type 'natnum
+  :group 'diffs)
 
 (defcustom diffs-refine-whitespace 'show
   "Whether within-line emphasis includes whitespace changes.
 `show' treats whitespace runs as tokens, like diffs.com's word diff.
 `ignore' excludes whitespace tokens from matching and emphasis."
   :type '(choice (const :tag "Show whitespace changes" show)
-                 (const :tag "Ignore whitespace changes" ignore)))
+                 (const :tag "Ignore whitespace changes" ignore))
+  :group 'diffs)
 
 (defcustom diffs-fullscreen t
   "When non-nil, the diffs view takes over the whole frame.
 `diffs-quit' (bound to \\`q') restores the previous window layout."
-  :type 'boolean)
+  :type 'boolean
+  :group 'diffs)
 
 (defcustom diffs-buffer-name "*diffs*"
   "Name of the buffer used to display diffs."
-  :type 'string)
+  :type 'string
+  :group 'diffs)
 
 (defcustom diffs-token-interactions-on-whitespace nil
   "When non-nil, token interaction APIs include whitespace tokens.
@@ -319,7 +372,7 @@ The function returns a string or nil.  Context keys include `:view',
   "Function that renders a hunk separator from one context plist.
 The function returns a string or nil.  Context keys include `:view',
 `:section', `:hunk', `:file', `:item-type', `:context', `:count',
-`:visible', and `:hidden'."
+`:visible', `:hidden', `:direction', and `:context-step'."
   :type 'function
   :group 'diffs)
 
@@ -484,7 +537,9 @@ Each element: (:beg N :block-end N :end N :file S :adds N :dels N
   "Non-nil when old and new sides are independently selected files.")
 
 (defvar-local diffs--context-gaps nil
-  "Expandable unchanged gaps preceding hunks in this diff.")
+  "Expandable unchanged gaps preceding hunks in this diff.
+A leading gap has direction `up'; a gap following an earlier hunk has
+direction `down'.")
 
 (defvar-local diffs--context-gap-table nil
   "EQ hash table mapping parsed hunks to their unchanged gaps.")
@@ -513,8 +568,8 @@ Each element: (:beg N :block-end N :end N :file S :adds N :dels N
 (defvar-local diffs--refined-blocks nil
   "Hash table of change blocks already refined in the unified view.")
 
-(defvar-local diffs--saved-diff-refine nil
-  "Value of `diff-refine' before `diffs-minor-mode' was enabled.")
+(defvar-local diffs--minor-mode-saved-state nil
+  "External buffer state saved while `diffs-minor-mode' is active.")
 
 (defvar-local diffs--item-ranges nil
   "Source ranges and metadata supplied by `diffs-items'.")
@@ -544,6 +599,9 @@ Each element: (:beg N :block-end N :end N :file S :adds N :dels N
 
 (defvar diffs--render-theme-generation 0
   "Generation included in source render cache keys.")
+
+(defconst diffs--source-render-version 1
+  "Version of syntax-rendered source cache entries.")
 
 (defconst diffs--file-header-path-width 72
   "Maximum display width used for paths in default file headers.")
@@ -743,7 +801,8 @@ Return a section plist; see `diffs--sections'."
         gaps)
     (dolist (section diffs--sections)
       (let ((old-end 1)
-            (new-end 1))
+            (new-end 1)
+            (direction 'up))
         (dolist (hunk (plist-get section :hunks))
           (let* ((old-start (nth 1 hunk))
                  (new-start (nth 2 hunk))
@@ -752,11 +811,13 @@ Return a section plist; see `diffs--sections'."
                                   (- new-start new-end)))))
             (let ((gap (list :section section :hunk hunk
                              :old-start old-end :new-start new-end
-                             :count count :visible 0 :overlay nil)))
+                             :count count :visible 0 :overlay nil
+                             :direction direction)))
               (push gap gaps)
               (puthash hunk gap table))
             (setq old-end (+ old-start (nth 5 hunk))
-                  new-end (+ new-start (nth 6 hunk)))))))
+                  new-end (+ new-start (nth 6 hunk))
+                  direction 'down)))))
     (setq diffs--context-gaps (nreverse gaps)
           diffs--context-gap-table table
           diffs--old-content-cache (make-hash-table :test #'eq)
@@ -810,6 +871,38 @@ Return a section plist; see `diffs--sections'."
          (t (setq found section)))))
     found))
 
+(defun diffs--section-for-identity
+    (item-id file &optional section-index)
+  "Return the section identified by ITEM-ID, FILE, and SECTION-INDEX.
+An exact stable ITEM-ID is authoritative.  A generated ordinary-diff
+id may fall back to FILE only when that path is unique; mixed items and
+duplicate paths are never guessed.  SECTION-INDEX is zero based."
+  (let ((indexed
+         (and section-index (nth section-index diffs--sections))))
+    (or
+     (and indexed
+          (or (null item-id)
+              (equal item-id (plist-get indexed :item-id)))
+          indexed)
+     (and item-id
+          (cl-find
+           item-id diffs--sections
+           :key (lambda (section)
+                  (plist-get section :item-id))
+           :test #'equal))
+     (and
+      file
+      (or (null item-id)
+          (string-prefix-p "diff:" item-id))
+      (cl-loop
+       with match
+       for section in diffs--sections
+       when (equal file (plist-get section :file))
+       if match return nil
+       else do (setq match section)
+       finally return match))
+     (and (null item-id) indexed))))
+
 (defun diffs--hunk-at-pos (section position)
   "Return the hunk in SECTION containing POSITION."
   (cl-find-if (lambda (hunk)
@@ -846,31 +939,33 @@ Return a section plist; see `diffs--sections'."
   (setq-local kill-buffer-query-functions nil)
   (set-buffer-modified-p nil))
 
-(defun diffs--fontified-lines (string file)
-  "Return STRING as syntax-fontified line vectors for FILE.
-Mode hooks and file-local variables are not run.  If source-mode
-fontification fails, return the original unfontified lines."
+(defun diffs--fontified-lines-result (string file)
+  "Return (LINES . SUCCESS) after syntax-fontifying STRING as FILE.
+Mode hooks and file-local variables are not run.  On failure, LINES is
+the original unfontified text and SUCCESS is nil."
   (condition-case nil
-      (with-temp-buffer
-        (unwind-protect
-            (progn
-              (insert string)
-              (let ((buffer-file-name
-                     (and file
-                          (expand-file-name file default-directory)))
-                    (enable-local-variables nil)
-                    (enable-local-eval nil))
-                (delay-mode-hooks
-                  (set-auto-mode))
-                (font-lock-mode 1)
-                (font-lock-ensure (point-min) (point-max))
-                (diffs--string-lines
-                 (buffer-substring (point-min) (point-max)))))
-          ;; A source mode may leave this synthetic buffer looking like a
-          ;; modified file.  Sanitize it before `with-temp-buffer' kills it
-          ;; so context expansion can never ask the user to save it.
-          (diffs--sanitize-synthetic-source)))
-    (error (diffs--string-lines string))))
+      (cons
+       (with-temp-buffer
+         (unwind-protect
+             (progn
+               (insert string)
+               (let ((buffer-file-name
+                      (and file
+                           (expand-file-name file default-directory)))
+                     (enable-local-variables nil)
+                     (enable-local-eval nil))
+                 (delay-mode-hooks
+                   (set-auto-mode))
+                 (font-lock-mode 1)
+                 (font-lock-ensure (point-min) (point-max))
+                 (diffs--string-lines
+                  (buffer-substring (point-min) (point-max)))))
+           ;; A source mode may leave this synthetic buffer looking like a
+           ;; modified file.  Sanitize it before `with-temp-buffer' kills it
+           ;; so context expansion can never ask the user to save it.
+           (diffs--sanitize-synthetic-source)))
+       t)
+    (error (cons (diffs--string-lines string) nil))))
 
 (defun diffs--context-source-root ()
   "Return the stable source root for unchanged context."
@@ -970,6 +1065,7 @@ avoids rebuilding the already available plain source string."
    :file file
    :side side
    :revision revision
+   :renderer diffs--source-render-version
    :content
    (secure-hash
     'sha1 (or text (diffs--source-lines-string lines)))
@@ -1013,6 +1109,14 @@ avoids rebuilding the already available plain source string."
   (let ((entry (gethash section diffs--source-render-identities)))
     (if (eq side 'old) (car entry) (cdr entry))))
 
+(defun diffs--source-render-current-p (section side)
+  "Return non-nil when SECTION SIDE has a current render identity."
+  (equal
+   (plist-get
+    (diffs--source-render-identity section side)
+    :renderer)
+   diffs--source-render-version))
+
 (defun diffs--set-source-render-identity (section side key)
   "Record KEY as the pending render identity for SECTION on SIDE."
   (let ((entry (gethash section diffs--source-render-identities)))
@@ -1048,6 +1152,20 @@ avoids rebuilding the already available plain source string."
            owner section side)
           (force-window-update owner))))))
 
+(defun diffs--source-render-reject (key waiter)
+  "Reject failed render KEY for WAITER so a later read can retry."
+  (let ((owner (plist-get waiter :owner))
+        (generation (plist-get waiter :generation))
+        (section (plist-get waiter :section))
+        (side (plist-get waiter :side)))
+    (when (buffer-live-p owner)
+      (with-current-buffer owner
+        (when (and (= generation diffs--source-render-generation)
+                   (equal
+                    key
+                    (diffs--source-render-identity section side)))
+          (diffs--set-source-render-identity section side nil))))))
+
 (defun diffs--render-ensure-timer ()
   "Ensure an idle worker is scheduled for the source render queue."
   (when (and diffs--render-queue
@@ -1063,13 +1181,22 @@ avoids rebuilding the already available plain source string."
   (when-let* ((key (pop diffs--render-queue))
               (job (gethash key diffs--render-jobs)))
     (remhash key diffs--render-jobs)
-    (let ((lines
-           (diffs--fontified-lines
-            (plist-get job :text)
-            (plist-get job :file))))
-      (diffs--render-cache-put key lines)
-      (dolist (waiter (plist-get job :waiters))
-        (diffs--source-render-publish key lines waiter))))
+    (let* ((result
+            (diffs--fontified-lines-result
+             (plist-get job :text)
+             (plist-get job :file)))
+           (lines (car result))
+           (success (cdr result)))
+      (if success
+          (progn
+            (diffs--render-cache-put key lines)
+            (dolist (waiter (plist-get job :waiters))
+              (diffs--source-render-publish key lines waiter)))
+        (remhash key diffs--render-cache)
+        (setq diffs--render-cache-order
+              (delete key diffs--render-cache-order))
+        (dolist (waiter (plist-get job :waiters))
+          (diffs--source-render-reject key waiter)))))
   (diffs--render-ensure-timer))
 
 (defun diffs--schedule-source-render
@@ -1179,7 +1306,10 @@ Return cached rendered lines immediately when available, otherwise nil."
     (cond
      ((and (hash-table-contains-p section cache)
            (vectorp cached))
-      cached)
+      (if (diffs--source-render-current-p section side)
+          cached
+        (or (diffs--schedule-source-render section side cached)
+            cached)))
      ((and (hash-table-contains-p section cache)
            (consp cached))
       nil)
@@ -1853,6 +1983,69 @@ within-line ranges can be computed only when the row becomes visible."
 
 ;;;; Rendering
 
+(defvar diffs--nerd-icons-state 'unknown
+  "Cached availability of the optional nerd-icons integration.")
+
+(defun diffs--nerd-icons-available-p ()
+  "Return non-nil when the public nerd-icons APIs are available."
+  (cond
+   ((and (featurep 'nerd-icons)
+         (fboundp 'nerd-icons-icon-for-file))
+    (setq diffs--nerd-icons-state 'available)
+    t)
+   ((and (eq diffs--nerd-icons-state 'available)
+         (fboundp 'nerd-icons-icon-for-file))
+    t)
+   ((eq diffs--nerd-icons-state 'missing) nil)
+   ((and (require 'nerd-icons nil t)
+         (fboundp 'nerd-icons-icon-for-file))
+    (setq diffs--nerd-icons-state 'available)
+    t)
+   (t
+    (setq diffs--nerd-icons-state 'missing)
+    nil)))
+
+(defun diffs--file-icon (file)
+  "Return the optional nerd-icons prefix glyph for FILE."
+  (when (and diffs-file-icons
+             file
+             (diffs--nerd-icons-available-p))
+    (condition-case nil
+        (let ((icon (nerd-icons-icon-for-file file)))
+          (and (stringp icon)
+               (not (string-empty-p icon))
+               icon))
+      (error nil))))
+
+(defun diffs--context-direction-icon (direction)
+  "Return an upward or downward context glyph for DIRECTION."
+  (let* ((up (eq direction 'up))
+         (fallback (if up "↑" "↓"))
+         (name (if up "nf-oct-chevron_up" "nf-oct-chevron_down")))
+    (if (and (diffs--nerd-icons-available-p)
+             (fboundp 'nerd-icons-octicon))
+        (condition-case nil
+            (let ((icon
+                   (nerd-icons-octicon
+                    name :face 'diffs-hunk-separator)))
+              (if (and (stringp icon)
+                       (not (string-empty-p icon)))
+                  icon
+                fallback))
+          (error fallback))
+      fallback)))
+
+(defun diffs--context-action-hint (amount)
+  "Return a styled key hint for revealing AMOUNT unchanged lines."
+  (concat
+   "press "
+   (propertize
+    "[e]"
+    'help-echo
+    (format "Press e to reveal %d more unchanged line%s"
+            amount (if (= amount 1) "" "s")))
+   (format " +%d" amount)))
+
 (defun diffs--string-tail-to-width (string width)
   "Return the trailing portion of STRING no wider than WIDTH."
   (let ((total (string-width string)))
@@ -1893,19 +2086,41 @@ within-line ranges can be computed only when the row becomes visible."
                 (setq directory nil))))
           (concat ellipsis tail))))))
 
+(defun diffs--file-label (file width &optional truncate-function)
+  "Return FILE with an optional type icon within WIDTH columns.
+TRUNCATE-FUNCTION receives FILE and the columns left for its path.  It
+defaults to `diffs--short-display-path'."
+  (let* ((truncate-function
+          (or truncate-function #'diffs--short-display-path))
+         (icon (diffs--file-icon file))
+         (prefix (and icon (concat icon " ")))
+         (prefix-width (and prefix (string-width prefix))))
+    (if (and prefix-width (< prefix-width width))
+        (concat
+         prefix
+         (funcall truncate-function file (- width prefix-width)))
+      (funcall truncate-function file width))))
+
+(defun diffs--file-header-text (text)
+  "Return TEXT with `diffs-file-header' below existing icon faces."
+  (let ((copy (copy-sequence text)))
+    (add-face-text-property
+     0 (length copy) 'diffs-file-header t copy)
+    copy))
+
 (defun diffs--display-file-label (old-file file width)
   "Return OLD-FILE and FILE as one path label no wider than WIDTH."
   (if (equal old-file file)
-      (diffs--short-display-path file width)
+      (diffs--file-label file width)
     (let* ((separator " → ")
            (available
             (max 2 (- width (string-width separator))))
            (old-width (/ available 2))
            (new-width (- available old-width)))
       (concat
-       (diffs--short-display-path old-file old-width)
+       (diffs--file-label old-file old-width)
        separator
-       (diffs--short-display-path file new-width)))))
+       (diffs--file-label file new-width)))))
 
 (defun diffs--put (beg end &rest props)
   "Set PROPS on BEG..END, marking them as owned by diffs."
@@ -1953,15 +2168,11 @@ within-line ranges can be computed only when the row becomes visible."
           (diffs--display-file-label
            old-file file diffs--file-header-path-width)))
     (if (eq (plist-get context :item-type) 'file)
-        (propertize
-         (concat
-          "── "
-          (diffs--short-display-path
-           file diffs--file-header-path-width))
-         'face 'diffs-file-header)
+        (diffs--file-header-text
+         (diffs--file-label
+          file diffs--file-header-path-width))
       (concat
-       (propertize (concat "── " label "  ")
-                   'face 'diffs-file-header)
+       (diffs--file-header-text (concat label "  "))
        (propertize
         (format "+%d" (or (plist-get context :adds) 0))
         'face 'diffs-file-stats-added)
@@ -1976,6 +2187,25 @@ within-line ranges can be computed only when the row becomes visible."
    diffs-file-header-function
    (diffs--file-header-context section view)
    "`diffs-file-header-function'"))
+
+(defun diffs--sticky-file-header (section view width &optional owner)
+  "Render SECTION's file header for sticky VIEW within WIDTH columns.
+When OWNER is live, use its presentation configuration."
+  (when section
+    (let ((diffs--file-header-path-width width))
+      (if (buffer-live-p owner)
+          (with-current-buffer owner
+            (diffs--file-header section view))
+        (diffs--file-header section view)))))
+
+(defun diffs--sticky-hunk-label (hunk)
+  "Return sticky line-position and function context for HUNK."
+  (when hunk
+    (let ((context (nth 4 hunk)))
+      (concat
+       (format "  ·  −%d +%d" (nth 1 hunk) (nth 2 hunk))
+       (when (and context (not (string-empty-p context)))
+         (concat "  " context))))))
 
 (defun diffs--gutter-context
     (section view kind width old-line new-line
@@ -2064,6 +2294,7 @@ NEW-LINE, SIDE, CONTINUATION, and FACE describe its presentation."
      :count count
      :visible visible
      :hidden hidden
+     :direction (and gap (plist-get gap :direction))
      :context-step diffs-context-step)))
 
 ;;;###autoload
@@ -2073,23 +2304,36 @@ NEW-LINE, SIDE, CONTINUATION, and FACE describe its presentation."
     (let ((count (plist-get context :count))
           (visible (plist-get context :visible))
           (hidden (plist-get context :hidden))
+          (direction (or (plist-get context :direction) 'up))
           (hunk-context (plist-get context :context))
           (step (max 1 (plist-get context :context-step))))
       (concat
-       "⋯"
+       (if (and count (> count 0))
+           (diffs--context-direction-icon direction)
+         "⋯")
        (cond
         ((not (and count (> count 0))) "")
         ((zerop visible)
-         (format " %d unmodified lines · e +%d"
-                 count (min count step)))
+         (concat
+          (format " %d unmodified lines · " count)
+          (diffs--context-action-hint (min count step))))
         ((> hidden 0)
-         (format
-          " %d more unmodified lines · %d shown · e +%d"
-          hidden visible (min hidden step)))
+         (concat
+          (format " %d more unmodified lines · %d shown · "
+                  hidden visible)
+          (diffs--context-action-hint (min hidden step))))
         (t ""))
        (when (and hunk-context
                   (not (string-empty-p hunk-context)))
          (concat " · " hunk-context))))))
+
+(defun diffs--style-hunk-separator (string)
+  "Apply the base separator face to STRING without hiding nested faces."
+  (when string
+    (let ((styled (copy-sequence string)))
+      (add-face-text-property
+       0 (length styled) 'diffs-hunk-separator t styled)
+      styled)))
 
 (defun diffs--hunk-separator (section hunk view)
   "Render HUNK's separator in SECTION for VIEW."
@@ -2112,14 +2356,18 @@ NEW-LINE, SIDE, CONTINUATION, and FACE describe its presentation."
          pos next '(diffs display line-prefix wrap-prefix))
         (setq pos next)))))
 
+(defun diffs--section-header-end (section)
+  "Return the end of SECTION's source header block."
+  (if (plist-get section :hunks)
+      (plist-get section :block-end)
+    (save-excursion
+      (goto-char (plist-get section :beg))
+      (forward-line 1)
+      (point))))
+
 (defun diffs--decorate-header (sec)
   "Display the header block of section SEC as one styled line."
-  (let* ((end (if (plist-get sec :hunks)
-                  (plist-get sec :block-end)
-                (save-excursion
-                  (goto-char (plist-get sec :beg))
-                  (forward-line 1)
-                  (point))))
+  (let* ((end (diffs--section-header-end sec))
          (header (diffs--file-header sec 'stacked))
          (line (and header (concat header "\n"))))
     (diffs--put (plist-get sec :beg) end
@@ -2141,10 +2389,10 @@ NEW-LINE, SIDE, CONTINUATION, and FACE describe its presentation."
            'display
            (if (and gap (> (plist-get gap :visible) 0))
                ""
-             (propertize (or (diffs--hunk-separator
-                              section hunk 'stacked)
-                             "")
-                         'face 'diffs-hunk-separator))))))))
+             (or
+              (diffs--style-hunk-separator
+               (diffs--hunk-separator section hunk 'stacked))
+              ""))))))))
 
 (defun diffs--context-before-string (gap)
   "Return a unified-view display string for visible rows of GAP."
@@ -2193,8 +2441,7 @@ NEW-LINE, SIDE, CONTINUATION, and FACE describe its presentation."
                (if (and separator
                         (not (string-empty-p separator)))
                    (concat
-                    (propertize separator
-                                'face 'diffs-hunk-separator)
+                    (diffs--style-hunk-separator separator)
                     "\n"
                     context)
                  context)))))
@@ -2477,8 +2724,175 @@ patch-block fingerprint used to revalidate it across refreshes.")
 (defvar-local diffs--index-current-overlay nil
   "Overlay highlighting the current file in a changed-file index.")
 
-(defvar-local diffs--saved-header-line-format nil
-  "Header line that was active before `diffs-minor-mode'.")
+(defconst diffs--minor-mode-owned-variables
+  '(header-line-format
+    diff-refine
+    diff-font-lock-prettify
+    diff-font-lock-syntax
+    font-lock-extra-managed-props
+    imenu-create-index-function
+    outline-minor-mode-cycle
+    outline-minor-mode-highlight)
+  "Buffer variables temporarily owned by `diffs-minor-mode'.")
+
+(defun diffs--minor-mode-state-snapshot ()
+  "Return the external buffer state that diffs.el temporarily owns."
+  (list
+   :variables
+   (mapcar
+    (lambda (symbol)
+      (list symbol
+            (local-variable-p symbol)
+            (and (boundp symbol)
+                 (copy-tree (symbol-value symbol)))))
+    diffs--minor-mode-owned-variables)
+   :outline-minor-mode (bound-and-true-p outline-minor-mode)))
+
+(defun diffs--minor-mode-restore-state ()
+  "Restore state saved before `diffs-minor-mode' was enabled."
+  (when diffs--minor-mode-saved-state
+    (let ((outline-enabled
+           (plist-get diffs--minor-mode-saved-state
+                      :outline-minor-mode))
+          (outline-active (bound-and-true-p outline-minor-mode)))
+      (unless (eq (not (null outline-active))
+                  (not (null outline-enabled)))
+        (outline-minor-mode (if outline-enabled 1 -1))))
+    (dolist (entry
+             (plist-get diffs--minor-mode-saved-state :variables))
+      (pcase-let ((`(,symbol ,local ,value) entry))
+        (if local
+            (set symbol value)
+          (kill-local-variable symbol))))
+    (setq diffs--minor-mode-saved-state nil)))
+
+(defconst diffs--sticky-header-owner-parameter
+  'diffs--sticky-header-owner
+  "Window parameter recording the buffer that owns a sticky header.")
+
+(defconst diffs--sticky-header-previous-parameter
+  'diffs--sticky-header-previous-format
+  "Window parameter storing the header replaced by a sticky header.")
+
+(defun diffs--sticky-header-format (window split)
+  "Return a header-line format specific to WINDOW.
+When SPLIT is non-nil, render side-by-side header content."
+  (list
+   (list
+    :eval
+    (list (if split
+              'diffs--split-header-line
+            'diffs--header-line)
+          (list 'quote window)))))
+
+(defun diffs--clear-sticky-header-window (window owner)
+  "Remove OWNER's sticky-header parameters from WINDOW."
+  (when (and (window-live-p window)
+             (eq (window-parameter
+                  window diffs--sticky-header-owner-parameter)
+                 owner))
+    (set-window-parameter
+     window 'header-line-format
+     (window-parameter
+      window diffs--sticky-header-previous-parameter))
+    (set-window-parameter
+     window diffs--sticky-header-previous-parameter nil)
+    (set-window-parameter
+     window diffs--sticky-header-owner-parameter nil)
+    t))
+
+(defun diffs--clear-sticky-headers ()
+  "Remove sticky-header window parameters owned by the current buffer."
+  (let ((owner (current-buffer)))
+    (dolist (frame (frame-list))
+      (dolist (window (window-list frame 'nomini))
+        (when (diffs--clear-sticky-header-window window owner)
+          (force-window-update window))))))
+
+(defun diffs--sticky-header-window-buffer-change (window)
+  "Update or remove the current buffer's sticky header in WINDOW."
+  (if (eq (window-buffer window) (current-buffer))
+      (diffs--update-sticky-header window)
+    (diffs--clear-sticky-header-window window (current-buffer))))
+
+(defun diffs--stacked-file-header-at-p (position)
+  "Return non-nil when a rendered file header covers POSITION."
+  (when-let* ((diffs-prettify-headers)
+              (section (diffs--section-at-pos position))
+              (begin (plist-get section :beg))
+              ((< position (diffs--section-header-end section)))
+              (display (get-text-property begin 'display))
+              ((stringp display)))
+    (string-match-p "[^\n]" display)))
+
+(defun diffs--split-file-header-at-p (position)
+  "Return non-nil when a rendered split file header covers POSITION."
+  (when-let* ((row (diffs--split-row-at-position position))
+              ((eq (nth 3 row) 'header))
+              (text (car row))
+              ((stringp text)))
+    (string-match-p "[^\n]" text)))
+
+(defun diffs--update-sticky-header (window &optional start)
+  "Update the sticky header shown in WINDOW at START.
+The sticky header yields completely while the rendered file header is
+the first content row, so the same file label is never shown twice."
+  (when (window-live-p window)
+    (with-current-buffer (window-buffer window)
+      (let* ((owner (current-buffer))
+             (position (or start (window-start window)))
+             (split (derived-mode-p 'diffs-split-mode))
+             (supported (or split diffs-minor-mode))
+             (content-header
+              (and supported
+                   (if split
+                       (diffs--split-file-header-at-p position)
+                     (diffs--stacked-file-header-at-p position))))
+             (wanted
+              (and supported
+                   (not content-header)
+                   (diffs--sticky-header-format window split)))
+             (old-format
+              (window-parameter window 'header-line-format))
+             (old-owner
+              (window-parameter
+               window diffs--sticky-header-owner-parameter))
+             (current-owner old-owner))
+        (when (and current-owner (not (eq current-owner owner)))
+          (diffs--clear-sticky-header-window window current-owner)
+          (setq current-owner nil))
+        (if supported
+            (progn
+              (unless (eq current-owner owner)
+                (set-window-parameter
+                 window diffs--sticky-header-previous-parameter
+                 (window-parameter window 'header-line-format)))
+              (set-window-parameter
+               window diffs--sticky-header-owner-parameter owner)
+              (set-window-parameter window 'header-line-format wanted))
+          (diffs--clear-sticky-header-window window owner))
+        (unless
+            (and
+             (equal
+              old-format
+              (window-parameter window 'header-line-format))
+             (eq
+              old-owner
+              (window-parameter
+               window diffs--sticky-header-owner-parameter)))
+          (force-window-update window))))))
+
+(defun diffs--update-split-sticky-headers (window &optional start)
+  "Update WINDOW's sticky header at START and its paired split header."
+  (when (window-live-p window)
+    (let* ((buffer (window-buffer window))
+           (other
+            (and (buffer-live-p buffer)
+                 (buffer-local-value 'diffs--split-other buffer))))
+      (diffs--update-sticky-header window start)
+      (when (buffer-live-p other)
+        (dolist (peer (get-buffer-window-list other nil t))
+          (diffs--update-sticky-header peer))))))
 
 (defun diffs--index-buffer-name (owner)
   "Return a changed-file index buffer name for OWNER."
@@ -2507,15 +2921,19 @@ patch-block fingerprint used to revalidate it across refreshes.")
 (defun diffs--index-render (owner index)
   "Render OWNER's changed files into INDEX."
   (let ((sections (buffer-local-value 'diffs--sections owner))
-        (width (max 20 (buffer-local-value 'diffs-index-width owner))))
+        (width (max 20 (buffer-local-value 'diffs-index-width owner)))
+        (file-icons (buffer-local-value 'diffs-file-icons owner)))
     (with-current-buffer index
       (let ((inhibit-read-only t)
+            (diffs-file-icons file-icons)
             (file-width (max 8 (- width 14))))
         (erase-buffer)
         (dolist (section sections)
           (let* ((beg (point))
                  (file (or (plist-get section :file) "?"))
-                 (label (diffs--index-file-label file file-width)))
+                 (label
+                  (diffs--file-label
+                   file file-width #'diffs--index-file-label)))
             (insert "  " label)
             (insert (make-string (max 1 (- file-width
                                            (string-width label)))
@@ -2579,16 +2997,20 @@ patch-block fingerprint used to revalidate it across refreshes.")
      (current-buffer)
      (diffs--section-at-pos (or position (point))))))
 
-(defun diffs--index-post-command ()
-  "Sync the changed-file index after movement in a unified diff."
+(defun diffs--stacked-post-command ()
+  "Update stacked-view context after point movement."
   (when diffs-minor-mode
-    (diffs--index-sync (point))))
+    (diffs--index-sync (point))
+    (let ((window (selected-window)))
+      (when (eq (window-buffer window) (current-buffer))
+        (diffs--update-sticky-header window)))))
 
-(defun diffs--index-scroll (window start)
-  "Sync the changed-file index when WINDOW scrolls to START."
+(defun diffs--stacked-scroll-hook (window start)
+  "Update stacked-view context when WINDOW scrolls to START."
   (when (and diffs-minor-mode
              (eq (window-buffer window) (current-buffer)))
-    (diffs--index-sync start)))
+    (diffs--index-sync start)
+    (diffs--update-sticky-header window start)))
 
 (defun diffs--index-owner-buffer ()
   "Return the unified diff buffer related to the current view."
@@ -2780,23 +3202,30 @@ hunk headers, and enables outline folding (TAB on headings).
     (user-error "`diffs-minor-mode' only works in diff-mode buffers"))
   (if diffs-minor-mode
       (progn
-        (setq diffs--saved-header-line-format header-line-format)
-        (setq diffs--saved-diff-refine diff-refine)
+        (unless diffs--minor-mode-saved-state
+          (setq diffs--minor-mode-saved-state
+                (diffs--minor-mode-state-snapshot)))
         (setq-local diff-refine nil)
         (remove-overlays (point-min) (point-max) 'diff-mode 'fine)
         (when font-lock-mode
           (font-lock-flush))
-        (setq header-line-format '((:eval (diffs--header-line))))
+        (setq header-line-format nil)
         (diffs--define-fringe-bitmap)
         (add-hook 'text-scale-mode-hook #'diffs--define-fringe-bitmap nil t)
         (add-hook 'kill-buffer-hook #'diffs--split-cache-clear nil t)
         (add-hook 'kill-buffer-hook #'diffs--index-cleanup nil t)
         (add-hook 'kill-buffer-hook #'diffs--token-source-cache-clear nil t)
-        (add-hook 'post-command-hook #'diffs--index-post-command nil t)
-        (add-hook 'window-scroll-functions #'diffs--index-scroll nil t)
+        (add-hook 'kill-buffer-hook #'diffs--clear-sticky-headers nil t)
+        (add-hook 'post-command-hook #'diffs--stacked-post-command nil t)
+        (add-hook 'window-scroll-functions
+                  #'diffs--stacked-scroll-hook nil t)
+        (add-hook 'window-buffer-change-functions
+                  #'diffs--sticky-header-window-buffer-change nil t)
         (add-hook 'eldoc-documentation-functions
                   #'diffs-eldoc-function nil t)
         (add-hook 'xref-backend-functions #'diffs-xref-backend nil t)
+        (setq-local imenu-create-index-function
+                    #'diffs--imenu-create-index)
         (setq-local diff-font-lock-prettify nil)
         (when (eq diff-font-lock-syntax t)
           (setq-local diff-font-lock-syntax 'hunk-also))
@@ -2805,6 +3234,8 @@ hunk headers, and enables outline folding (TAB on headings).
         (add-to-invisibility-spec '(diffs-resolution))
         (diffs--review-ensure-session-state)
         (diffs--decorate-setup)
+        (dolist (window (get-buffer-window-list (current-buffer) nil t))
+          (diffs--update-sticky-header window))
         (setq-local outline-minor-mode-cycle t)
         (setq-local outline-minor-mode-highlight nil)
         (outline-minor-mode 1))
@@ -2813,20 +3244,20 @@ hunk headers, and enables outline folding (TAB on headings).
     (remove-hook 'kill-buffer-hook #'diffs--split-cache-clear t)
     (remove-hook 'kill-buffer-hook #'diffs--index-cleanup t)
     (remove-hook 'kill-buffer-hook #'diffs--token-source-cache-clear t)
-    (remove-hook 'post-command-hook #'diffs--index-post-command t)
-    (remove-hook 'window-scroll-functions #'diffs--index-scroll t)
+    (remove-hook 'kill-buffer-hook #'diffs--clear-sticky-headers t)
+    (remove-hook 'post-command-hook #'diffs--stacked-post-command t)
+    (remove-hook 'window-scroll-functions #'diffs--stacked-scroll-hook t)
+    (remove-hook 'window-buffer-change-functions
+                 #'diffs--sticky-header-window-buffer-change t)
     (remove-hook 'eldoc-documentation-functions
                  #'diffs-eldoc-function t)
     (remove-hook 'xref-backend-functions #'diffs-xref-backend t)
     (remove-from-invisibility-spec '(diffs-resolution))
     (diffs--index-cleanup)
     (diffs--split-cache-clear)
-    (outline-minor-mode -1)
+    (diffs--clear-sticky-headers)
     (diffs--undecorate)
-    (setq-local diff-refine diffs--saved-diff-refine)
-    (setq header-line-format diffs--saved-header-line-format
-          diffs--saved-header-line-format nil
-          diffs--saved-diff-refine nil)
+    (diffs--minor-mode-restore-state)
     (when font-lock-mode
       (font-lock-flush))))
 
@@ -2854,10 +3285,13 @@ hunk headers, and enables outline folding (TAB on headings).
           (goto-char (window-point window))
           (let* ((position (line-beginning-position))
                  (row (diffs--split-row-at-position position))
-                 (hunk (and row (nth 5 row))))
+                 (hunk (and row (nth 5 row)))
+                 (section
+                  (and row (diffs--token-section-for-row owner row))))
             (list
              :role diffs--split-role
              :file (and row (nth 4 row))
+             :item-id (and section (plist-get section :item-id))
              :hunk-old-start (and hunk (nth 1 hunk))
              :hunk-new-start (and hunk (nth 2 hunk))
              :source
@@ -2879,6 +3313,7 @@ hunk headers, and enables outline folding (TAB on headings).
        (let ((section (plist-get gap :section))
              (hunk (plist-get gap :hunk)))
          (list :file (plist-get section :file)
+               :item-id (plist-get section :item-id)
                :old-start (nth 1 hunk)
                :new-start (nth 2 hunk)
                :visible (plist-get gap :visible))))
@@ -2983,13 +3418,11 @@ integers before refresh adoption begins."
 (defun diffs--refresh-find-hunk (owner state)
   "Return the refreshed hunk in OWNER identified by split STATE."
   (with-current-buffer owner
-    (when-let* ((file (plist-get state :file))
-                (section
-                 (cl-find file diffs--sections
-                          :key
-                          (lambda (item)
-                            (plist-get item :file))
-                          :test #'equal)))
+    (when-let*
+        ((section
+          (diffs--section-for-identity
+           (plist-get state :item-id)
+           (plist-get state :file))))
       (cl-find-if
        (lambda (hunk)
          (and
@@ -3004,13 +3437,9 @@ integers before refresh adoption begins."
   (with-current-buffer owner
     (dolist (saved (plist-get state :context))
       (when-let* ((section
-                   (cl-find
-                    (plist-get saved :file)
-                    diffs--sections
-                    :key
-                    (lambda (item)
-                      (plist-get item :file))
-                    :test #'equal))
+                   (diffs--section-for-identity
+                    (plist-get saved :item-id)
+                    (plist-get saved :file)))
                   (hunk
                    (cl-find-if
                     (lambda (item)
@@ -3300,7 +3729,7 @@ integers before refresh adoption begins."
             diffs--regenerator regenerator
             diffs--item-ranges item-ranges
             buffer-read-only t
-            header-line-format '((:eval (diffs--header-line))))
+            header-line-format nil)
       (diffs--decorate-setup)
       (unless diffs--sections
         (user-error "No changes"))
@@ -3317,7 +3746,9 @@ integers before refresh adoption begins."
     (diffs--refresh-prepare-new-layout owner state)
     (diffs--refresh-restore-layout owner state)
     (diffs--refresh-restore-restriction owner state)
-    (diffs--refresh-release-saved-view-buffers owner state)))
+    (diffs--refresh-release-saved-view-buffers owner state)
+    (dolist (window (get-buffer-window-list owner nil t))
+      (diffs--update-sticky-header window))))
 
 (defun diffs--refresh-leave-partial-split (owner)
   "Leave any currently displayed split derived from OWNER."
@@ -3625,6 +4056,13 @@ INDEX may equal the row count, in which case return `point-max'."
   (when-let* ((index (diffs--split-row-index-at-position position)))
     (aref diffs--split-rows index)))
 
+(defun diffs--split-row-section (row)
+  "Return the exact owning section carried by physical split ROW."
+  (let ((section (nth 12 row)))
+    (and (listp section)
+         (plist-member section :beg)
+         section)))
+
 (defun diffs--split-row-property (row property)
   "Return data-bearing PROPERTY from split ROW."
   (pcase property
@@ -3633,7 +4071,8 @@ INDEX may equal the row count, in which case return `point-max'."
     ('diffs-file (nth 4 row))
     ('diffs-hunk (nth 5 row))
     ('diffs-kind (nth 3 row))
-    ('diffs-number (nth 1 row))))
+    ('diffs-number (nth 1 row))
+    ('diffs-section (diffs--split-row-section row))))
 
 (defun diffs--split-row-resolution-key (row)
   "Return the review resolution key carried by split ROW."
@@ -3689,9 +4128,15 @@ INDEX may equal the row count, in which case return `point-max'."
       (when-let* ((row (diffs--split-row-at-position position)))
         (diffs--split-row-property row property))))
 
-(defun diffs--split-header-line ()
-  "Return the sticky header for a side-by-side buffer."
-  (let* ((window (get-buffer-window (current-buffer)))
+(defun diffs--split-section-at-position (position)
+  "Return the owning diff section for split POSITION."
+  (when (buffer-live-p diffs--split-unified)
+    (when-let* ((row (diffs--split-row-at-position position)))
+      (diffs--token-section-for-row diffs--split-unified row))))
+
+(defun diffs--split-header-line (&optional window)
+  "Return the sticky header for a side-by-side WINDOW."
+  (let* ((window (or window (get-buffer-window (current-buffer))))
          (position (if (window-live-p window)
                        (window-start window)
                      (point)))
@@ -3699,41 +4144,19 @@ INDEX may equal the row count, in which case return `point-max'."
           (if (window-live-p window)
               (max 20 (- (window-width window) 24))
             diffs--file-header-path-width))
-         (row (diffs--split-row-at-position position))
-         (file (or (and row (diffs--split-row-source-file row))
-                   (diffs--split-property-at 'diffs-file position)))
+         (section (diffs--split-section-at-position position))
          (hunk (diffs--split-property-at 'diffs-hunk position))
-         (side (if (eq diffs--split-role 'old)
-                   (or (and (buffer-live-p diffs--split-unified)
-                            (buffer-local-value
-                             'diffs--revision diffs--split-unified))
-                       "old")
-                 "new")))
+         (header
+          (diffs--sticky-file-header
+           section 'split path-width diffs--split-unified)))
     (concat
-     " " side
-     (when file
-       (concat
-        "  │  "
-        (propertize
-         (diffs--short-display-path file path-width)
-         'face 'diffs-file-header)
-        (when hunk
-          (let ((context (nth 4 hunk)))
-            (concat
-             (format "  ·  −%d +%d" (nth 1 hunk) (nth 2 hunk))
-             (when (and context (not (string-empty-p context)))
-               (concat "  " context))))))))))
+     (or header "")
+     (or (diffs--sticky-hunk-label hunk) ""))))
 
 (defun diffs--split-sync-index (position)
   "Sync the owning file index to split POSITION."
   (when (buffer-live-p diffs--split-unified)
-    (when-let* ((file (diffs--split-property-at 'diffs-file position))
-                (section
-                 (cl-find file
-                          (buffer-local-value
-                           'diffs--sections diffs--split-unified)
-                          :key (lambda (item) (plist-get item :file))
-                          :test #'equal)))
+    (when-let* ((section (diffs--split-section-at-position position)))
       (diffs--index-highlight-section diffs--split-unified section))))
 
 (defun diffs--split-cache-clear ()
@@ -3782,10 +4205,10 @@ the hunk's logical separator as the first row."
                   (emit
                    (or old
                        (list "" nil (nth 2 new) 'filler
-                             file hunk nil nil))
+                             file hunk nil nil nil nil nil section))
                    (or new
                        (list "" nil (nth 2 old) 'filler
-                             file hunk nil nil)))))))
+                             file hunk nil nil nil nil nil section)))))))
           (setq dels nil
                 adds nil)))
       (let* ((gap (diffs--gap-for-hunk hunk))
@@ -3796,15 +4219,16 @@ the hunk's logical separator as the first row."
                        (diffs--hunk-separator
                         section hunk 'split)))
                   (if separator-text
-                      (propertize separator-text
-                                  'face 'diffs-hunk-separator)
+                      (diffs--style-hunk-separator separator-text)
                     "")))))
         (when separator
           ;; Keep an empty logical separator when complete context is
           ;; visible.  Resolution still needs the hunk boundary, while
           ;; `diffs--split-physical-rows' omits it from rendered views.
-          (emit (list text nil nil 'sep file hunk nil nil)
-                (list text nil nil 'sep file hunk nil nil)))
+          (emit (list text nil nil 'sep file hunk nil nil
+                      nil nil nil section)
+                (list text nil nil 'sep file hunk nil nil
+                      nil nil nil section)))
         (when (and gap (> (plist-get gap :visible) 0))
           (dolist (context-row (diffs--gap-visible-rows gap))
             (let ((old-number (nth 0 context-row))
@@ -3812,9 +4236,9 @@ the hunk's logical separator as the first row."
                   (old-text (diffs--context-text (nth 2 context-row)))
                   (new-text (diffs--context-text (nth 3 context-row))))
               (emit (list old-text old-number new-number
-                          'ctx file hunk nil nil)
+                          'ctx file hunk nil nil nil nil nil section)
                     (list new-text new-number new-number
-                          'ctx file hunk nil nil))))))
+                          'ctx file hunk nil nil nil nil nil section))))))
       (save-excursion
         (goto-char (car hunk))
         (forward-line 1)
@@ -3828,9 +4252,9 @@ the hunk's logical separator as the first row."
                      (min (1+ (line-beginning-position))
                           (line-end-position))))
                 (emit (list text old-line new-line 'ctx file hunk
-                            origin nil)
+                            origin nil nil nil nil section)
                       (list text new-line new-line 'ctx file hunk
-                            origin nil)))
+                            origin nil nil nil nil section)))
               (cl-incf old-line)
               (cl-incf new-line))
              ((eq character ?-)
@@ -3838,7 +4262,7 @@ the hunk's logical separator as the first row."
                           old-line new-line 'del file hunk
                           (min (1+ (line-beginning-position))
                                (line-end-position))
-                          nil)
+                          nil nil nil nil section)
                     dels)
               (cl-incf old-line))
              ((eq character ?+)
@@ -3846,7 +4270,7 @@ the hunk's logical separator as the first row."
                           new-line new-line 'add file hunk
                           (min (1+ (line-beginning-position))
                                (line-end-position))
-                          nil)
+                          nil nil nil nil section)
                     adds)
               (cl-incf new-line))))
           (forward-line 1))
@@ -3977,9 +4401,9 @@ or hunk depending on KIND."
 
 (defun diffs--split-collect ()
   "Collect aligned row lists from the current unified diffs buffer.
-Returns (OLD-ROWS NEW-ROWS ANCHORS); each row is
-\(STRING NUMBER SRC-LINE KIND FILE HUNK ORIGIN PAIR [SOURCE-NUMBER
-SOURCE-SIDE LIVE-TARGET]).  NUMBER is the displayed preview line, or nil
+Returns (OLD-ROWS NEW-ROWS ANCHORS); each logical row is
+\(STRING NUMBER SRC-LINE KIND FILE HUNK ORIGIN PAIR SOURCE-NUMBER
+SOURCE-SIDE LIVE-TARGET SECTION).  NUMBER is the displayed preview line, or nil
 for fillers and headers; SOURCE-NUMBER is its immutable old/new
 patch-side line.  SRC-LINE is the original new-side target coordinate and
 LIVE-TARGET is that coordinate after decisions actually applied to the
@@ -3993,8 +4417,10 @@ Paired changed rows share a two-element PAIR vector."
         (let* ((file (plist-get sec :file))
                (header (diffs--file-header sec 'split)))
           (when header
-            (emit (list header nil nil 'header file nil nil nil)
-                  (list header nil nil 'header file nil nil nil)))
+            (emit (list header nil nil 'header file nil nil nil
+                        nil nil nil sec)
+                  (list header nil nil 'header file nil nil nil
+                        nil nil nil sec)))
           (unless (plist-get sec :hunks)
             (save-excursion
               (goto-char (plist-get sec :beg))
@@ -4003,8 +4429,10 @@ Paired changed rows share a two-element PAIR vector."
                 (let ((text (buffer-substring
                              (line-beginning-position)
                              (line-end-position))))
-                  (emit (list text nil nil 'meta file nil nil nil)
-                        (list text nil nil 'meta file nil nil nil)))
+                  (emit (list text nil nil 'meta file nil nil nil
+                              nil nil nil sec)
+                        (list text nil nil 'meta file nil nil nil
+                              nil nil nil sec)))
                 (forward-line 1))))
           (dolist (hunk (plist-get sec :hunks))
             (push (1+ row) anchors)
@@ -4057,8 +4485,10 @@ both columns."
           ;; source number and live target before changing preview numbers.
           (when (or (not (zerop display-shift))
                     (not (zerop target-shift)))
-            (unless (nthcdr 8 row)
-              (nconc row (list (nth 1 row) nil (nth 2 row))))
+            (when (and (nth 1 row) (null (nth 8 row)))
+              (setcar (nthcdr 8 row) (nth 1 row)))
+            (when (and (nth 2 row) (null (nth 10 row)))
+              (setcar (nthcdr 10 row) (nth 2 row)))
             (when (and (nth 1 row) (not (zerop display-shift)))
               (setcar (nthcdr 1 row)
                       (+ (nth 1 row) display-shift)))
@@ -4067,17 +4497,18 @@ both columns."
                       (+ (nth 2 row) target-shift))))
           row)
          (set-target
-          (row target)
+         (row target)
           ;; Keep display and immutable review coordinates unchanged while
           ;; recording a distinct live-worktree destination.
-          (unless (nthcdr 8 row)
-            (nconc row (list (nth 1 row) nil (nth 2 row))))
+          (when (and (nth 1 row) (null (nth 8 row)))
+            (setcar (nthcdr 8 row) (nth 1 row)))
           (setcar (nthcdr 10 row) target)
           row)
          (flush
           ()
           (when change-pairs
             (let* ((pairs (nreverse change-pairs))
+                   (block-section (nth 11 (caar pairs)))
                    (key (diffs--resolution-key file hunk block-index))
                    (decision
                     (alist-get key decisions nil nil #'equal))
@@ -4121,8 +4552,10 @@ both columns."
                           (if (eq action 'accept)
                               new-shift old-shift)))
                     (emit
-                     (list label nil nil 'decision file hunk nil nil)
-                     (list label nil nil 'decision file hunk nil nil))
+                     (list label nil nil 'decision file hunk nil nil
+                           nil nil nil block-section)
+                     (list label nil nil 'decision file hunk nil nil
+                           nil nil nil block-section))
                     (cl-loop
                      for source in chosen
                      for source-index from 0
@@ -4146,7 +4579,7 @@ both columns."
                                'ctx file hunk
                                (nth 6 adjusted) nil
                                (or (nth 8 adjusted) (nth 1 source))
-                               source-side live-target)))
+                               source-side live-target block-section)))
                         (emit (copy-tree row) (copy-tree row))))
                     (if (eq action 'accept)
                         (cl-incf old-shift
@@ -4199,7 +4632,8 @@ both columns."
                      hunk nil
                      block-index 0))
              (when (eq old-kind 'sep)
-               (setq hunk (nth 5 old)
+               (setq file (nth 4 old)
+                     hunk (nth 5 old)
                      block-index 0))
              (emit (adjust old old-shift live-shift)
                    (adjust new new-shift live-shift)))))
@@ -4253,7 +4687,7 @@ CONTENT-WIDTH is used when WRAP-LINES is non-nil.  Return
 of rendered hunk starts.  A hidden complete-context separator anchors
 its first context row.  Physical rows append the immutable patch-side
 source number, source-character offset, original old/new source side,
-and live-worktree target number."
+live-worktree target number, and exact owning section."
   (let (old-physical new-physical anchors
         (physical-count 0))
     (cl-labels
@@ -4272,12 +4706,14 @@ and live-worktree target number."
                        (or (nth 8 source) (nth 1 source))
                        offset
                        (or (nth 9 source) role)
-                       (or (nth 10 source) (nth 2 source)))
+                       (or (nth 10 source) (nth 2 source))
+                       (nth 11 source))
                (list "" nil (nth 2 source) 'filler
                      (nth 4 source) (nth 5 source) nil nil
                      (or (nth 8 source) (nth 1 source)) offset
                      (or (nth 9 source) role)
-                     (or (nth 10 source) (nth 2 source)))))))
+                     (or (nth 10 source) (nth 2 source))
+                     (nth 11 source))))))
       (cl-mapc
        (lambda (old new)
          (let ((separator (eq (nth 3 old) 'sep)))
@@ -4507,7 +4943,8 @@ Return the signed row-count adjustment."
     (pcase (aref chunk 0)
       ('header
        (let* ((file (plist-get section :file))
-              (row (list payload nil nil 'header file nil nil nil))
+              (row (list payload nil nil 'header file nil nil nil
+                         nil nil nil nil section))
               (rows (vector row)))
          (list rows (vector (copy-sequence row)))))
       ('meta
@@ -4522,7 +4959,8 @@ Return the signed row-count adjustment."
                       (line-beginning-position)
                       (line-end-position)))
                     (row
-                     (list text nil nil 'meta file nil nil nil)))
+                     (list text nil nil 'meta file nil nil nil
+                           nil nil nil nil section)))
                (push row old)
                (push (copy-sequence row) new))
              (forward-line 1)))
@@ -4966,24 +5404,11 @@ Each run is (START END FACE), with offsets relative to ROW's text."
                  (save-excursion
                    (goto-char source-end)
                    (min (point-max) (1+ (line-end-position)))))
-                (let ((position source-start))
-                  (while (< position source-end)
-                    (let ((next
-                           (min
-                            source-end
-                            (or
-                             (next-single-property-change
-                              position 'face nil source-end)
-                             source-end)))
-                          (face
-                           (get-text-property position 'face)))
-                      (when face
-                        (push
-                         (list (- position source-start)
-                               (- next source-start)
-                               face)
-                         runs))
-                      (setq position next))))
+                ;; Diff mode stores its added/removed/context presentation
+                ;; in text `face' properties and deliberately materializes
+                ;; source-language font-lock as overlays.  Copy only those
+                ;; overlays: the split row supplies its own background, and
+                ;; copying the patch face would override syntax foregrounds.
                 (dolist (overlay
                          (overlays-in source-start source-end))
                   (when-let*
@@ -5098,20 +5523,22 @@ Each run is (START END FACE), with offsets relative to ROW's text."
                    (plist-get cache :new)))
       (when (buffer-live-p buffer)
         (with-current-buffer buffer
-          (dotimes (index (length diffs--split-rows))
-            (let ((row (aref diffs--split-rows index)))
-              (when
-                  (and
-                   (aref diffs--split-decorated index)
-                   (null (nth 6 row))
-                   (eq side
-                       (diffs--split-row-source-side row))
-                   (eq section
-                       (diffs--token-section-for-row owner row)))
-                (diffs--split-apply-source-faces
-                 (diffs--split-row-position index)
-                 (diffs--split-row-position (1+ index))
-                 row))))
+          (let ((inhibit-read-only t))
+            (with-silent-modifications
+              (dotimes (index (length diffs--split-rows))
+                (let ((row (aref diffs--split-rows index)))
+                  (when
+                      (and
+                       (aref diffs--split-decorated index)
+                       (null (nth 6 row))
+                       (eq side
+                           (diffs--split-row-source-side row))
+                       (eq section
+                           (diffs--token-section-for-row owner row)))
+                    (diffs--split-apply-source-faces
+                     (diffs--split-row-position index)
+                     (diffs--split-row-position (1+ index))
+                     row))))))
           (force-window-update buffer))))))
 
 (defun diffs--split-intraline-runs (row role)
@@ -5531,14 +5958,16 @@ and treat the peer as the horizontal source of truth."
 
 (defun diffs--split-scroll-hook (window start)
   "Synchronize WINDOW at START while a split view is shown."
-  (unless diffs--split-syncing
-    (let ((diffs--split-syncing t))
-      (with-demoted-errors "diffs split sync: %S"
-        (let ((position
-               (or (diffs--split-materialize-window window start)
-                   start)))
+  (let ((position start))
+    (unless diffs--split-syncing
+      (let ((diffs--split-syncing t))
+        (with-demoted-errors "diffs split sync: %S"
+          (setq position
+                (or (diffs--split-materialize-window window start)
+                    start))
           (diffs--split-sync-from window position)
-          (diffs--split-sync-index position))))))
+          (diffs--split-sync-index position))))
+    (diffs--update-split-sticky-headers window position)))
 
 (defun diffs--split-post-command ()
   "Sync the paired window after commands in a split buffer."
@@ -5553,7 +5982,9 @@ and treat the peer as the horizontal source of truth."
             (diffs--split-sync-point-from w)
             (diffs--split-keep-point-horizontally-visible w)
             (diffs--split-sync-from (or horizontal-source w))
-            (diffs--split-sync-index (point))))))))
+            (diffs--split-sync-index (point)))))
+      (when (eq (window-buffer w) (current-buffer))
+        (diffs--update-split-sticky-headers w)))))
 
 (defvar-keymap diffs-split-mode-map
   "n" #'diffs-split-next-hunk
@@ -5579,12 +6010,17 @@ and treat the peer as the horizontal source of truth."
 (define-derived-mode diffs-split-mode special-mode "diffs-split"
   "Major mode for one side of the diffs side-by-side view."
   (diffs--define-fringe-bitmap)
-  (setq truncate-lines t)
+  (setq truncate-lines t
+        header-line-format nil)
   (setq-local cursor-in-non-selected-windows nil)
+  (setq-local imenu-create-index-function #'diffs--imenu-create-index)
   (add-hook 'text-scale-mode-hook #'diffs--define-fringe-bitmap nil t)
+  (add-hook 'kill-buffer-hook #'diffs--clear-sticky-headers nil t)
   (add-hook 'pre-command-hook #'diffs--split-pre-command nil t)
   (add-hook 'post-command-hook #'diffs--split-post-command nil t)
   (add-hook 'window-scroll-functions #'diffs--split-scroll-hook nil t)
+  (add-hook 'window-buffer-change-functions
+            #'diffs--sticky-header-window-buffer-change nil t)
   (add-hook 'eldoc-documentation-functions
             #'diffs-eldoc-function nil t)
   (add-hook 'xref-backend-functions #'diffs-xref-backend nil t))
@@ -5615,6 +6051,144 @@ and treat the peer as the horizontal source of truth."
   "Move to the previous hunk in the side-by-side view."
   (interactive)
   (diffs--split-move-to-anchor nil))
+
+(defun diffs--imenu-create-index ()
+  "Return a file-and-hunk Imenu index for the current review."
+  (let* ((owner
+          (if (derived-mode-p 'diffs-split-mode)
+              diffs--split-unified
+            (current-buffer)))
+         (counts (make-hash-table :test #'equal))
+         index)
+    (when (buffer-live-p owner)
+      (with-current-buffer owner
+        (dolist (section diffs--sections)
+          (cl-incf
+           (gethash (or (plist-get section :file) "Patch") counts 0)))
+        (cl-loop
+         for section in diffs--sections
+         for section-index from 0
+         for file = (or (plist-get section :file) "Patch")
+         for item-id = (plist-get section :item-id)
+         for duplicate = (> (gethash file counts) 1)
+         for suffix =
+         (and duplicate
+              (if (and item-id
+                       (not (string-prefix-p "diff:" item-id)))
+                  item-id
+                (format "#%d" (1+ section-index))))
+         for group = (if suffix
+                         (format "%s [%s]" file suffix)
+                       file)
+         do
+         (let ((entries
+                (list
+                 (list "File" 0 #'diffs--imenu-goto
+                       item-id file section-index nil nil))))
+           (cl-loop
+            for hunk in (plist-get section :hunks)
+            for hunk-index from 0
+            for context = (nth 4 hunk)
+            for label =
+            (format
+             "Hunk %d · -%d +%d%s"
+             (1+ hunk-index)
+             (nth 1 hunk)
+             (nth 2 hunk)
+             (if (string-empty-p context)
+                 ""
+               (format
+                " · %s"
+                (truncate-string-to-width context 56 nil nil t))))
+            do
+            (push
+             (list label 0 #'diffs--imenu-goto
+                   item-id file section-index
+                   (nth 1 hunk) (nth 2 hunk))
+             entries))
+           (push (cons group (nreverse entries)) index)))))
+    (nreverse index)))
+
+(defun diffs--imenu-split-row-index (section hunk)
+  "Return the split row for SECTION and optional HUNK."
+  (if diffs--split-paged-p
+      (cl-loop
+       for chunk across diffs--split-chunks
+       when (and
+             (eq section (aref chunk 1))
+             (or (null hunk)
+                 (and (eq (aref chunk 0) 'hunk)
+                      (eq hunk (aref chunk 2)))))
+       return (aref chunk 3))
+    (cl-loop
+     for row across diffs--split-rows
+     for row-index from 0
+     when (and
+           (eq section (diffs--split-row-section row))
+           (or (null hunk) (eq hunk (nth 5 row))))
+     return row-index)))
+
+(defun diffs--imenu-goto
+    (_name _position item-id file section-index old-start new-start)
+  "Jump to an Imenu review target.
+ITEM-ID, FILE, and SECTION-INDEX identify the file.  OLD-START and
+NEW-START identify an optional hunk."
+  (let* ((split (derived-mode-p 'diffs-split-mode))
+         (owner (if split diffs--split-unified (current-buffer))))
+    (unless (buffer-live-p owner)
+      (user-error "The review buffer no longer exists"))
+    (let* ((section
+            (with-current-buffer owner
+              (or
+               (diffs--section-for-identity
+                item-id file section-index)
+               (user-error
+                "The selected file is no longer in this review"))))
+           (hunks (plist-get section :hunks))
+           (hunk
+            (and
+             old-start
+             new-start
+             (or
+              (cl-find-if
+               (lambda (candidate)
+                 (and (= old-start (nth 1 candidate))
+                      (= new-start (nth 2 candidate))))
+               hunks)
+              (user-error
+               "The selected hunk is no longer in this review")))))
+      (if (not split)
+          (goto-char
+           (if hunk (car hunk) (plist-get section :beg)))
+        (let ((row-index
+               (diffs--imenu-split-row-index section hunk)))
+          (unless row-index
+            (user-error "The selected target is not in the split view"))
+          (when diffs--split-paged-p
+            (diffs--split-materialize-range row-index (1+ row-index))
+            (setq row-index
+                  (diffs--imenu-split-row-index section hunk)))
+          (goto-char (diffs--split-row-position row-index))
+          (dolist
+              (peer
+               (get-buffer-window-list diffs--split-other nil t))
+            (set-window-point
+             peer
+             (with-current-buffer diffs--split-other
+               (diffs--split-row-position row-index))))
+          (diffs--split-sync-index (point))
+          (when-let*
+              ((window
+                (if (eq (window-buffer (selected-window))
+                        (current-buffer))
+                    (selected-window)
+                  (get-buffer-window (current-buffer) t))))
+            (set-window-point window (point))
+            (with-selected-window window
+              (recenter)
+              (diffs--split-materialize-window window)
+              (diffs--split-sync-from window)
+              (diffs--update-split-sticky-headers window))))))))
 
 (defun diffs--split-find-row
     (hunk source kind number physical-offset)
@@ -5832,6 +6406,9 @@ error never strands the user in the unified view."
                  (buffer-live-p index)
                  (get-buffer-window index))
             (delete-window (get-buffer-window index)))))))
+    (when (buffer-live-p unified)
+      (dolist (window (get-buffer-window-list unified nil t))
+        (diffs--update-sticky-header window)))
     ;; Keep the rendered pair alive.  The owning unified buffer kills it
     ;; when the diff changes, is refreshed, or is itself killed.
     (dolist (buffer (list old other))
@@ -5856,6 +6433,7 @@ error never strands the user in the unified view."
          (modified-tick (buffer-chars-modified-tick))
          (wrap-lines diffs-split-wrap-lines)
          (show-line-numbers diffs-line-numbers)
+         (show-file-icons diffs-file-icons)
          (show-fringe-bars diffs-fringe-bars)
          (fringe-bar-width diffs-fringe-bar-width)
          (full-width-backgrounds diffs-split-full-width-backgrounds)
@@ -5920,6 +6498,7 @@ error never strands the user in the unified view."
                           wrap-lines
                           paged
                           show-line-numbers
+                          show-file-icons
                           show-fringe-bars
                           fringe-bar-width
                           full-width-backgrounds
@@ -5944,6 +6523,7 @@ error never strands the user in the unified view."
                   (diffs-split-mode))))
             (let ((diffs-split-wrap-lines wrap-lines)
                   (diffs-line-numbers show-line-numbers)
+                  (diffs-file-icons show-file-icons)
                   (diffs-fringe-bars show-fringe-bars)
                   (diffs-fringe-bar-width fringe-bar-width)
                   (diffs-split-full-width-backgrounds
@@ -5981,6 +6561,7 @@ error never strands the user in the unified view."
               (setq-local diffs-split-full-width-backgrounds
                           full-width-backgrounds)
               (setq-local diffs-line-numbers show-line-numbers)
+              (setq-local diffs-file-icons show-file-icons)
               (setq-local diffs-fringe-bars show-fringe-bars)
               (setq-local diffs-fringe-bar-width fringe-bar-width)
               (setq-local diffs-split-virtualization virtualization)
@@ -5992,11 +6573,11 @@ error never strands the user in the unified view."
               (setq-local diffs--split-anchors anchors)
               (setq-local diffs--split-other (nth 2 spec))
               (setq-local diffs--split-window-configuration configuration)
-              (setq header-line-format
-                    '((:eval (diffs--split-header-line)))))))
+              (setq header-line-format nil))))
         (select-window w2)
         (diffs--split-materialize-window w2)
         (diffs--split-sync-from w2)
+        (diffs--update-split-sticky-headers w2)
         ;; The unified owner was already current when split was entered.
         ;; Project only the two newly rendered views; decision rebuilds may
         ;; intentionally leave the now-hidden owner stale until stacked is
@@ -6061,13 +6642,19 @@ error never strands the user in the unified view."
 
 (defun diffs--token-section-for-row (owner row)
   "Return the section in OWNER that contains split ROW."
-  (let ((hunk (nth 5 row))
+  (let ((section (diffs--split-row-section row))
+        (hunk (nth 5 row))
+        (origin (nth 6 row))
         (file (nth 4 row)))
     (with-current-buffer owner
       (or
+       section
        (and hunk
             (when-let* ((gap (diffs--gap-for-hunk hunk)))
               (plist-get gap :section)))
+       (and origin
+            (diffs--section-at-pos
+             (if (consp origin) (car origin) origin)))
        (cl-find-if
         (lambda (section)
           (equal file (plist-get section :file)))
@@ -10451,10 +11038,10 @@ project-cache entry before falling back to diff-hl's global default."
    ((boundp 'diff-hl-reference-revision)
     (default-value 'diff-hl-reference-revision))))
 
-(defun diffs--header-line ()
-  "Return the sticky file, hunk, and summary header."
+(defun diffs--header-line (&optional window)
+  "Return the sticky file, hunk, and summary header for WINDOW."
   (cl-destructuring-bind (&optional (files 0) (adds 0) (dels 0)) diffs--stats
-    (let* ((window (get-buffer-window (current-buffer)))
+    (let* ((window (or window (get-buffer-window (current-buffer))))
            (position (if (window-live-p window)
                          (window-start window)
                        (point)))
@@ -10463,28 +11050,17 @@ project-cache entry before falling back to diff-hl's global default."
                 (max 20 (- (window-width window) 48))
               diffs--file-header-path-width))
            (section (diffs--section-at-pos position))
-           (hunk (and section (diffs--hunk-at-pos section position))))
+           (hunk (and section (diffs--hunk-at-pos section position)))
+           (header
+            (diffs--sticky-file-header
+             section 'stacked path-width)))
       (concat
-       " "
        (when section
          (concat
-          (propertize
-           (diffs--short-display-path
-            (or (plist-get section :file) "?") path-width)
-           'face 'diffs-file-header)
-          (format "  [%d/%d]  "
+          (or header "")
+          (format "  [%d/%d]"
                   (plist-get section :index) files)
-          (propertize (format "+%d" (plist-get section :adds))
-                      'face 'diffs-file-stats-added)
-          " "
-          (propertize (format "−%d" (plist-get section :dels))
-                      'face 'diffs-file-stats-removed)
-          (when hunk
-            (let ((context (nth 4 hunk)))
-              (concat
-               (format "  ·  −%d +%d" (nth 1 hunk) (nth 2 hunk))
-               (when (and context (not (string-empty-p context)))
-                 (concat "  " context)))))
+          (or (diffs--sticky-hunk-label hunk) "")
           "  │  "))
        (if (= files 1) "1 file" (format "%d files" files))
        " · "
@@ -10519,7 +11095,7 @@ INDEPENDENT-SOURCES means the old and new paths are separate files."
     (unless diffs--sections
       (kill-buffer buf)
       (user-error "No changes"))
-    (setq header-line-format '((:eval (diffs--header-line)))))
+    (setq header-line-format nil))
   (when entry-restorer
     (funcall entry-restorer))
   (unless diffs--refreshing
@@ -10550,7 +11126,9 @@ INDEPENDENT-SOURCES means the old and new paths are separate files."
         (unless (eq (current-buffer) buf)
           (set-buffer buf))
         (diffs-toggle-split)
-        (diffs--split-restore-entry-anchor buf entry-anchor))))
+        (diffs--split-restore-entry-anchor buf entry-anchor))
+      (when-let* ((window (get-buffer-window buf t)))
+        (diffs--update-sticky-header window))))
   buf)
 
 (defun diffs--mixed-item-id (item index payload)
@@ -10901,281 +11479,6 @@ Blames the saved file, so save first for accurate results."
     (when (or (null sha) (string-match-p "\\`0+\\'" sha))
       (user-error "Line is not committed yet"))
     (diffs-commit sha (and file-only file))))
-
-(defvar diffs--diff-hl-show-hunk-function-before-mode nil
-  "Value of `diff-hl-show-hunk-function' before integration is enabled.")
-
-(defvar diffs--diff-hl-show-hunk-function-saved-p nil
-  "Non-nil when the prior diff-hl renderer has been saved.")
-
-(defconst diffs--diff-hl-split-buffer-name " *diffs diff-hl split*"
-  "Hidden carrier buffer for a side-by-side diff-hl hunk.")
-
-(defun diffs--diff-hl-line-display (begin end)
-  "Return the diffs-rendered replacement for line BEGIN through END.
-The current buffer must be an eagerly decorated complete diff."
-  (let* ((prefix
-          (copy-sequence
-           (or (get-text-property begin 'line-prefix) "")))
-         (prefix-width (length prefix))
-         (line (buffer-substring begin end))
-         (rendered (concat prefix line)))
-    ;; The prefix is now literal content of the replacement string.
-    ;; Retaining these properties on LINE would ask redisplay to add it
-    ;; a second time.
-    (remove-list-of-text-properties
-     prefix-width (length rendered) '(line-prefix wrap-prefix) rendered)
-    ;; Source modes can express syntax through overlays.  Materialize
-    ;; those faces before the word refinement, which must remain the
-    ;; highest visual layer.
-    (dolist (overlay (overlays-in begin end))
-      (when-let* (((not (overlay-get overlay 'diffs-intraline)))
-                  ((not (overlay-get overlay 'diffs-review)))
-                  (face (overlay-get overlay 'face)))
-        (add-face-text-property
-         (+ prefix-width (- (max begin (overlay-start overlay)) begin))
-         (+ prefix-width (- (min end (overlay-end overlay)) begin))
-         face nil rendered)))
-    (dolist (overlay (overlays-in begin end))
-      (when-let* (((overlay-get overlay 'diffs-intraline))
-                  (face (overlay-get overlay 'face)))
-        (add-face-text-property
-         (+ prefix-width (- (max begin (overlay-start overlay)) begin))
-         (+ prefix-width (- (min end (overlay-end overlay)) begin))
-         face nil rendered)))
-    rendered))
-
-(defun diffs--diff-hl-split-side
-    (row role width content-width unified scratch &optional pad)
-  "Render one split ROW for ROLE into a string.
-WIDTH is the line-number width, CONTENT-WIDTH is the minimum code
-column width, UNIFIED owns source faces, and SCRATCH is reusable.
-When PAD is non-nil, pad the code to CONTENT-WIDTH."
-  (with-current-buffer scratch
-    (let* ((inhibit-read-only t)
-           (diffs-fringe-bars nil)
-           (text (car row))
-           (padding
-            (if pad
-                (make-string
-                 (max 0 (- content-width (string-width text))) ?\s)
-              "")))
-      (erase-buffer)
-      (insert text padding)
-      (setq-local diffs--split-unified unified)
-      (setq-local diffs--split-role role)
-      (diffs--split-decorate-row
-       (point-min) (point-max) row width role)
-      (let* ((prefix
-              (copy-sequence
-               (or (get-text-property (point-min) 'line-prefix) "")))
-             (line (buffer-substring (point-min) (point-max))))
-        (remove-list-of-text-properties
-         0 (length line) '(line-prefix wrap-prefix) line)
-        (concat prefix line)))))
-
-(defun diffs--diff-hl-split-buffer
-    (section hunk available-width)
-  "Return a carrier buffer rendering HUNK in SECTION side by side.
-AVAILABLE-WIDTH is the source window width in columns.  The current
-buffer is the decorated unified owner."
-  (let* ((unified (current-buffer))
-         (number-width (plist-get section :width))
-         (separator (propertize " │ " 'face 'shadow))
-         ;; Diff-hl's posframe backend asks posframe to enable wrapping.
-         ;; Leave room before the parent window edge: a replacement
-         ;; string that exactly fills it otherwise produces an empty
-         ;; continuation row after every logical diff row.
-         (total-width (max 20 (- available-width 2)))
-         (column-width
-          (max 12 (/ (- total-width (string-width separator)) 2)))
-         (gutter-width (if diffs-line-numbers (1+ number-width) 0))
-         (content-width (max 4 (- column-width gutter-width)))
-         (logical (diffs--split-collect-hunk section hunk))
-         (physical
-          (diffs--split-physical-rows
-           (nth 0 logical) (nth 1 logical)
-           content-width diffs-split-wrap-lines))
-         (old-rows (nth 0 physical))
-         (new-rows (nth 1 physical))
-         (old-scratch (generate-new-buffer " *diffs old hunk row*"))
-         (new-scratch (generate-new-buffer " *diffs new hunk row*"))
-         lines)
-    (unwind-protect
-        (dotimes (index (length old-rows))
-          (push
-           (concat
-            (diffs--diff-hl-split-side
-             (aref old-rows index) 'old number-width content-width
-             unified old-scratch t)
-            separator
-            (diffs--diff-hl-split-side
-             (aref new-rows index) 'new number-width content-width
-             unified new-scratch))
-           lines))
-      (kill-buffer old-scratch)
-      (kill-buffer new-scratch))
-    (let ((carrier
-           (get-buffer-create diffs--diff-hl-split-buffer-name)))
-      (with-current-buffer carrier
-        (let ((inhibit-read-only t))
-          (fundamental-mode)
-          (erase-buffer)
-          (remove-overlays)
-          (setq default-directory
-                (buffer-local-value 'default-directory unified))
-          (dolist (line (nreverse lines))
-            (let ((begin (point)))
-              ;; Keeping the rendered row inside a display replacement
-              ;; protects its layered faces from diff-hl backends that
-              ;; apply a carrier-wide `face' property.
-              (insert " ")
-              (put-text-property begin (point) 'display line)
-              (insert "\n")))
-          (setq-local truncate-lines (not diffs-split-wrap-lines))
-          (setq buffer-read-only t)
-          (goto-char (point-min))))
-      carrier)))
-
-(defun diffs--diff-hl-render-current-hunk (buffer)
-  "Render BUFFER's narrowed hunk without changing its patch text.
-Diff-hl supplies BUFFER narrowed to the current hunk while retaining the
-complete patch outside the restriction.  The complete patch is used for
-diffs.el's scan and matching.  `diffs-default-view' selects a stacked
-replacement in BUFFER or a separate side-by-side carrier."
-  (unless (buffer-live-p buffer)
-    (user-error "Diff-hl supplied a dead diff buffer"))
-  (let* ((directory default-directory)
-         (layout diffs-default-view)
-         (available-width (window-body-width))
-         (hunk-begin (with-current-buffer buffer (point-min)))
-         (hunk-end (with-current-buffer buffer (point-max)))
-         (patch
-          (with-current-buffer buffer
-            (save-restriction
-              (widen)
-              (buffer-substring-no-properties
-               (point-min) (point-max)))))
-         replacements
-         rendered-buffer)
-    (with-temp-buffer
-      (setq default-directory directory)
-      (insert patch)
-      (delay-mode-hooks
-        (diff-mode))
-      (setq-local diff-refine nil)
-      (setq-local diff-font-lock-syntax 'hunk-also)
-      (font-lock-mode 1)
-      (diffs--undecorate)
-      (diffs--scan)
-      (let* ((section (diffs--section-at-pos hunk-begin))
-             (hunk (and section
-                        (diffs--hunk-at-pos section hunk-begin))))
-        (unless hunk
-          (error "Diff-hl's narrowed region is not inside a diff hunk"))
-        (font-lock-ensure (car hunk) (diffs--hunk-end hunk section))
-        (with-silent-modifications
-          (diffs--decorate-hunk
-           hunk (diffs--hunk-end hunk section) section
-           hunk-begin hunk-end))
-        (if (eq layout 'split)
-            (setq rendered-buffer
-                  (diffs--diff-hl-split-buffer
-                   section hunk available-width))
-          (save-excursion
-            (goto-char hunk-begin)
-            (while (< (point) hunk-end)
-              (let ((begin (point))
-                    (end (min hunk-end (line-end-position))))
-                (push (list begin end
-                            (diffs--diff-hl-line-display begin end))
-                      replacements))
-              (forward-line 1))))))
-    (if rendered-buffer
-        rendered-buffer
-      (with-current-buffer buffer
-        (let ((inhibit-read-only t))
-          (with-silent-modifications
-            (save-restriction
-              (widen)
-              (dolist (replacement replacements)
-                (pcase-let ((`(,begin ,end ,display) replacement))
-                  (when (< begin end)
-                    ;; Some diff-hl releases add their own line-number
-                    ;; prefix before invoking a backend.  Diffs.el's
-                    ;; replacement already contains its old/new columns.
-                    (remove-list-of-text-properties
-                     begin end '(line-prefix wrap-prefix))
-                    (add-text-properties
-                     begin end
-                     (list 'diffs-diff-hl t 'display display)))))))))
-      buffer)))
-
-(defun diffs--diff-hl-display-backend ()
-  "Return the public diff-hl backend for the rendered current hunk."
-  (let ((backend
-         (or diffs-diff-hl-display-function
-             (and diffs--diff-hl-show-hunk-function-saved-p
-                  (not (eq diffs--diff-hl-show-hunk-function-before-mode
-                           #'diffs-diff-hl-show-hunk))
-                  diffs--diff-hl-show-hunk-function-before-mode)
-             #'diff-hl-show-hunk-inline)))
-    (when (eq backend #'diffs-diff-hl-show-hunk)
-      (user-error "Diffs.el cannot use its adapter as a display backend"))
-    (pcase backend
-      ('diff-hl-show-hunk-inline
-       (unless (require 'diff-hl-show-hunk-inline nil t)
-         (user-error "Diff-hl's inline hunk backend is not available")))
-      ('diff-hl-show-hunk-posframe
-       (unless (require 'diff-hl-show-hunk-posframe nil t)
-         (user-error "Diff-hl's posframe hunk backend is not available"))))
-    (unless (functionp backend)
-      (user-error "Diff-hl hunk display backend is not callable: %S" backend))
-    backend))
-
-;;;###autoload
-(defun diffs-diff-hl-show-hunk (buffer &optional line)
-  "Render diff-hl's current hunk BUFFER with diffs.el.
-LINE is the hunk-relative source line supplied to the selected public
-diff-hl display backend.  `diffs-default-view' selects the hunk's split
-or stacked content layout.  Diffs.el changes only display properties;
-diff-hl retains placement, navigation, actions, and cleanup."
-  (let ((backend (diffs--diff-hl-display-backend))
-        (rendered (diffs--diff-hl-render-current-hunk buffer)))
-    (if (eq backend #'diff-hl-show-hunk-inline)
-        ;; Upstream's smart-lines default sizes the popup to deleted
-        ;; lines and replaces a pure-addition hunk with a message.
-        ;; A diffs-rendered preview shows the complete current hunk.
-        (let ((diff-hl-show-hunk-inline-smart-lines nil))
-          (funcall backend rendered line))
-      (funcall backend rendered line))))
-
-;;;###autoload
-(define-minor-mode diffs-diff-hl-mode
-  "Use diffs.el as diff-hl's show-hunk renderer.
-This global opt-in saves and restores `diff-hl-show-hunk-function'.
-It does not change diff-hl keymaps or enable diff-hl mouse handling."
-  :global t
-  :group 'diffs
-  (if diffs-diff-hl-mode
-      (condition-case error-data
-          (progn
-            (unless (require 'diff-hl-show-hunk nil t)
-              (user-error "Diff-hl-show-hunk is not available"))
-            (unless diffs--diff-hl-show-hunk-function-saved-p
-              (setq diffs--diff-hl-show-hunk-function-before-mode
-                    diff-hl-show-hunk-function
-                    diffs--diff-hl-show-hunk-function-saved-p t))
-            (setq diff-hl-show-hunk-function
-                  #'diffs-diff-hl-show-hunk))
-        (error
-         (setq diffs-diff-hl-mode nil)
-         (signal (car error-data) (cdr error-data))))
-    (when diffs--diff-hl-show-hunk-function-saved-p
-      (setq diff-hl-show-hunk-function
-            diffs--diff-hl-show-hunk-function-before-mode
-            diffs--diff-hl-show-hunk-function-before-mode nil
-            diffs--diff-hl-show-hunk-function-saved-p nil))))
 
 (provide 'diffs)
 ;;; diffs.el ends here

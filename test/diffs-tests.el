@@ -3,6 +3,14 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'diffs)
+
+(defconst diffs-tests--diff-hl-adapter-was-lazy
+  (and (autoloadp (symbol-function 'diffs-diff-hl-show-hunk))
+       (autoloadp (symbol-function 'diffs-diff-hl-mode))
+       (not (featurep 'diffs-diff-hl)))
+  "Non-nil when the core installed lazy diff-hl adapter entry points.")
+
+(require 'diffs-diff-hl)
 (require 'vc-git)
 (require 'xref)
 
@@ -61,6 +69,18 @@
    "@@ -5 +5 @@ context-function\n"
    "-old five\n"
    "+new five\n"))
+
+(defconst diffs-tests--directional-context
+  (concat
+   "diff --git a/context.el b/context.el\n"
+   "--- a/context.el\n"
+   "+++ b/context.el\n"
+   "@@ -3 +3 @@ first\n"
+   "-old three\n"
+   "+new three\n"
+   "@@ -8 +8 @@ second\n"
+   "-old eight\n"
+   "+new eight\n"))
 
 (defconst diffs-tests--two-change-blocks
   (concat
@@ -1026,13 +1046,55 @@
                   (overlay-get overlay 'diffs-intraline))
                 (overlays-in (point-min) (point-max)))))))
 
+(ert-deftest diffs-minor-mode-restores-external-buffer-state ()
+  (diffs-tests--with-diff diffs-tests--normal
+    (outline-minor-mode 1)
+    (setq-local header-line-format '("External header"))
+    (setq-local diff-refine 'navigation)
+    (setq-local diff-font-lock-syntax t)
+    (setq-local font-lock-extra-managed-props
+                '(face display diffs-tests-property))
+    (setq-local imenu-create-index-function #'ignore)
+    (setq-local outline-minor-mode-cycle 'external-cycle)
+    (setq-local outline-minor-mode-highlight 'external-highlight)
+    (let ((prettify-local
+           (local-variable-p 'diff-font-lock-prettify)))
+      (diffs-minor-mode 1)
+      (should (bound-and-true-p outline-minor-mode))
+      (should-not header-line-format)
+      (should-not diff-refine)
+      (should (eq diff-font-lock-syntax 'hunk-also))
+      (should
+       (eq imenu-create-index-function #'diffs--imenu-create-index))
+      (should-not
+       (memq 'display font-lock-extra-managed-props))
+      (diffs-minor-mode 1)
+      (diffs-minor-mode -1)
+      (should (bound-and-true-p outline-minor-mode))
+      (should (equal header-line-format '("External header")))
+      (should (eq diff-refine 'navigation))
+      (should (eq diff-font-lock-syntax t))
+      (should
+       (equal font-lock-extra-managed-props
+              '(face display diffs-tests-property)))
+      (should (eq imenu-create-index-function #'ignore))
+      (should (eq outline-minor-mode-cycle 'external-cycle))
+      (should
+       (eq outline-minor-mode-highlight 'external-highlight))
+      (should
+       (eq (local-variable-p 'diff-font-lock-prettify)
+           prettify-local)))
+    (outline-minor-mode -1)))
+
 (ert-deftest diffs-expanded-context-keeps-source-syntax-faces ()
-  (let* ((lines
-          (diffs--fontified-lines
+  (let* ((result
+          (diffs--fontified-lines-result
            "(defun highlighted-function ()\n  (message \"hello\"))\n"
            "sample.el"))
+         (lines (car result))
          (source (aref lines 0))
          (context (diffs--context-text source)))
+    (should (cdr result))
     (should (eq (get-text-property 1 'face source)
                 'font-lock-keyword-face))
     (let ((faces (get-text-property 1 'face context)))
@@ -1069,10 +1131,11 @@
                               (buffer-modified-p)
                               kill-buffer-query-functions))))
               (funcall original-kill-buffer buffer-or-name)))))
-      (should
-       (equal (diffs--fontified-lines "const answer = 42;\n"
-                                     "sample.internal")
-              ["const answer = 42;"])))
+      (let ((result
+             (diffs--fontified-lines-result
+              "const answer = 42;\n" "sample.internal")))
+        (should (cdr result))
+        (should (equal (car result) ["const answer = 42;"]))))
     (should (equal (file-name-nondirectory seen-file) "sample.internal"))
     (should (equal cleanup-state '(nil nil nil nil)))))
 
@@ -1104,9 +1167,11 @@
                               (buffer-modified-p)
                               kill-buffer-query-functions))))
               (funcall original-kill-buffer buffer-or-name)))))
-      (should
-       (equal (diffs--fontified-lines "plain source\n" "sample.fail")
-              ["plain source"])))
+      (let ((result
+             (diffs--fontified-lines-result
+              "plain source\n" "sample.fail")))
+        (should-not (cdr result))
+        (should (equal (car result) ["plain source"]))))
     (should (equal cleanup-state '(nil nil nil nil)))))
 
 (ert-deftest diffs-source-syntax-renders-from-the-idle-queue ()
@@ -1145,6 +1210,164 @@
               (should (eq (diffs--section-lines section 'old)
                           rendered)))))))))
 
+(ert-deftest diffs-context-expansion-repaints-after-source-render ()
+  (let ((diffs--render-cache (make-hash-table :test #'equal))
+        (diffs--render-cache-order nil)
+        (diffs--render-jobs (make-hash-table :test #'equal))
+        (diffs--render-queue nil)
+        (diffs--render-idle-timer nil)
+        scheduled)
+    (diffs-tests--with-diff diffs-tests--hidden-context
+      (diffs-minor-mode 1)
+      (setq diffs--revision "HEAD")
+      (let* ((section (car diffs--sections))
+             (gap (car diffs--context-gaps))
+             (raw ["(message \"one\")"
+                   "(message \"two\")"
+                   "(defun context-three () nil)"
+                   "(setq context-four t)"
+                   "new five"]))
+        (cl-letf
+            (((symbol-function 'diffs--revision-lines)
+              (lambda (_file _revision) raw))
+             ((symbol-function 'diffs--worktree-lines)
+              (lambda (_file) raw))
+             ((symbol-function 'run-with-idle-timer)
+              (lambda (_seconds _repeat function &rest arguments)
+                (setq scheduled (cons function arguments))
+                'diffs-tests-idle-timer)))
+          (diffs--set-context-visible gap 2)
+          (let* ((before
+                  (overlay-get
+                   (plist-get gap :overlay) 'before-string))
+                 (keyword (string-match "defun" before)))
+            (should keyword)
+            (should-not
+             (diffs-tests--face-includes-p
+              (get-text-property keyword 'face before)
+              'font-lock-keyword-face)))
+          (should scheduled)
+          (apply (car scheduled) (cdr scheduled))
+          (let* ((after
+                  (overlay-get
+                   (plist-get gap :overlay) 'before-string))
+                 (keyword (string-match "defun" after)))
+            (should keyword)
+            (should
+             (diffs-tests--face-includes-p
+              (get-text-property keyword 'face after)
+              'font-lock-keyword-face))))
+        (diffs-minor-mode -1)))))
+
+(ert-deftest diffs-source-render-publishes-into-read-only-split ()
+  (let ((diffs--render-cache (make-hash-table :test #'equal))
+        (diffs--render-cache-order nil)
+        (diffs--render-jobs (make-hash-table :test #'equal))
+        (diffs--render-queue nil)
+        (diffs--render-idle-timer nil)
+        (owner (generate-new-buffer " *diffs async split test*"))
+        scheduled)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer owner)
+          (insert diffs-tests--hidden-context)
+          (diff-mode)
+          (cl-letf
+              (((symbol-function 'diffs--revision-lines)
+                (lambda (_file _revision)
+                  ["(message \"one\")"
+                   "(message \"two\")"
+                   "(defun context-three () nil)"
+                   "(setq context-four t)"
+                   "old five"]))
+               ((symbol-function 'diffs--worktree-lines)
+                (lambda (_file)
+                  ["(message \"one\")"
+                   "(message \"two\")"
+                   "(defun context-three () nil)"
+                   "(setq context-four t)"
+                   "new five"]))
+               ((symbol-function 'run-with-idle-timer)
+                (lambda (_seconds _repeat function &rest arguments)
+                  (setq scheduled (cons function arguments))
+                  'diffs-tests-idle-timer)))
+            (diffs-minor-mode 1)
+            (setq diffs--revision "HEAD")
+            (diffs--set-context-visible
+             (car diffs--context-gaps) 2)
+            (setq buffer-read-only t)
+            (diffs-toggle-split)
+            (let ((new (current-buffer))
+                  (old diffs--split-other)
+                  modified-states)
+              (dolist (buffer (list old new))
+                (with-current-buffer buffer
+                  (should buffer-read-only)
+                  (push
+                   (cons buffer (buffer-modified-p))
+                   modified-states)))
+              (while scheduled
+                (let ((callback scheduled))
+                  (setq scheduled nil)
+                  (apply (car callback) (cdr callback))))
+              (dolist (buffer (list old new))
+                (with-current-buffer buffer
+                  (goto-char (point-min))
+                  (search-forward "defun")
+                  (should
+                   (diffs-tests--face-includes-p
+                    (get-text-property
+                     (match-beginning 0) 'face)
+                    'font-lock-keyword-face))
+                  (should buffer-read-only)
+                  (should
+                   (eq (buffer-modified-p)
+                       (cdr (assq buffer modified-states)))))))))
+      (when (buffer-live-p owner)
+        (with-current-buffer owner
+          (diffs--split-cache-clear)
+          (when diffs-minor-mode
+            (diffs-minor-mode -1))
+          (setq buffer-read-only nil))
+        (kill-buffer owner)))))
+
+(ert-deftest diffs-source-render-failure-does-not-poison-cache ()
+  (let* ((diffs--render-cache (make-hash-table :test #'equal))
+         (diffs--render-cache-order nil)
+         (diffs--render-jobs (make-hash-table :test #'equal))
+         (diffs--render-idle-timer nil)
+         (key '(:render failed)))
+    (puthash
+     key
+     (list :text "(defun retry-after-failure () nil)"
+           :file "sample.fail"
+           :waiters nil)
+     diffs--render-jobs)
+    (let ((diffs--render-queue (list key)))
+      (cl-letf (((symbol-function 'set-auto-mode)
+                 (lambda (&rest _)
+                   (error "Synthetic mode failure"))))
+        (diffs--render-run-next)))
+    (should-not (gethash key diffs--render-cache))
+    (should-not (member key diffs--render-cache-order))))
+
+(ert-deftest diffs-source-lines-retry-a-stale-raw-render ()
+  (diffs-tests--with-diff diffs-tests--normal
+    (diffs--scan)
+    (let* ((section (car diffs--sections))
+           (raw ["(defun stale-source () nil)"])
+           scheduled)
+      (puthash section raw diffs--old-raw-content-cache)
+      (puthash section raw diffs--old-content-cache)
+      (diffs--set-source-render-identity
+       section 'old '(:renderer 0))
+      (cl-letf (((symbol-function 'diffs--schedule-source-render)
+                 (lambda (candidate side lines)
+                   (setq scheduled (list candidate side lines))
+                   nil)))
+        (should (eq (diffs--section-lines section 'old) raw)))
+      (should (equal scheduled (list section 'old raw))))))
+
 (ert-deftest diffs-source-render-cache-keys-all-render-inputs ()
   (let ((diffs--render-theme-generation 7)
         (root "/tmp/repository/")
@@ -1152,6 +1375,9 @@
     (let ((base
            (diffs--source-render-key
             root "sample.el" 'old "rev-a" lines 'emacs-lisp-mode)))
+      (should
+       (= (plist-get base :renderer)
+          diffs--source-render-version))
       (should
        (equal
         base
@@ -1278,6 +1504,122 @@
           (when diffs-minor-mode
             (diffs-minor-mode -1)))
         (kill-buffer owner)))))
+
+(ert-deftest diffs-imenu-indexes-stacked-files-and-hunks ()
+  (diffs-tests--with-diff diffs-tests--two-files
+    (diffs-minor-mode 1)
+    (should
+     (eq imenu-create-index-function #'diffs--imenu-create-index))
+    (let* ((index (funcall imenu-create-index-function))
+           (bar (assoc "bar.el" index))
+           (entries (cdr bar))
+           (hunk-item (cadr entries))
+           (section (cadr diffs--sections))
+           (hunk (car (plist-get section :hunks))))
+      (should (equal (mapcar #'car index) '("foo.el" "bar.el")))
+      (should (equal (caar entries) "File"))
+      (should
+       (string-match-p
+        (regexp-quote "Hunk 1 · -10 +10 · bar-function")
+        (car hunk-item)))
+      (goto-char (point-min))
+      (imenu hunk-item)
+      (should (eq (diffs--section-at-pos (point)) section))
+      (should (= (point) (car hunk))))
+    (diffs-minor-mode -1)))
+
+(ert-deftest diffs-imenu-keeps-duplicate-mixed-items-exact-in-split ()
+  (dolist (virtualization '(complete paged))
+    (let ((diffs-default-view 'stacked)
+          (diffs-fullscreen nil)
+          (diffs-split-virtualization virtualization)
+          (buffer-name
+           (generate-new-buffer-name
+            " *diffs duplicate imenu test*"))
+          owner split-buffer)
+      (unwind-protect
+          (save-window-excursion
+            (setq owner
+                  (diffs-items
+                   (list
+                    (list :type 'diff :id "first"
+                          :patch diffs-tests--normal)
+                    (list :type 'diff :id "second"
+                          :patch diffs-tests--normal))
+                   (list :directory default-directory
+                         :buffer-name buffer-name)))
+            (setq split-buffer
+                  (with-current-buffer owner
+                    (diffs-toggle-split)
+                    (current-buffer)))
+            (set-buffer split-buffer)
+            (let* ((index (funcall imenu-create-index-function))
+                   (first (assoc "foo.el [first]" index))
+                   (second (assoc "foo.el [second]" index))
+                   (stale-file-item (car (cdr first)))
+                   (file-item (car (cdr second)))
+                   (hunk-item (cadr (cdr second))))
+              (should first)
+              (should second)
+              (should
+               (eq imenu-create-index-function
+                   #'diffs--imenu-create-index))
+              (imenu file-item)
+              (should (derived-mode-p 'diffs-split-mode))
+              (should
+               (equal
+                (plist-get
+                 (diffs--split-section-at-position (point))
+                 :item-id)
+                "second"))
+              (imenu hunk-item)
+              (should
+               (equal
+                (plist-get
+                 (diffs--split-section-at-position (point))
+                 :item-id)
+                "second"))
+              (should
+               (eq
+                (nth 5 (diffs--split-row-at-position (point)))
+                (car
+                 (plist-get
+                  (cadr
+                   (buffer-local-value
+                    'diffs--sections owner))
+                  :hunks))))
+              (let ((sections
+                     (buffer-local-value 'diffs--sections owner)))
+                (unwind-protect
+                    (progn
+                      (with-current-buffer owner
+                        (setq diffs--sections (cdr sections)))
+                      (should-error
+                       (imenu stale-file-item) :type 'user-error))
+                  (with-current-buffer owner
+                    (setq diffs--sections sections)))))
+            (diffs-split-quit))
+        (when (buffer-live-p owner)
+          (with-current-buffer owner
+            (diffs--split-cache-clear)
+            (when diffs-minor-mode
+              (diffs-minor-mode -1)))
+          (kill-buffer owner))))))
+
+(ert-deftest diffs-imenu-stale-hunks-do-not-fall-through-by-ordinal ()
+  (diffs-tests--with-diff diffs-tests--directional-context
+    (diffs-minor-mode 1)
+    (let* ((section (car diffs--sections))
+           (hunks (plist-get section :hunks))
+           (first-hunk-item
+            (cadr (cdar (funcall imenu-create-index-function)))))
+      (unwind-protect
+          (progn
+            (setf (plist-get section :hunks) (cdr hunks))
+            (should-error
+             (imenu first-hunk-item) :type 'user-error))
+        (setf (plist-get section :hunks) hunks)))
+    (diffs-minor-mode -1)))
 
 (ert-deftest diffs-token-coordinates-cover-unicode-and-whitespace ()
   (let ((patch
@@ -1523,7 +1865,7 @@
       (goto-char (car hunk))
       (should
        (string-search
-        "e +4"
+        "[e] +4"
         (diffs--hunk-separator section hunk 'stacked)))
       (diffs--set-context-visible gap 2)
       (should (equal (buffer-string) text))
@@ -1532,7 +1874,7 @@
         (should (string-match-p "new three" display))
         (should (string-match-p "new four" display))
         (should-not (string-match-p "new two" display))
-        (should (string-search "e +2" display)))
+        (should (string-search "[e] +2" display)))
       (pcase-let ((`(,old ,new . ,_) (diffs--split-collect)))
         (should (equal (mapcar (lambda (row) (nth 3 row))
                               (seq-take old 4))
@@ -1560,6 +1902,78 @@
           '(header ctx ctx ctx ctx)))
         (should (equal anchors '(1))))
       (should (equal (buffer-string) text)))))
+
+(ert-deftest diffs-context-separators-show-direction-and-key-hint ()
+  (let ((diffs--nerd-icons-state 'available))
+    (cl-letf (((symbol-function 'nerd-icons-icon-for-file)
+               (lambda (&rest _) "file"))
+              ((symbol-function 'nerd-icons-octicon)
+               (lambda (name &rest _)
+                 (pcase name
+                   ("nf-oct-chevron_up" "UP")
+                   ("nf-oct-chevron_down" "DOWN")))))
+      (diffs-tests--with-diff diffs-tests--directional-context
+        (diffs-minor-mode 1)
+        (let* ((section (car diffs--sections))
+               (hunks (plist-get section :hunks))
+               (first (car hunks))
+               (second (cadr hunks))
+               (first-context
+                (diffs--hunk-separator-context section first 'stacked))
+               (second-context
+                (diffs--hunk-separator-context section second 'stacked))
+               (first-label
+                (diffs--hunk-separator section first 'stacked))
+               (second-label
+                (diffs--hunk-separator section second 'stacked))
+               (key-start (string-match "\\[e\\]" first-label)))
+          (should (eq (plist-get first-context :direction) 'up))
+          (should (eq (plist-get second-context :direction) 'down))
+          (should (string-prefix-p "UP " first-label))
+          (should (string-prefix-p "DOWN " second-label))
+          (should (string-search "press [e] +2" first-label))
+          (should (string-search "press [e] +4" second-label))
+          (should key-start)
+          (should-not (get-text-property key-start 'face first-label))
+          (goto-char (car first))
+          (let* ((display (get-text-property (point) 'display))
+                 (display-key (string-match "\\[e\\]" display))
+                 (faces (ensure-list
+                         (get-text-property display-key 'face display))))
+            (should display-key)
+            (should (memq 'diffs-hunk-separator faces))
+            (should-not (memq 'diffs-key-hint faces)))
+          (pcase-let ((`(,old ,_new . ,_) (diffs--split-collect)))
+            (let* ((labels
+                    (mapcar
+                     #'car
+                     (seq-filter
+                      (lambda (row) (eq (nth 3 row) 'sep))
+                      old)))
+                   (split-key (string-match "\\[e\\]" (car labels)))
+                   (faces
+                    (ensure-list
+                     (get-text-property
+                      split-key 'face (car labels)))))
+              (should (string-prefix-p "UP " (car labels)))
+              (should (string-prefix-p "DOWN " (cadr labels)))
+              (should (memq 'diffs-hunk-separator faces))
+              (should-not (memq 'diffs-key-hint faces)))))
+        (diffs-minor-mode -1)))))
+
+(ert-deftest diffs-context-separator-icons-have-text-fallbacks ()
+  (let ((diffs--nerd-icons-state 'missing))
+    (dolist (spec '((up . "↑ ") (down . "↓ ")))
+      (let ((label
+             (diffs-default-hunk-separator
+              (list :item-type 'diff
+                    :direction (car spec)
+                    :count 12
+                    :visible 0
+                    :hidden 12
+                    :context-step 10))))
+        (should (string-prefix-p (cdr spec) label))
+        (should (string-search "press [e] +10" label))))))
 
 (ert-deftest diffs-context-bindings-expand-in-steps ()
   (should (eq (keymap-lookup diffs-minor-mode-map "e")
@@ -2441,6 +2855,10 @@
         (diffs-diff-hl-mode -1)))
     (should (eq diff-hl-show-hunk-function #'ignore))
     (should-not diffs--diff-hl-show-hunk-function-saved-p)))
+
+(ert-deftest diffs-diff-hl-adapter-loads-lazily ()
+  (should diffs-tests--diff-hl-adapter-was-lazy)
+  (should (featurep 'diffs-diff-hl)))
 
 (ert-deftest diffs-diff-hl-mode-restores-nil-renderer ()
   (let ((diff-hl-show-hunk-function nil)
@@ -5902,7 +6320,8 @@
     (unwind-protect
         (progn
           (make-directory build t)
-          (dolist (file '("diffs.el" "diffs-cli.el" "diffs-assets.el"))
+          (dolist (file '("diffs.el" "diffs-diff-hl.el"
+                          "diffs-cli.el" "diffs-assets.el"))
             (copy-file (expand-file-name file source)
                        (expand-file-name file build)))
           (should-not
@@ -6161,16 +6580,249 @@
       (delete-directory directory t))))
 
 (ert-deftest diffs-sticky-header-follows-file-and-hunk-position ()
-  (diffs-tests--with-diff diffs-tests--two-files
-    (diffs--scan)
-    (let* ((section (aref diffs--section-vector 1))
-           (hunk (car (plist-get section :hunks))))
-      (goto-char (1+ (car hunk)))
-      (let ((header (diffs--header-line)))
-        (should (string-match-p "bar\\.el" header))
-        (should (string-match-p "\\[2/2\\]" header))
-        (should (string-match-p (regexp-quote "−10 +10") header))
-        (should (string-match-p "bar-function" header))))))
+  (let ((diffs-file-header-function
+         (lambda (context)
+           (format "PUBLIC:%s:%s"
+                   (plist-get context :view)
+                   (plist-get context :file)))))
+    (diffs-tests--with-diff diffs-tests--two-files
+      (diffs--scan)
+      (let* ((section (aref diffs--section-vector 1))
+             (hunk (car (plist-get section :hunks))))
+        (goto-char (1+ (car hunk)))
+        (let ((header (diffs--header-line)))
+          (should (string-prefix-p "PUBLIC:stacked:bar.el" header))
+          (should (string-match-p "\\[2/2\\]" header))
+          (should (string-match-p (regexp-quote "−10 +10") header))
+          (should (string-match-p "bar-function" header)))))))
+
+(ert-deftest diffs-sticky-header-yields-to-visible-file-header ()
+  (let ((owner (generate-new-buffer " *diffs sticky header test*"))
+        old-buffer new-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer owner)
+          (insert diffs-tests--two-files)
+          (diff-mode)
+          (diffs-minor-mode 1)
+          (let* ((window (selected-window))
+                 (section (car diffs--sections))
+                 (hunk (car (plist-get section :hunks))))
+            (should-not header-line-format)
+            (redisplay t)
+            (should (zerop (window-header-line-height window)))
+            (run-hook-with-args
+             'window-scroll-functions window (car hunk))
+            (should-not header-line-format)
+            (should
+             (window-parameter window 'header-line-format))
+            (redisplay t)
+            (should (> (window-header-line-height window) 0))
+            (run-hook-with-args
+             'window-scroll-functions window (plist-get section :beg))
+            (should-not
+             (window-parameter window 'header-line-format)))
+          (dolist (virtualization '(complete paged))
+            (ert-info ((format "virtualization: %s" virtualization))
+              (let ((diffs-split-virtualization virtualization))
+                (diffs-toggle-split)
+                (setq new-buffer (current-buffer)
+                      old-buffer diffs--split-other)
+                (dolist (buffer (list old-buffer new-buffer))
+                  (with-current-buffer buffer
+                    (should-not header-line-format)))
+                (let* ((window (selected-window))
+                       (position
+                        (with-current-buffer new-buffer
+                          (cl-loop
+                           for row across diffs--split-rows
+                           for index from 0
+                           when (and
+                                 row
+                                 (not (eq (nth 3 row) 'header)))
+                           return (diffs--split-row-position index)))))
+                  (with-current-buffer new-buffer
+                    (run-hook-with-args
+                     'window-scroll-functions window position)
+                    (should-not header-line-format)
+                    (should
+                     (window-parameter
+                      window 'header-line-format))))
+                (diffs-split-quit))))
+          (diffs-minor-mode -1))
+      (dolist (buffer (list old-buffer new-buffer owner))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest diffs-sticky-headers-are-window-local-and-restored ()
+  (let ((owner
+         (generate-new-buffer " *diffs multiwindow sticky test*"))
+        (plain
+         (generate-new-buffer " *diffs sticky replacement test*")))
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer owner)
+          (insert diffs-tests--two-files)
+          (diff-mode)
+          (delete-other-windows)
+          (let* ((first-window (selected-window))
+                 (second-window (split-window-right))
+                 (external-header '("External window header")))
+            (set-window-buffer second-window owner)
+            (set-window-parameter
+             second-window 'header-line-format external-header)
+            (diffs-minor-mode 1)
+            (let* ((section (cadr diffs--sections))
+                   (hunk (car (plist-get section :hunks)))
+                   (hunk-position (car hunk)))
+              (should-not header-line-format)
+              (diffs--update-sticky-header
+               first-window (plist-get (car diffs--sections) :beg))
+              (diffs--update-sticky-header
+               second-window hunk-position)
+              (should-not
+               (window-parameter first-window 'header-line-format))
+              (should
+               (window-parameter second-window 'header-line-format))
+              (should
+               (eq
+                (window-parameter
+                 first-window diffs--sticky-header-owner-parameter)
+                owner))
+              (should
+               (eq
+                (window-parameter
+                 second-window diffs--sticky-header-owner-parameter)
+                owner))
+              (diffs--update-sticky-header
+               first-window hunk-position)
+              (should
+               (window-parameter first-window 'header-line-format))
+              (should
+               (window-parameter second-window 'header-line-format))
+              (diffs--update-sticky-header
+               first-window (plist-get (car diffs--sections) :beg))
+              (should-not
+               (window-parameter first-window 'header-line-format))
+              (should
+               (window-parameter second-window 'header-line-format))
+              (set-window-buffer second-window plain)
+              ;; Batch Emacs does not enter redisplay, so drive the
+              ;; standard old-buffer hook that interactive redisplay runs.
+              (run-hook-with-args
+               'window-buffer-change-functions second-window)
+              (should
+               (equal
+                (window-parameter
+                 second-window 'header-line-format)
+                external-header))
+              (should-not
+               (window-parameter
+                second-window
+                diffs--sticky-header-owner-parameter))
+              (diffs-minor-mode -1)
+              (should-not
+               (window-parameter first-window 'header-line-format))
+              (should
+               (equal
+                (window-parameter
+                 second-window 'header-line-format)
+                external-header))
+              (should-not
+               (window-parameter
+                first-window diffs--sticky-header-owner-parameter))
+              (should-not
+               (window-parameter
+                second-window
+                diffs--sticky-header-owner-parameter)))))
+      (dolist (buffer (list owner plain))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest diffs-file-icons-cover-file-label-surfaces ()
+  (let ((diffs-file-icons t)
+        (diffs--nerd-icons-state 'available))
+    (cl-letf
+        (((symbol-function 'nerd-icons-icon-for-file)
+          (lambda (file &rest _)
+            (propertize
+             (if (string-suffix-p ".el" file) "λ" "□")
+             'face 'font-lock-type-face))))
+      (let* ((header
+              (diffs-default-file-header
+               '(:file "src/sample.el" :old-file "src/sample.el"
+                 :adds 1 :dels 1)))
+             (icon-position (string-match "λ" header))
+             (faces (get-text-property icon-position 'face header)))
+        (should (string-match-p "λ src/sample\\.el" header))
+        (should-not (string-prefix-p "──" header))
+        (should
+         (diffs-tests--face-includes-p
+          faces 'font-lock-type-face))
+        (should
+         (diffs-tests--face-includes-p
+          faces 'diffs-file-header)))
+      (should
+       (string-match-p
+        "λ old\\.el → □ new\\.js"
+        (diffs--display-file-label "old.el" "new.js" 40)))
+      (diffs-tests--with-diff diffs-tests--normal
+        (diffs-minor-mode 1)
+        (let* ((owner (current-buffer))
+               (section (car diffs--sections))
+               (hunk (car (plist-get section :hunks)))
+               (logical (diffs--split-collect-hunk section hunk))
+               (physical
+                (diffs--split-physical-rows
+                 (nth 0 logical) (nth 1 logical) 80 nil))
+               (index (generate-new-buffer " *diffs icon index test*")))
+          (unwind-protect
+              (progn
+                (goto-char (plist-get section :beg))
+                (should
+                 (string-match-p "λ foo\\.el"
+                                 (diffs--header-line)))
+                (diffs--index-render owner index)
+                (with-current-buffer index
+                  (should
+                   (string-match-p "λ foo\\.el" (buffer-string))))
+                (with-temp-buffer
+                  (diffs-split-mode)
+                  (setq-local diffs-file-icons t)
+                  (setq-local diffs--split-unified owner)
+                  (setq-local diffs--split-role 'new)
+                  (diffs--split-install-rows (nth 1 physical)
+                                             (plist-get section :width))
+                  (goto-char (point-min))
+                  (cl-letf (((symbol-function 'get-buffer-window)
+                             (lambda (&rest _) nil)))
+                    (let ((sticky (diffs--split-header-line)))
+                      (should
+                       (string-prefix-p
+                        "λ foo.el  +2 −1" sticky))
+                      (should-not
+                       (string-match-p
+                        "\\` \\(?:old\\|new\\)  │" sticky))))))
+            (kill-buffer index)))
+        (diffs-minor-mode -1)))))
+
+(ert-deftest diffs-file-icons-fall-back-to-text-labels ()
+  (let ((diffs-file-icons t)
+        (diffs--nerd-icons-state 'missing))
+    (should
+     (equal (diffs--file-label "src/sample.el" 30)
+            "src/sample.el")))
+  (let ((diffs-file-icons nil)
+        (diffs--nerd-icons-state 'available)
+        called)
+    (cl-letf (((symbol-function 'nerd-icons-icon-for-file)
+               (lambda (&rest _)
+                 (setq called t)
+                 "λ")))
+      (should
+       (equal (diffs--file-label "src/sample.el" 30)
+              "src/sample.el"))
+      (should-not called))))
 
 (ert-deftest diffs-changed-file-index-previews-and-visits-files ()
   (let ((owner (generate-new-buffer " *diffs index owner*"))
@@ -6330,6 +6982,53 @@
     (let ((faces (get-text-property (point-min) 'face)))
       (should (eq (car faces) 'diff-refine-added))
       (should (memq 'diffs-split-added-line faces)))))
+
+(ert-deftest diffs-split-changed-lines-keep-source-syntax-faces ()
+  (diffs-tests--with-diff
+      (concat
+       "diff --git a/sample.el b/sample.el\n"
+       "--- a/sample.el\n"
+       "+++ b/sample.el\n"
+       "@@ -1 +1 @@\n"
+       "-(defun answer () \"old\")\n"
+       "+(defun answer () \"new\")\n")
+    (diffs-minor-mode 1)
+    (let* ((owner (current-buffer))
+           (section (car diffs--sections))
+           (hunk (car (plist-get section :hunks)))
+           (logical (diffs--split-collect-hunk section hunk))
+           (physical
+            (diffs--split-physical-rows
+             (nth 0 logical) (nth 1 logical) 80 nil)))
+      (dolist
+          (spec
+           (list
+            (list (aref (nth 0 physical) 0)
+                  'old 'diffs-split-removed-line 'diff-removed)
+            (list (aref (nth 1 physical) 0)
+                  'new 'diffs-split-added-line 'diff-added)))
+        (pcase-let ((`(,row ,role ,line-face ,patch-face) spec))
+          (with-temp-buffer
+            (let ((begin (point)))
+              (insert (car row) "\n")
+              (setq-local diffs--split-unified owner)
+              (setq-local diffs--split-role role)
+              (diffs--split-decorate-row
+               begin (point) row (plist-get section :width) role)
+              (goto-char begin)
+              (search-forward "defun")
+              (let ((faces
+                     (get-text-property
+                      (match-beginning 0) 'face)))
+                (should
+                 (diffs-tests--face-includes-p
+                  faces 'font-lock-keyword-face))
+                (should
+                 (diffs-tests--face-includes-p faces line-face))
+                (should-not
+                 (diffs-tests--face-includes-p
+                  faces patch-face))))))))
+    (diffs-minor-mode -1)))
 
 (ert-deftest diffs-decodes-git-quoted-file-name ()
   (diffs-tests--with-diff
