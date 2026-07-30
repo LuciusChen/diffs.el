@@ -6925,8 +6925,10 @@
 (ert-deftest diffs-unified-change-backgrounds-reach-the-fringe ()
   (diffs-tests--with-diff diffs-tests--normal
     (diffs-minor-mode 1)
-    (dolist (spec '(("^-(message" diff-removed)
-                    ("^+(message" diff-added)))
+    (dolist (spec '(("^-(message" diff-removed
+                     diff-indicator-removed)
+                    ("^+(message" diff-added
+                     diff-indicator-added)))
       (goto-char (point-min))
       (re-search-forward (car spec))
       (let* ((prefix
@@ -6935,9 +6937,12 @@
              (gutter-face
               (get-text-property (1- (length prefix)) 'face prefix)))
         (should
-         (diffs-tests--face-includes-p gutter-face (cadr spec)))))
+         (diffs-tests--face-includes-p gutter-face (cadr spec)))
+        (should
+         (diffs-tests--face-includes-p gutter-face (caddr spec)))))
     (let ((section (car diffs--sections)))
-      (dolist (spec '((?- diff-removed) (?+ diff-added)))
+      (dolist (spec '((?- diff-removed diff-indicator-removed)
+                      (?+ diff-added diff-indicator-added)))
         (let* ((prefix
                 (diffs--review-resolution-prefix
                  section (car spec) 1 1 nil))
@@ -6946,7 +6951,10 @@
                  (1- (length prefix)) 'face prefix)))
           (should
            (diffs-tests--face-includes-p
-            gutter-face (cadr spec))))))))
+            gutter-face (cadr spec)))
+          (should
+           (diffs-tests--face-includes-p
+            gutter-face (caddr spec))))))))
 
 (ert-deftest diffs-fringe-bars-can-be-disabled ()
   (let ((diffs-line-numbers nil)
@@ -6961,18 +6969,28 @@
 (ert-deftest diffs-split-full-width-backgrounds-can-be-disabled ()
   (let ((diffs-split-full-width-backgrounds nil))
     (with-temp-buffer
-      (diffs-tests--split-insert-row
-       "new" 1 1 'add "foo.el" 2 'new)
-      (goto-char (point-min))
-      (let* ((prefix (get-text-property (point) 'line-prefix))
-             (prefix-face
-              (get-text-property (1- (length prefix)) 'face prefix)))
-        (should-not
-         (diffs-tests--face-includes-p prefix-face 'diff-added))
-        (should-not
-         (diffs-tests--face-includes-p
-          (get-text-property (line-end-position) 'face)
-          'diff-added))))))
+      (let ((diffs--split-unified (current-buffer))
+            (section
+             '(:file "foo.el" :item-type diff :width 2)))
+        (cl-letf
+            (((symbol-function 'diffs--token-section-for-row)
+              (lambda (_owner _row) section)))
+          (diffs-tests--split-insert-row
+           "new" 1 1 'add "foo.el" 2 'new)
+          (goto-char (point-min))
+          (let* ((prefix (get-text-property (point) 'line-prefix))
+                 (prefix-face
+                  (get-text-property
+                   (1- (length prefix)) 'face prefix)))
+            (should
+             (diffs-tests--face-includes-p
+              prefix-face 'diff-indicator-added))
+            (should-not
+             (diffs-tests--face-includes-p prefix-face 'diff-added))
+            (should-not
+             (diffs-tests--face-includes-p
+              (get-text-property (line-end-position) 'face)
+              'diff-added))))))))
 
 (ert-deftest diffs-split-keeps-refinement-above-the-line-background ()
   (with-temp-buffer

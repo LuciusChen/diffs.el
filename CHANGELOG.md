@@ -2,6 +2,7 @@
 
 ## Unreleased (0.13.0)
 
+- Color added and removed line-number digits with theme-native `diff-indicator-added` and `diff-indicator-removed` faces in stacked, split, and decision previews, independently of split full-width backgrounds.
 - Add a standard Imenu file → hunk hierarchy to project, commit, mixed-item, and other multi-file reviews. Selecting an entry preserves stacked or split layout, paged splits materialize only the target chunk, and repeated mixed-item paths retain exact stable item identity.
 - Make sticky file/hunk headers truly per-window, restore any replaced window header when diffs.el releases it, and restore the complete external diff-buffer state when `diffs-minor-mode` is disabled. Split rows now carry their exact owning section so duplicate mixed-item paths, refresh restoration, token lookup, and navigation cannot collapse onto the first file match.
 - Prevent a transient source-mode fontification failure from permanently poisoning the shared render cache with unhighlighted text, version cache identities so stale live reviews retry, repaint expanded context with syntax faces when its idle render completes, and publish those faces into read-only split buffers without signaling or changing their modified state.

@@ -468,11 +468,16 @@ the background in any theme.")
   '((t :inherit warning :extend t))
   "Face for a merge-conflict block edited outside diffs.el.")
 
-(defun diffs--line-prefix-face (change-face)
-  "Return the line-number face, optionally layered over CHANGE-FACE."
-  (if change-face
-      (list 'diffs-line-number change-face)
-    'diffs-line-number))
+(defun diffs--line-prefix-face (kind change-face)
+  "Return the line-number face for KIND over optional CHANGE-FACE."
+  (let ((number-face
+         (pcase kind
+           ('add 'diff-indicator-added)
+           ('del 'diff-indicator-removed)
+           (_ 'diffs-line-number))))
+    (if change-face
+        (list number-face change-face)
+      number-face)))
 
 (defun diffs--define-fringe-bitmap ()
   "Define the full-height bitmap used by `diffs-fringe-bars'."
@@ -2533,7 +2538,7 @@ non-nil, only apply properties to lines intersecting that region."
              'diffs-new-number (and new new-line))
             (let* ((fringe (diffs--fringe-prefix c))
                    (gutter-face
-                    (diffs--line-prefix-face change-face))
+                    (diffs--line-prefix-face kind change-face))
                    (gutter
                     (diffs--gutter
                      section 'stacked kind width
@@ -5605,7 +5610,7 @@ WIDTH is the number-column width and ROLE is `old' or `new'."
                (gutter-face
                 (if (eq kind 'filler)
                     '(diffs-line-number diffs-filler)
-                  (diffs--line-prefix-face change-face)))
+                  (diffs--line-prefix-face kind change-face)))
                (gutter
                 (and section
                      (diffs--gutter
@@ -8415,7 +8420,7 @@ preview result numbers.  RESOLVED suppresses the change fringe."
       (diffs--gutter
        section 'stacked kind width old-number new-number
        nil nil
-       (diffs--line-prefix-face change-face))
+       (diffs--line-prefix-face kind change-face))
       ""))))
 
 (defun diffs--review-project-unified-result-numbers
