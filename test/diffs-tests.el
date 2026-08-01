@@ -3651,6 +3651,44 @@
       (diffs-split-quit)
       (diffs-minor-mode -1))))
 
+(ert-deftest diffs-review-opposite-split-comments-share-one-lane ()
+  (diffs-tests--with-diff diffs-tests--normal
+    (save-window-excursion
+      (switch-to-buffer (current-buffer))
+      (diffs-minor-mode 1)
+      (goto-char (point-min))
+      (re-search-forward "^-(message \"old\")")
+      (beginning-of-line)
+      (diffs-review-add-annotation "Old-side note." nil)
+      (diffs-review-clear-selection)
+      (goto-char (point-min))
+      (re-search-forward "^+(message \"new\")")
+      (beginning-of-line)
+      (diffs-review-add-annotation
+       "New-side note."
+       "This side is taller.\nIt still shares the same lane.")
+      (diffs-toggle-split)
+      (let ((new-buffer (current-buffer))
+            (old-buffer diffs--split-other))
+        (cl-labels
+            ((annotation-string
+              (buffer)
+              (with-current-buffer buffer
+                (let ((strings
+                       (cl-loop for overlay in diffs--review-overlays
+                                for string = (overlay-get overlay 'after-string)
+                                when (stringp string) collect string)))
+                  (should (= (length strings) 1))
+                  (car strings)))))
+          (let ((old-string (annotation-string old-buffer))
+                (new-string (annotation-string new-buffer)))
+            (should (string-match-p "Old-side note" old-string))
+            (should (string-match-p "New-side note" new-string))
+            (should (= (cl-count ?\n old-string)
+                       (cl-count ?\n new-string))))))
+      (diffs-split-quit)
+      (diffs-minor-mode -1))))
+
 (ert-deftest diffs-split-clearing-selection-removes-all-selection-face ()
   (let ((buf (generate-new-buffer " *diffs split selection face test*"))
         old-buf new-buf)

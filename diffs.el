@@ -8550,37 +8550,83 @@ overlay string."
          annotation
          (diffs--review-line-prefix-pixel-width position)))))))
 
-(defun diffs--review-project-split-annotations (owner annotations)
-  "Project OWNER's ANNOTATIONS into the current split buffer."
-  (let* ((cache (buffer-local-value 'diffs--split-cache owner))
-         (role diffs--split-role))
+(defun diffs--review-split-annotation-groups (owner annotations)
+  "Return OWNER's ANNOTATIONS grouped by aligned split row.
+Each result is (INDEX OLD NEW), preserving annotation order per side."
+  (let ((cache (buffer-local-value 'diffs--split-cache owner))
+        (table (make-hash-table :test #'eql))
+        indices)
     (dolist (annotation annotations)
       (when-let* ((target (diffs--review-annotation-target annotation))
+                  (side (car target))
                   (target-buffer
-                   (plist-get cache
-                              (if (eq (car target) 'old) :old :new)))
+                   (plist-get cache (if (eq side 'old) :old :new)))
                   ((buffer-live-p target-buffer))
                   (index
                    (with-current-buffer target-buffer
                      (diffs--review-split-row-index
-                      (plist-get annotation :file)
-                      (car target)
-                      (cdr target))))
-                  ((< index (length diffs--split-rows))))
-        (pcase-let* ((position (diffs--split-row-position index))
-                     (`(,display . ,height)
-                      (diffs--review-annotation-display
-                       annotation
-                       (diffs--review-line-prefix-pixel-width position)))
-                     (string
-                      (if (eq role (car target))
-                          display
-                        (propertize
-                         (make-string height ?\n)
-                         'face 'diffs-filler))))
-          (diffs--review-add-annotation-overlay
-           position
-           string))))))
+                      (plist-get annotation :file) side (cdr target)))))
+        (let ((group (gethash index table)))
+          (unless group
+            (setq group (vector nil nil))
+            (puthash index group table)
+            (push index indices))
+          (push annotation (aref group (if (eq side 'old) 0 1))))))
+    (mapcar
+     (lambda (index)
+       (let ((group (gethash index table)))
+         (list index
+               (nreverse (aref group 0))
+               (nreverse (aref group 1)))))
+     (sort indices #'<))))
+
+(defun diffs--review-split-annotation-string
+    (annotations peer-annotations prefix-pixels)
+  "Render one split annotation lane sequence.
+ANNOTATIONS belong to the current side, PEER-ANNOTATIONS to the other
+side, and PREFIX-PIXELS is the current gutter width.  Opposite comments
+at the same aligned row share a lane whose height is the larger one."
+  (let (parts)
+    (while (or annotations peer-annotations)
+      (let* ((annotation (pop annotations))
+             (peer-annotation (pop peer-annotations))
+             (render
+              (and annotation
+                   (diffs--review-annotation-display
+                    annotation prefix-pixels)))
+             (height (if render (cdr render) 0))
+             (peer-height
+              (if peer-annotation
+                  (cdr (diffs--review-annotation-display peer-annotation))
+                0))
+             (lane-height (max height peer-height)))
+        (push
+         (if render
+             (concat
+              (car render)
+              (propertize
+               (make-string (- lane-height height) ?\n)
+               'face 'diffs-filler))
+           (propertize (make-string lane-height ?\n)
+                       'face 'diffs-filler))
+         parts)))
+    (apply #'concat (nreverse parts))))
+
+(defun diffs--review-project-split-annotations (owner annotations)
+  "Project OWNER's ANNOTATIONS into the current split buffer."
+  (let ((role diffs--split-role))
+    (pcase-dolist (`(,index ,old ,new)
+                   (diffs--review-split-annotation-groups
+                    owner annotations))
+      (when (< index (length diffs--split-rows))
+        (let* ((position (diffs--split-row-position index))
+               (prefix
+                (diffs--review-line-prefix-pixel-width position))
+               (string
+                (if (eq role 'old)
+                    (diffs--review-split-annotation-string old new prefix)
+                  (diffs--review-split-annotation-string new old prefix))))
+          (diffs--review-add-annotation-overlay position string))))))
 
 (defun diffs--review-add-decision-overlay (begin end &rest properties)
   "Add a decision overlay from BEGIN to END with PROPERTIES."
