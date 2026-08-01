@@ -1,17 +1,23 @@
 ;;; diffs-benchmark.el --- Reproducible diffs.el benchmark -*- lexical-binding: t -*-
 
 (require 'benchmark)
+(require 'cl-lib)
 (require 'diffs)
 
+(defvar diffs-benchmark--profile
+  (intern (or (getenv "DIFFS_BENCH_PROFILE") "volume")))
+
 (defvar diffs-benchmark--files
-  (string-to-number (or (getenv "DIFFS_BENCH_FILES") "800")))
+  (string-to-number
+   (or (getenv "DIFFS_BENCH_FILES")
+       (if (eq diffs-benchmark--profile 'complex) "16" "800"))))
 
 (defvar diffs-benchmark--virtualization
   (intern
    (or (getenv "DIFFS_BENCH_VIRTUALIZATION") "auto")))
 
-(defun diffs-benchmark--input ()
-  "Build a representative multi-file Git diff."
+(defun diffs-benchmark--volume-input ()
+  "Build a large Git diff that isolates scaling costs."
   (with-temp-buffer
     (dotimes (file diffs-benchmark--files)
       (let* ((contexts (+ 20 (if (< file (/ diffs-benchmark--files 2)) 1 0)))
@@ -27,6 +33,76 @@
         (insert (format "-(message \"old value %04d\")\n" file))
         (insert (format "+(message \"new value %04d\")\n" file))))
     (buffer-string)))
+
+(defun diffs-benchmark--complex-input ()
+  "Build a Git diff with expensive, varied change blocks."
+  (with-temp-buffer
+    (cl-labels
+        ((context-line
+          (file hunk line)
+          (format
+           " (message \"context file=%02d hunk=%d line=%d / 上下文 café\")\n"
+           file hunk line))
+         (changed-line
+          (marker file hunk line source old-p)
+          (format
+           (concat
+            "%c    (setf (alist-get 'recordValue_%02d_%02d_%02d cache) "
+            "(list :account-id \"acct/%02d/%02d/%02d\" "
+            ":display-name \"%s 用户 café é 🙂\" "
+            ":roles '(%s) :flags [active %s beta] "
+            ":payload (format \"%%s::%%04d\" tenant-id %d)))\n")
+           marker file hunk source file hunk source
+           (if old-p "Legacy" "Revised")
+           (if old-p "reader editor" "reader reviewer editor")
+           (if old-p "nil" "t") line)))
+      (dotimes (file diffs-benchmark--files)
+        (insert (format "diff --git a/src/complex-%02d.el b/src/complex-%02d.el\n"
+                        file file))
+        (insert "index 1111111..2222222 100644\n")
+        (insert (format "--- a/src/complex-%02d.el\n+++ b/src/complex-%02d.el\n"
+                        file file))
+        (dotimes (hunk 3)
+          (let* ((old-lines (+ 10 (% (+ file hunk) 5)))
+                 (new-lines (+ 9 (% (+ file (* 2 hunk)) 7)))
+                 (old-start (+ 1 (* hunk 100)))
+                 (new-start (+ 1 (* hunk 110)))
+                 (old-count (+ old-lines 4))
+                 (new-count (+ new-lines 4)))
+            (insert (format "@@ -%d,%d +%d,%d @@ complex block %d\n"
+                            old-start old-count new-start new-count hunk))
+            (dotimes (line 2)
+              (insert (context-line file hunk line)))
+            (dotimes (line old-lines)
+              (insert (changed-line ?- file hunk line line t)))
+            (dotimes (line new-lines)
+              (let ((source
+                     (% (+ line (if (zerop (% hunk 2)) 1 2))
+                        old-lines)))
+                (insert
+                 (changed-line ?+ file hunk line source nil))))
+            (dotimes (line 2)
+              (insert (context-line file hunk (+ line 2))))))
+        ;; Exercise the long-line pairing and intraline guards once per
+        ;; file without making every alignment compare thousand-character
+        ;; strings.
+        (insert "@@ -901,2 +931,2 @@ long replacement\n")
+        (insert " (message \"tail context\")\n")
+        (insert "-(message \"long legacy payload: ")
+        (insert (make-string 1100 ?x))
+        (insert " / 长行 🙂\")\n")
+        (insert "+(message \"long revised payload: ")
+        (insert (make-string 1100 ?x))
+        (insert " / 长行 🙂\")\n")))
+    (buffer-string)))
+
+(defun diffs-benchmark--input ()
+  "Build the Git diff selected by `diffs-benchmark--profile'."
+  (pcase diffs-benchmark--profile
+    ('volume (diffs-benchmark--volume-input))
+    ('complex (diffs-benchmark--complex-input))
+    (_ (error "Unknown benchmark profile: %S"
+              diffs-benchmark--profile))))
 
 (defun diffs-benchmark--measure (name repetitions function)
   "Print timings for calling FUNCTION REPETITIONS times under NAME."
@@ -66,8 +142,10 @@
           ;; installs the actual redisplay worker below.
           (setq-local font-lock-mode t))
         (princ
-         (format "Emacs %s; %s split policy; %d files; %d lines; %d bytes\n"
-                 emacs-version diffs-benchmark--virtualization
+         (format (concat "Emacs %s; %s profile; %s split policy; "
+                         "%d files; %d lines; %d bytes\n")
+                 emacs-version diffs-benchmark--profile
+                 diffs-benchmark--virtualization
                  diffs-benchmark--files
                  (with-current-buffer buffer
                    (count-lines (point-min) (point-max)))
@@ -82,12 +160,40 @@
          (lambda ()
            (with-current-buffer buffer
              (diffs-minor-mode 1))))
-        (diffs-benchmark--measure
-         "stacked viewport" 1
-         (lambda ()
-           (with-current-buffer buffer
-             (when (memq #'diffs--jit-decorate
-                         jit-lock-functions)
+        (princ
+         (format "estimated change work: %d\n"
+                 (with-current-buffer buffer
+                   (diffs--estimated-change-work))))
+        (when (eq diffs-benchmark--profile 'complex)
+          (let* ((section
+                  (with-current-buffer buffer
+                    (car diffs--sections)))
+                 (hunk (car (plist-get section :hunks)))
+                 (end
+                  (with-current-buffer buffer
+                    (diffs--hunk-end hunk section))))
+            (with-current-buffer buffer
+              (diffs--clear-intraline))
+            (diffs-benchmark--measure
+             "cold hunk pairing" 1
+             (lambda ()
+               (with-current-buffer buffer
+                 (diffs--split-collect-hunk section hunk t))))
+            (with-current-buffer buffer
+              (diffs--clear-intraline))
+            (diffs-benchmark--measure
+             "cold hunk refine" 1
+             (lambda ()
+               (with-current-buffer buffer
+                 (diffs--refine-hunk hunk end))))
+            (with-current-buffer buffer
+              (diffs--clear-intraline))))
+        (when (with-current-buffer buffer
+                (memq #'diffs--jit-decorate jit-lock-functions))
+          (diffs-benchmark--measure
+           "stacked viewport" 1
+           (lambda ()
+             (with-current-buffer buffer
                (jit-lock-fontify-now
                 (point-min)
                 (save-excursion

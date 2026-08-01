@@ -10,6 +10,10 @@
        (not (featurep 'diffs-diff-hl)))
   "Non-nil when the core installed lazy diff-hl adapter entry points.")
 
+(defconst diffs-tests--review-composer-was-lazy
+  (not (featurep 'diffs-review-compose))
+  "Non-nil when loading diffs.el left its comment composer unloaded.")
+
 (require 'diffs-diff-hl)
 (require 'vc-git)
 (require 'xref)
@@ -42,6 +46,11 @@
    "-(message \"old\")\n"
    "+(message \"new\")\n"
    "+(message \"extra\")\n"))
+
+(defconst diffs-tests--png
+  (base64-decode-string
+   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+  "A valid one-pixel PNG used by review attachment tests.")
 
 (defconst diffs-tests--rename
   (concat
@@ -136,6 +145,23 @@
    "-old later\n"
    "+new later\n"
    " tail\n"))
+
+(defconst diffs-tests--complex-replacement
+  (let ((payload (make-string 160 ?x)))
+    (concat
+     "diff --git a/complex.el b/complex.el\n"
+     "--- a/complex.el\n"
+     "+++ b/complex.el\n"
+     "@@ -1,4 +1,4 @@\n"
+     (mapconcat
+      (lambda (index)
+        (format "-(setq record-%d \"%s old\")\n" index payload))
+      (number-sequence 0 3) "")
+     (mapconcat
+      (lambda (index)
+        (format "+(setq record-%d \"%s new\")\n" index payload))
+      (number-sequence 0 3) "")))
+  "Small replacement whose content is expensive to pair and refine.")
 
 (defconst diffs-tests--context-zero-deletion
   (concat
@@ -244,6 +270,43 @@
   "Return non-nil when face VALUE includes FACE."
   (or (eq value face)
       (and (listp value) (memq face value))))
+
+(defun diffs-tests--review-annotation-projection (summary)
+  "Return (DISPLAY . PREFIX-PIXELS) for projected annotation SUMMARY."
+  (let ((overlay
+         (cl-find-if
+          (lambda (candidate)
+            (when-let* ((display (overlay-get candidate 'after-string)))
+              (string-match-p (regexp-quote summary) display)))
+          (overlays-in (point-min) (point-max)))))
+    (unless overlay
+      (ert-fail (format "No projected review annotation contains %S" summary)))
+    (save-excursion
+      (goto-char (overlay-start overlay))
+      (cons (overlay-get overlay 'after-string)
+            (diffs--review-line-prefix-pixel-width
+             (line-beginning-position))))))
+
+(defun diffs-tests--review-annotation-align-position (display)
+  "Return the absolute pixel alignment encoded in annotation DISPLAY."
+  (when-let* ((position
+               (text-property-not-all 0 (length display)
+                                      'display nil display))
+              (space (get-text-property position 'display display))
+              (align (plist-get (cdr space) :align-to))
+              ((and (consp align)
+                    (numberp (car align))
+                    (null (cdr align)))))
+    (car align)))
+
+(defun diffs-tests--review-annotation-expected-right-edge (display prefix)
+  "Return expected right-border pixels for DISPLAY after PREFIX."
+  (let ((corner (string-match "╮" display)))
+    (unless corner
+      (ert-fail "Projected review annotation has no top-right corner"))
+    (+ prefix
+       (string-pixel-width (substring display 1 corner)
+                           (current-buffer)))))
 
 (defun diffs-tests--split-insert-row
     (string number source kind file width role)
@@ -958,6 +1021,105 @@
         (when (buffer-live-p candidate)
           (kill-buffer candidate))))))
 
+(ert-deftest diffs-complex-change-selects-lazy-stacked-rendering ()
+  (let ((diffs-lazy-threshold 50))
+    (diffs-tests--with-diff diffs-tests--complex-replacement
+      (font-lock-mode -1)
+      (diffs-minor-mode 1)
+      (should (< (count-lines (point-min) (point-max))
+                 diffs-lazy-threshold))
+      (should (>= (diffs--estimated-change-work)
+                  diffs-lazy-threshold))
+      (should (memq #'diffs--jit-decorate jit-lock-functions))
+      (diffs-minor-mode -1)))
+  (let ((diffs-lazy-threshold most-positive-fixnum))
+    (diffs-tests--with-diff diffs-tests--complex-replacement
+      (font-lock-mode -1)
+      (diffs-minor-mode 1)
+      (should-not (memq #'diffs--jit-decorate jit-lock-functions))
+      (diffs-minor-mode -1)))
+  (diffs-tests--with-diff diffs-tests--normal
+    (let ((diffs-lazy-threshold
+           (count-lines (point-min) (point-max)))
+          (diffs-line-diff-type 'none))
+      (font-lock-mode -1)
+      (diffs-minor-mode 1)
+      (should (memq #'diffs--jit-decorate jit-lock-functions))
+      (diffs-minor-mode -1))))
+
+(ert-deftest diffs-scan-change-work-keeps-replacement-boundaries ()
+  (let* ((old (make-string 80 ?o))
+         (new (make-string 80 ?n))
+         (patch
+          (concat
+           "diff --git a/work.el b/work.el\n"
+           "--- a/work.el\n"
+           "+++ b/work.el\n"
+           "@@ -1,3 +1,3 @@\n"
+           "-" old "\n+" new "\n"
+           " context\n"
+           "-" old "\n+" new "\n")))
+    (diffs-tests--with-diff patch
+      (diffs--scan)
+      (should (= (plist-get (car diffs--sections) :adds) 2))
+      (should (= (plist-get (car diffs--sections) :dels) 2))
+      ;; Each 80-by-80 replacement costs one unit.  Context must keep
+      ;; the two blocks separate; treating the hunk as one block costs 4.
+      (should (= (diffs--estimated-change-work) 2))))
+  (let* ((old (make-string 80 ?o))
+         (new (make-string 80 ?n))
+         (patch
+          (concat
+           "diff --git a/eof.el b/eof.el\n"
+           "--- a/eof.el\n"
+           "+++ b/eof.el\n"
+           "@@ -1 +1 @@\n"
+           "-" old "\n"
+           "\\ No newline at end of file\n"
+           "+" new "\n"
+           "\\ No newline at end of file\n")))
+    (diffs-tests--with-diff patch
+      (diffs--scan)
+      ;; The marker belongs to the adjacent replacement and must not turn
+      ;; it into unrelated pure deletion/addition blocks with zero work.
+      (should (= (diffs--estimated-change-work) 1)))))
+
+(ert-deftest diffs-split-auto-selects-paged-for-complex-change ()
+  (let ((buffer
+         (generate-new-buffer " *diffs complex split test*"))
+        (diffs-split-virtualization 'auto)
+        (diffs-split-virtualization-threshold 50)
+        old-buffer new-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (insert diffs-tests--complex-replacement)
+          (diff-mode)
+          (diffs-minor-mode 1)
+          (should (< (diffs--split-estimated-row-count)
+                     diffs-split-virtualization-threshold))
+          (should (>= (diffs--estimated-change-work)
+                      diffs-split-virtualization-threshold))
+          (diffs-toggle-split)
+          (setq new-buffer (current-buffer)
+                old-buffer diffs--split-other)
+          (should diffs--split-paged-p)
+          (should
+           (buffer-local-value 'diffs--split-paged-p old-buffer))
+          (diffs-split-quit)
+          (with-current-buffer buffer
+            (let ((diffs-split-virtualization 'complete))
+              (diffs-toggle-split)))
+          (should-not diffs--split-paged-p)
+          (should-not
+           (buffer-local-value 'diffs--split-paged-p old-buffer))
+          (diffs-split-quit)
+          (with-current-buffer buffer
+            (diffs-minor-mode -1)))
+      (dolist (candidate (list old-buffer new-buffer buffer))
+        (when (buffer-live-p candidate)
+          (kill-buffer candidate))))))
+
 (ert-deftest diffs-split-auto-respects-ineligible-view-state ()
   (let ((diffs-split-virtualization-threshold 0))
     (diffs-tests--with-diff diffs-tests--normal
@@ -1426,7 +1588,16 @@
     (diffs--render-theme-changed)
     (should (= diffs--render-theme-generation 5))
     (should (= (hash-table-count diffs--render-cache) 0))
-    (should-not diffs--render-cache-order)))
+    (should-not diffs--render-cache-order))
+  (diffs-tests--with-diff diffs-tests--normal
+    (diffs-minor-mode 1)
+    (let (refreshed)
+      (cl-letf (((symbol-function 'diffs--review-refresh-overlays)
+                 (lambda (owner &optional _views)
+                   (push owner refreshed))))
+        (diffs--render-theme-changed))
+      (should (memq (current-buffer) refreshed)))
+    (diffs-minor-mode -1)))
 
 (ert-deftest diffs-mixed-items-share-one-searchable-owner-model ()
   (let ((diffs-default-view 'stacked)
@@ -3211,15 +3382,274 @@
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
 
+(ert-deftest diffs-review-interactive-comment-uses-bottom-composer ()
+  (diffs-tests--with-diff diffs-tests--normal
+    (let ((owner (current-buffer)) draft origin-point)
+      (save-window-excursion
+        (delete-other-windows)
+        (switch-to-buffer owner)
+        (diffs-minor-mode 1)
+        (goto-char (point-min))
+        (re-search-forward "^+(message \"new\")")
+        (beginning-of-line)
+        (setq origin-point (point))
+        (let ((origin-window (selected-window))
+              (origin-count (length (window-list))))
+          (call-interactively #'diffs-review-add-annotation)
+          (setq draft (current-buffer))
+          (should (derived-mode-p 'diffs-review-compose-mode))
+          (should (eq diffs--review-compose-owner owner))
+          (should (eq (command-remapping 'yank)
+                      #'diffs-review-compose-yank))
+          (should (eq (window-parameter nil 'window-side) 'bottom))
+          (should (> (length (window-list)) origin-count))
+          (cl-letf (((symbol-function 'yank-media)
+                     (lambda (&optional _noselect)
+                       (ert-fail "prefixed yank attempted media")))
+                    ((symbol-function 'yank)
+                     (lambda (&optional _argument)
+                       (insert "forced text"))))
+            (let ((this-command 'diffs-review-compose-yank))
+              (diffs-review-compose-yank '(4))
+              (should (eq this-command 'yank))))
+          (should (equal (buffer-string) "forced text"))
+          (erase-buffer)
+          (cl-letf (((symbol-function 'yank-media)
+                     (lambda (&optional _noselect)
+                       (user-error "No image is available")))
+                    ((symbol-function 'yank)
+                     (lambda (&optional _argument)
+                       (insert "Summary line\ncontinues"))))
+            (diffs-review-compose-yank))
+          (insert "\n\nReason one\nreason two")
+          (diffs-review-compose-submit)
+          (should-not (buffer-live-p draft))
+          (should (eq (current-buffer) owner))
+          (should (eq (selected-window) origin-window))
+          (should (= (length (window-list)) origin-count))
+          (should (= (point) origin-point))
+          (let ((annotation (car diffs--review-annotations)))
+            (should (equal (plist-get annotation :summary)
+                           "Summary line\ncontinues"))
+            (should (equal (plist-get annotation :rationale)
+                           "Reason one\nreason two"))))
+        (diffs-minor-mode -1)))))
+
+(ert-deftest diffs-review-composer-removes-a-draft-image ()
+  (should diffs-tests--review-composer-was-lazy)
+  (require 'diffs-review-compose)
+  (with-temp-buffer
+    (diffs-review-compose-mode)
+    (let ((attachment
+           (list :id "diffs-attachment:delete-test"
+                 :label "Image #1"
+                 :bytes 3
+                 :data "png")))
+      (setq diffs--review-compose-attachments (list attachment))
+      (diffs--review-compose-insert-attachment attachment)
+      (let ((attachment-end (point)))
+        (insert " trailing text")
+        (should-not
+         (get-text-property attachment-end
+                            'diffs-review-attachment-id))
+        (goto-char attachment-end))
+      (diffs-review-compose-delete-attachment)
+      (should (equal (buffer-string) " trailing text"))
+      (should-not diffs--review-compose-attachments))))
+
+(ert-deftest diffs-review-image-attachments-stay-in-live-session ()
+  (diffs-tests--with-diff diffs-tests--normal
+    (let ((owner (current-buffer)) draft attachment-id annotation-id)
+      (save-window-excursion
+        (switch-to-buffer owner)
+        (diffs-minor-mode 1)
+        (goto-char (point-min))
+        (re-search-forward "^+(message \"new\")")
+        (beginning-of-line)
+        (call-interactively #'diffs-review-add-annotation)
+        (setq draft (current-buffer))
+        (insert "The screenshot shows the failure.\n\n")
+        (let ((diffs-review-image-max-bytes 1))
+          (should-error
+           (diffs-review-compose-yank-image
+            'image/png diffs-tests--png)
+           :type 'user-error))
+        (should-error
+         (diffs-review-compose-yank-image 'image/png "not an image")
+         :type 'user-error)
+        (should-error
+         (diffs-review-compose-yank-image 'image/jpeg diffs-tests--png)
+         :type 'user-error)
+        (should-error
+         (diffs-review-compose-yank-image
+          'image/png
+          (string-make-unibyte "\x89PNG\r\n\x1a\n"))
+         :type 'user-error)
+        (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                  ((symbol-function 'create-image)
+                   (lambda (&rest _) (error "Injected decoder failure"))))
+          (should-error
+           (diffs-review-compose-yank-image 'image/png diffs-tests--png)
+           :type 'user-error))
+        (cl-letf (((symbol-function 'gui-get-selection)
+                   (lambda (_selection target)
+                     (pcase target
+                       ('TARGETS [image/png])
+                       ('image/png diffs-tests--png)))))
+          (diffs-review-compose-yank))
+        (let ((attachment (car diffs--review-compose-attachments)))
+          (setq attachment-id (plist-get attachment :id))
+          (should (equal (plist-get attachment :mime) "image/png"))
+          (should (equal (buffer-substring-no-properties
+                          (- (point) (length "[Image #1]")) (point))
+                         "[Image #1]"))
+          (should (equal (get-text-property
+                          (1- (point)) 'diffs-review-attachment-id)
+                         attachment-id)))
+        (diffs-review-compose-submit)
+        (should-not (buffer-live-p draft))
+        (should (eq (current-buffer) owner))
+        (let* ((annotation (car diffs--review-annotations))
+               (metadata (car (plist-get annotation :attachments)))
+               (comments
+                (json-parse-string
+                 (diffs-review-comments-json nil "user")
+                 :object-type 'alist :array-type 'list))
+               (comment
+                (car (diffs--review-json-value comments "comments")))
+               (json-metadata
+                (car (diffs--review-json-value comment "attachments")))
+               (payload
+                (json-parse-string
+                 (diffs-review-attachment-json nil attachment-id)
+                 :object-type 'alist)))
+          (setq annotation-id (plist-get annotation :id))
+          (should (equal (plist-get annotation :rationale) "[Image #1]"))
+          (should (equal (plist-get metadata :id) attachment-id))
+          (should (= (length diffs--review-attachments) 1))
+          (should (equal (diffs--review-json-value json-metadata "id")
+                         attachment-id))
+          (should-not (diffs--review-json-value json-metadata "data"))
+          (should (equal
+                   (base64-decode-string
+                    (diffs--review-json-value payload "data"))
+                   diffs-tests--png))
+          (should-error (diffs-review-sidecar-json) :type 'user-error)
+          (diffs-review-remove-comment-json nil annotation-id)
+          (should-not diffs--review-annotations)
+          (should-not diffs--review-attachments))
+        (diffs-minor-mode -1)))))
+
+(ert-deftest diffs-review-owner-kill-discards-its-comment-draft ()
+  (let ((owner (generate-new-buffer " *diffs review owner kill test*"))
+        draft)
+    (unwind-protect
+        (save-window-excursion
+          (with-current-buffer owner
+            (insert diffs-tests--normal)
+            (diff-mode)
+            (diffs-minor-mode 1))
+          (switch-to-buffer owner)
+          (goto-char (point-min))
+          (re-search-forward "^+(message \"new\")")
+          (beginning-of-line)
+          (call-interactively #'diffs-review-add-annotation)
+          (setq draft (current-buffer))
+          (should (buffer-live-p draft))
+          (with-current-buffer owner
+            (set-buffer-modified-p nil)
+            (kill-buffer owner))
+          (should-not (buffer-live-p draft)))
+      (dolist (buffer (list draft owner))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (set-buffer-modified-p nil))
+          (kill-buffer buffer))))))
+
 (ert-deftest diffs-review-multiline-annotation-reports-rendered-height ()
   (pcase-let*
       ((`(,display . ,height)
         (diffs--review-annotation-display
          '(:summary "first\nsecond"
            :rationale "reason one\nreason two"
-           :author "agent\nname"))))
-    (should (= height 5))
-    (should (= height (cl-count ?\n display)))))
+           :author "agent\nname"
+           :source "agent"
+           :file "src/example.el"
+           :new-range (1 2)))))
+    (should (= height 7))
+    (should (= height (cl-count ?\n display)))
+    (should (string-match-p
+             "Agent note · agent name · src/example.el R2" display))
+    (should (eq (get-text-property
+                 (string-match "Agent note" display) 'face display)
+                'diffs-review-annotation-heading))
+    (should (eq (get-text-property
+                 (string-match "first" display) 'face display)
+                'diffs-review-annotation))
+    (should (eq (get-text-property
+                 (string-match "╭" display) 'face display)
+                'diffs-review-annotation-border))))
+
+(ert-deftest diffs-review-annotation-projectors-use-live-pixel-geometry ()
+  (diffs-tests--with-diff diffs-tests--normal
+    (save-window-excursion
+      (switch-to-buffer (current-buffer))
+      (diffs-minor-mode 1)
+      (goto-char (point-min))
+      (re-search-forward "^+(message \"new\")")
+      (beginning-of-line)
+      (diffs-review-add-annotation
+       "[Image #1] mixed 中文 👌\nshort\n中" nil)
+      (pcase-let ((`(,display . ,prefix)
+                   (diffs-tests--review-annotation-projection
+                    "[Image #1] mixed 中文 👌")))
+        (should (> prefix 0))
+        (should
+         (= (diffs-tests--review-annotation-align-position display)
+            (diffs-tests--review-annotation-expected-right-edge
+             display prefix))))
+      (diffs-toggle-split)
+      (pcase-let ((`(,display . ,prefix)
+                   (diffs-tests--review-annotation-projection
+                    "[Image #1] mixed 中文 👌")))
+        (should (> prefix 0))
+        (should
+         (= (diffs-tests--review-annotation-align-position display)
+            (diffs-tests--review-annotation-expected-right-edge
+             display prefix))))
+      (diffs-split-quit)
+      (diffs-minor-mode -1))))
+
+(ert-deftest diffs-review-display-metric-hooks-reproject-annotations ()
+  (diffs-tests--with-diff diffs-tests--normal
+    (save-window-excursion
+      (switch-to-buffer (current-buffer))
+      (diffs-minor-mode 1)
+      (goto-char (point-min))
+      (re-search-forward "^+(message \"new\")")
+      (beginning-of-line)
+      (diffs-review-add-annotation "metric-sensitive-note" nil)
+      (cl-letf (((symbol-function 'string-pixel-width)
+                 (lambda (string &optional _buffer)
+                   (if (string-match-p "╭" string) 211 71))))
+        (run-hooks 'text-scale-mode-hook)
+        (should
+         (= (diffs-tests--review-annotation-align-position
+             (car (diffs-tests--review-annotation-projection
+                   "metric-sensitive-note")))
+            282)))
+      (diffs-toggle-split)
+      (cl-letf (((symbol-function 'string-pixel-width)
+                 (lambda (string &optional _buffer)
+                   (if (string-match-p "╭" string) 241 83))))
+        (run-hooks 'text-scale-mode-hook)
+        (should
+         (= (diffs-tests--review-annotation-align-position
+             (car (diffs-tests--review-annotation-projection
+                   "metric-sensitive-note")))
+            324)))
+      (diffs-split-quit)
+      (diffs-minor-mode -1))))
 
 (ert-deftest diffs-split-clearing-selection-removes-all-selection-face ()
   (let ((buf (generate-new-buffer " *diffs split selection face test*"))
@@ -4418,7 +4848,7 @@
   (let ((buffer
          (generate-new-buffer " *diffs refresh state test*"))
         (next-patch diffs-tests--normal)
-        regenerator session annotation-id generation)
+        regenerator session annotation-id attachment-id generation)
     (unwind-protect
         (with-current-buffer buffer
           (setq default-directory temporary-file-directory)
@@ -4434,6 +4864,18 @@
                  (diffs-review-add-annotation
                   "Keep this review state." "")
                  :id))
+          (let* ((data diffs-tests--png)
+                 (attachment
+                  (list :id "diffs-attachment:refresh-test"
+                        :label "Image #1"
+                        :mime "image/png"
+                        :bytes (string-bytes data)
+                        :sha256 (secure-hash 'sha256 data)
+                        :data data)))
+            (setq attachment-id (plist-get attachment :id)
+                  diffs--review-attachments (list attachment))
+            (setf (plist-get (car diffs--review-annotations) :attachments)
+                  (list (diffs--review-attachment-metadata attachment))))
           (diffs-review-reject-change)
           (setq session diffs--review-session-id
                 generation diffs--review-generation
@@ -4456,6 +4898,12 @@
             (plist-get (car diffs--review-annotations) :id)
             annotation-id))
           (should
+           (equal (plist-get (car diffs--review-attachments) :id)
+                  attachment-id))
+          (should
+           (equal (plist-get (car diffs--review-attachments) :data)
+                  diffs-tests--png))
+          (should
            (eq (plist-get (cdar diffs--review-decisions) :action)
                'reject))
           (should-not
@@ -4467,6 +4915,7 @@
           (should (equal diffs--review-session-id session))
           (should-not diffs--review-selection)
           (should-not diffs--review-annotations)
+          (should-not diffs--review-attachments)
           (should-not diffs--review-decisions))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
@@ -6294,13 +6743,18 @@
     (diffs-minor-mode -1)))
 
 (ert-deftest diffs-review-agent-skill-uses-the-live-session-cli ()
+  (require 'diffs-assets)
   (let ((cli (diffs-review-cli-path))
         (skill (diffs-review-skill-path)))
     (should (file-executable-p cli))
     (with-temp-buffer
       (insert-file-contents skill)
+      (should (equal (buffer-string) diffs--review-skill-content))
       (should (search-forward
                "diffs session review --repo . --include-notes --json"
+               nil t))
+      (should (search-forward
+               "diffs session attachment get --repo . ATTACHMENT_ID"
                nil t))
       (should-not (search-forward
                    "diffs-review-write-json" nil t)))))
@@ -6321,7 +6775,8 @@
         (progn
           (make-directory build t)
           (dolist (file '("diffs.el" "diffs-diff-hl.el"
-                          "diffs-cli.el" "diffs-assets.el"))
+                          "diffs-review-compose.el" "diffs-cli.el"
+                          "diffs-assets.el"))
             (copy-file (expand-file-name file source)
                        (expand-file-name file build)))
           (should-not

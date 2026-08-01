@@ -93,6 +93,7 @@
                   (file &rest arg-overrides))
 (declare-function nerd-icons-octicon "nerd-icons"
                   (icon-name &rest args))
+(declare-function diffs-review-compose "diffs-review-compose")
 (defvar vc-git-program)
 (defvar diff-hl-update-async)
 (defvar diff-hl-show-staged-changes)
@@ -140,10 +141,11 @@ keeps the same text-only labels without signaling an error."
   :group 'diffs)
 
 (defcustom diffs-lazy-threshold 10000
-  "Decorate lazily via jit-lock when the diff has more lines than this.
-Lazy decoration makes huge diffs open instantly.  Set to 0 to
-always decorate lazily, or to `most-positive-fixnum' to always
-decorate eagerly."
+  "Work threshold at which stacked decoration uses jit-lock.
+The line count and the estimated changed-content work are compared
+independently with this value.  Lazy decoration keeps large or
+content-heavy diffs responsive.  Set to 0 to always decorate lazily,
+or to `most-positive-fixnum' to always decorate eagerly."
   :type 'natnum
   :group 'diffs)
 
@@ -156,8 +158,9 @@ this distance when retaining materialized chunks around the viewport."
 
 (defcustom diffs-split-virtualization 'auto
   "Data model used to prepare non-wrapping side-by-side views.
-`auto' uses `paged' when the estimated split row count reaches
-`diffs-split-virtualization-threshold', and `complete' otherwise.
+`auto' uses `paged' when the estimated split row count or changed-content
+work reaches `diffs-split-virtualization-threshold', and `complete'
+otherwise.
 `complete' always builds searchable text and row metadata before
 displaying the view.  `paged' always requests the first-frame path that
 indexes hunks cheaply, corrects their exact heights on first
@@ -172,7 +175,7 @@ decision-aware views continue to use the complete model."
   :group 'diffs)
 
 (defcustom diffs-split-virtualization-threshold 5000
-  "Estimated split rows at which `auto' uses paged rendering.
+  "Estimated split rows or change work at which `auto' uses paging.
 This threshold applies only when `diffs-split-virtualization' is
 `auto'.  Set it to zero to request paged rendering for every eligible
 split view.  Wrapping and decision-aware views always use the complete
@@ -254,6 +257,20 @@ Package-manager build directories need contain only root-level Elisp
 files; these copies therefore remain usable independently of a source
 checkout or package upgrade."
   :type 'directory
+  :group 'diffs)
+
+(defcustom diffs-review-image-max-bytes (* 15 1024 1024)
+  "Maximum accepted byte size of one pasted review image.
+The image remains in the live Emacs review session and is not written
+to disk automatically."
+  :type 'natnum
+  :group 'diffs)
+
+(defcustom diffs-review-image-total-max-bytes (* 64 1024 1024)
+  "Maximum total image bytes retained by one live review session.
+This includes committed comment attachments and the current comment
+draft."
+  :type 'natnum
   :group 'diffs)
 
 (defcustom diffs-line-diff-type 'word-alt
@@ -419,12 +436,16 @@ the background in any theme.")
   "Face for a stable selected diff-line range.")
 
 (defface diffs-review-annotation
-  '((t :inherit font-lock-doc-face))
+  '((t :inherit default))
   "Face for inline review annotation text.")
 
 (defface diffs-review-annotation-border
-  '((t :inherit shadow))
+  '((t :inherit default))
   "Face for inline review annotation borders and metadata.")
+
+(defface diffs-review-annotation-heading
+  '((t :inherit default))
+  "Face for inline review annotation headings.")
 
 (defface diffs-review-decision
   '((t :inherit success))
@@ -526,7 +547,7 @@ the background in any theme.")
 (defvar-local diffs--sections nil
   "List of file-section plists built by `diffs--scan'.
 Each element: (:beg N :block-end N :end N :file S :adds N :dels N
-:index N :width N
+:change-work N :index N :width N
 :hunks ((POS OLD-START NEW-START END CONTEXT OLD-COUNT NEW-COUNT) ...)).")
 
 (defvar-local diffs--section-vector []
@@ -722,6 +743,53 @@ Return (PATH . END), where END is the next position in TEXT."
         diffs--new-raw-content-cache nil
         diffs--source-render-identities nil))
 
+(defun diffs--change-block-work (old-width new-width)
+  "Return normalized comparison work for OLD-WIDTH and NEW-WIDTH."
+  (if (and (> old-width 0) (> new-width 0))
+      (max 1 (/ (+ (* old-width new-width) 6399) 6400))
+    0))
+
+(defun diffs--scan-hunk-stats (hunk-begin hunk-end)
+  "Return (ADDS DELS CHANGE-WORK) for HUNK-BEGIN through HUNK-END.
+CHANGE-WORK is a cheap proxy for corresponding-line and
+within-line comparison.  One unit approximates one pair of 80-character
+lines; individual line widths are capped at 1,000 characters."
+  (let ((adds 0)
+        (dels 0)
+        (old-width 0)
+        (new-width 0)
+        (work 0)
+        last-end)
+    (save-excursion
+      (goto-char hunk-begin)
+      (forward-line 1)
+      (while (re-search-forward "^[-+]" hunk-end t)
+        (let* ((begin (line-beginning-position))
+               (contiguous
+                (or (null last-end)
+                    (= begin last-end)
+                    (save-excursion
+                      (goto-char last-end)
+                      (and (looking-at "^\\\\ No newline")
+                           (= (line-beginning-position 2) begin))))))
+          (unless contiguous
+            (cl-incf work
+                     (diffs--change-block-work old-width new-width))
+            (setq old-width 0
+                  new-width 0))
+          (let ((width
+                 (min 1000
+                      (max 1 (- (line-end-position) begin 1)))))
+            (if (eq (char-after begin) ?-)
+                (progn
+                  (cl-incf dels)
+                  (cl-incf old-width width))
+              (cl-incf adds)
+              (cl-incf new-width width)))
+          (setq last-end (line-beginning-position 2)))))
+    (cl-incf work (diffs--change-block-work old-width new-width))
+    (list adds dels work)))
+
 (defun diffs--scan-section (section-end)
   "Scan the file section starting at point, up to SECTION-END.
 Return a section plist; see `diffs--sections'."
@@ -737,7 +805,7 @@ Return a section plist; see `diffs--sections'."
          (old-file (or (car git-paths)
                        (car marker-paths)
                        file))
-         (adds 0) (dels 0) (max-line 1) hunks)
+         (adds 0) (dels 0) (change-work 0) (max-line 1) hunks)
     (save-excursion
       (while (re-search-forward diffs--hunk-re section-end t)
         (let* ((old (string-to-number (match-string 1)))
@@ -745,20 +813,24 @@ Return a section plist; see `diffs--sections'."
                (new (string-to-number (match-string 3)))
                (newc (if (match-string 4) (string-to-number (match-string 4)) 1))
                (context (string-trim (match-string-no-properties 5)))
+               (hbeg (line-beginning-position))
                (hend (save-excursion
                        (or (and (re-search-forward "^@@ \\|^diff \\|^Index: "
                                                    section-end t)
                                 (line-beginning-position))
                            section-end))))
-          (push (list (line-beginning-position) old new hend context
-                      oldc newc)
-                hunks)
-          (setq max-line (max max-line (+ old oldc) (+ new newc)))
-          (cl-incf adds (count-matches "^\\+" (line-end-position) hend))
-          (cl-incf dels (count-matches "^-" (line-end-position) hend)))))
+          (pcase-let ((`(,hadds ,hdels ,hwork)
+                       (diffs--scan-hunk-stats hbeg hend)))
+            (push (list hbeg old new hend context
+                        oldc newc)
+                  hunks)
+            (setq max-line (max max-line (+ old oldc) (+ new newc)))
+            (cl-incf adds hadds)
+            (cl-incf dels hdels)
+            (cl-incf change-work hwork)))))
     (list :beg beg :block-end block-end :end section-end
           :file file :old-file old-file
-          :adds adds :dels dels
+          :adds adds :dels dels :change-work change-work
           :width (max 2 (length (number-to-string max-line)))
           :hunks (nreverse hunks))))
 
@@ -859,6 +931,11 @@ Return a section plist; see `diffs--sections'."
             diffs--section-vector (vconcat diffs--sections)
             diffs--stats (list nfiles nadds ndels))
       (diffs--build-context-gaps))))
+
+(defun diffs--estimated-change-work ()
+  "Return the cached changed-content work estimate for this review."
+  (cl-loop for section in diffs--sections
+           sum (or (plist-get section :change-work) 0)))
 
 (defun diffs--section-at-pos (position)
   "Return the file section containing POSITION, using binary search."
@@ -1382,7 +1459,8 @@ Raw source remains reusable and active reviews enqueue fresh rendering."
       (with-current-buffer buffer
         (when (and diffs-minor-mode
                    (hash-table-p diffs--source-render-identities))
-          (diffs--reset-owner-source-rendering buffer))))))
+          (diffs--reset-owner-source-rendering buffer)
+          (diffs--review-display-metrics-changed buffer))))))
 
 (add-hook 'enable-theme-functions #'diffs--render-theme-changed)
 (add-hook 'disable-theme-functions #'diffs--render-theme-changed)
@@ -2590,6 +2668,16 @@ non-nil, only apply properties to lines intersecting that region."
               (diffs--decorate-hunk hunk hend sec beg end)))))))
   `(jit-lock-bounds ,beg . ,end))
 
+(defun diffs--lazy-stacked-p ()
+  "Return non-nil when stacked decoration should use jit-lock."
+  (let ((work (diffs--estimated-change-work)))
+    (and (< diffs-lazy-threshold most-positive-fixnum)
+         (or (>= (count-lines (point-min) (point-max))
+                diffs-lazy-threshold)
+             (and (not (eq diffs-line-diff-type 'none))
+                  (> work 0)
+                  (>= work diffs-lazy-threshold))))))
+
 (defun diffs--decorate-setup ()
   "Scan the buffer and set up eager or lazy content decoration."
   (diffs--undecorate)
@@ -2602,7 +2690,7 @@ non-nil, only apply properties to lines intersecting that region."
   ;; `font-lock-mode'.  Jit-lock remains the viewport scheduler for our
   ;; decorator, so eager work here would defeat large-diff virtualization
   ;; before split rendering starts.
-  (if (> (count-lines (point-min) (point-max)) diffs-lazy-threshold)
+  (if (diffs--lazy-stacked-p)
       (jit-lock-register #'diffs--jit-decorate)
     (diffs--decorate-eagerly)))
 
@@ -2693,6 +2781,9 @@ non-nil, only apply properties to lines intersecting that region."
 
 (defvar-local diffs--review-annotations nil
   "Structured review annotations owned by this unified diffs buffer.")
+
+(defvar-local diffs--review-attachments nil
+  "Live binary image attachments owned by this unified diffs buffer.")
 
 (defvar-local diffs--review-decisions nil
   "Change-block resolution decisions owned by this unified diffs buffer.")
@@ -3217,6 +3308,8 @@ hunk headers, and enables outline folding (TAB on headings).
         (setq header-line-format nil)
         (diffs--define-fringe-bitmap)
         (add-hook 'text-scale-mode-hook #'diffs--define-fringe-bitmap nil t)
+        (add-hook 'text-scale-mode-hook
+                  #'diffs--review-display-metrics-changed nil t)
         (add-hook 'kill-buffer-hook #'diffs--split-cache-clear nil t)
         (add-hook 'kill-buffer-hook #'diffs--index-cleanup nil t)
         (add-hook 'kill-buffer-hook #'diffs--token-source-cache-clear nil t)
@@ -3246,6 +3339,8 @@ hunk headers, and enables outline folding (TAB on headings).
         (outline-minor-mode 1))
     (jit-lock-unregister #'diffs--jit-decorate)
     (remove-hook 'text-scale-mode-hook #'diffs--define-fringe-bitmap t)
+    (remove-hook 'text-scale-mode-hook
+                 #'diffs--review-display-metrics-changed t)
     (remove-hook 'kill-buffer-hook #'diffs--split-cache-clear t)
     (remove-hook 'kill-buffer-hook #'diffs--index-cleanup t)
     (remove-hook 'kill-buffer-hook #'diffs--token-source-cache-clear t)
@@ -3834,6 +3929,8 @@ integers before refresh adoption begins."
           (copy-tree (plist-get state :selection))
           diffs--review-annotations
           (copy-tree (plist-get state :annotations))
+          diffs--review-attachments
+          (copy-tree (plist-get state :attachments))
           diffs--review-decisions
           (copy-tree (plist-get state :decisions))
           diffs--review-source-actions
@@ -3862,8 +3959,7 @@ integers before refresh adoption begins."
     (dolist (spec (plist-get state :intraline-overlays))
       (diffs--make-intraline-overlay
        (nth 0 spec) (nth 1 spec) (nth 2 spec)))
-    (when (> (count-lines (point-min) (point-max))
-             diffs-lazy-threshold)
+    (when (diffs--lazy-stacked-p)
       (jit-lock-register #'diffs--jit-decorate))
     (setq diffs--split-cache
           (plist-get state :split-cache)
@@ -4323,8 +4419,9 @@ the hunk's logical separator as the first row."
 (defun diffs--split-estimated-row-count ()
   "Return a cheap approximate row count for an automatic split.
 The estimate uses parsed hunk ranges instead of collecting or aligning
-row text.  It is only a policy threshold; paged rendering builds its own
-chunk index and corrects each chunk's exact height when materialized."
+row text.  Automatic selection compares it with the independently cached
+change-work estimate.  Paged rendering builds its own chunk index and
+corrects each chunk's exact height when materialized."
   (let ((count 0))
     (dolist (section diffs--sections)
       ;; The normal and public custom header paths may suppress a header,
@@ -4364,13 +4461,15 @@ WRAP-LINES is the current wrapping setting."
     (virtualization wrap-lines threshold &optional estimated-row-count)
   "Return non-nil when this split should use paged rendering.
 VIRTUALIZATION is the configured policy, WRAP-LINES is the current
-wrapping setting, and THRESHOLD is the automatic row threshold.
-ESTIMATED-ROW-COUNT reuses a valid cached estimate when supplied."
+wrapping setting, and THRESHOLD is the automatic work threshold.
+ESTIMATED-ROW-COUNT reuses a valid cached row estimate when supplied;
+automatic selection also considers cached changed-content work."
   (and (diffs--split-paged-eligible-p wrap-lines)
        (or (eq virtualization 'paged)
            (and (eq virtualization 'auto)
-                (>= (or estimated-row-count
-                        (diffs--split-estimated-row-count))
+                (>= (max (or estimated-row-count
+                             (diffs--split-estimated-row-count))
+                         (diffs--estimated-change-work))
                     threshold)))))
 
 (defun diffs--split-paged-index ()
@@ -6020,6 +6119,8 @@ and treat the peer as the horizontal source of truth."
   (setq-local cursor-in-non-selected-windows nil)
   (setq-local imenu-create-index-function #'diffs--imenu-create-index)
   (add-hook 'text-scale-mode-hook #'diffs--define-fringe-bitmap nil t)
+  (add-hook 'text-scale-mode-hook
+            #'diffs--review-display-metrics-changed nil t)
   (add-hook 'kill-buffer-hook #'diffs--clear-sticky-headers nil t)
   (add-hook 'pre-command-hook #'diffs--split-pre-command nil t)
   (add-hook 'post-command-hook #'diffs--split-post-command nil t)
@@ -6602,16 +6703,20 @@ error never strands the user in the unified view."
    (or (ignore-errors (vc-root-dir))
        default-directory)))
 
-(defun diffs--review-new-session-id ()
-  "Return a locally unique live review session id."
+(defun diffs--review-new-prefixed-id (prefix length)
+  "Return a locally unique id with PREFIX and hash LENGTH."
   (concat
-   "diffs-session:"
+   prefix
    (substring
     (secure-hash
      'sha1
      (format "%s:%s:%s:%s"
              (float-time) (emacs-pid) (random) (buffer-name)))
-    0 16)))
+    0 length)))
+
+(defun diffs--review-new-session-id ()
+  "Return a locally unique live review session id."
+  (diffs--review-new-prefixed-id "diffs-session:" 16))
 
 (defun diffs--review-ensure-session-state (&optional owner)
   "Initialize live-session identity for OWNER or the current buffer."
@@ -6628,6 +6733,7 @@ error never strands the user in the unified view."
   (with-current-buffer owner
     (list :selection (copy-tree diffs--review-selection)
           :annotations (copy-tree diffs--review-annotations)
+          :attachments (copy-tree diffs--review-attachments)
           :decisions (copy-tree diffs--review-decisions)
           :source-actions (copy-tree diffs--review-source-actions)
           :session-id diffs--review-session-id
@@ -7385,11 +7491,15 @@ Retained entries are rebound to the newly scanned patch generation."
             diffs--review-annotations
             (delq
              nil
-             (mapcar
-              (lambda (annotation)
-                (diffs--review-revalidate-annotation
-                 owner annotation))
-              annotations))
+            (mapcar
+             (lambda (annotation)
+               (diffs--review-revalidate-annotation
+                owner annotation))
+             annotations))
+            diffs--review-attachments
+            (diffs--review-retain-attachments
+             (plist-get state :attachments)
+             diffs--review-annotations)
             diffs--review-decisions (nreverse decisions)
             diffs--review-source-actions source-actions)
       (diffs--review-ensure-session-state owner)
@@ -8304,31 +8414,108 @@ The result is a plist containing `:file', `:side', and `:line'."
   (let ((new-range (plist-get annotation :new-range))
         (old-range (plist-get annotation :old-range)))
     (cond
-     (new-range (cons 'new (cadr new-range)))
-     (old-range (cons 'old (cadr old-range))))))
+      (new-range (cons 'new (cadr new-range)))
+      (old-range (cons 'old (cadr old-range))))))
 
-(defun diffs--review-annotation-display (annotation)
-  "Return (STRING . HEIGHT) for inline ANNOTATION display."
-  (let* ((author (or (plist-get annotation :author)
-                     (plist-get annotation :source)
-                     "review"))
-         (summary (plist-get annotation :summary))
+(defun diffs--review-display-metrics-changed (&optional owner)
+  "Reproject review overlays after display metrics change in OWNER."
+  (when-let* ((owner (or owner (diffs--review-owner-buffer))))
+    (diffs--review-refresh-overlays owner)))
+
+(defun diffs--review-line-prefix-pixel-width (position)
+  "Return the displayed `line-prefix' width at POSITION in pixels."
+  (let ((prefix (get-char-property position 'line-prefix)))
+    (if (stringp prefix)
+        (string-pixel-width prefix (current-buffer))
+      0)))
+
+(defun diffs--review-annotation-display (annotation &optional prefix-pixels)
+  "Return (STRING . HEIGHT) for inline ANNOTATION display.
+PREFIX-PIXELS is the displayed `line-prefix' width inherited by its
+overlay string."
+  (let* ((source
+          (downcase
+           (format "%s" (or (plist-get annotation :source) "review"))))
+         (label
+          (format "%s note"
+                  (if (member source '("agent" "user"))
+                      (capitalize source)
+                    "Review")))
+         (author
+          (when-let* ((value (plist-get annotation :author))
+                      (text
+                       (string-trim
+                        (replace-regexp-in-string
+                         "[[:space:]\n\r]+" " " (format "%s" value)))))
+            (unless (or (string-empty-p text)
+                        (string-equal-ignore-case text source))
+              text)))
+         (target (diffs--review-annotation-target annotation))
+         (file (plist-get annotation :file))
+         (location
+          (when (or file target)
+            (string-join
+             (delq
+              nil
+              (list
+               (and file (diffs--short-display-path file 48))
+               (and target
+                    (format "%s%d"
+                            (if (eq (car target) 'old) "L" "R")
+                            (cdr target)))))
+             " ")))
+         (heading (string-join (delq nil (list label author location))
+                               " · "))
+         (summary (or (plist-get annotation :summary) ""))
          (rationale (plist-get annotation :rationale))
+         (content-lines
+          (append
+           (split-string summary "\n" nil)
+           (when (and rationale (not (string-empty-p rationale)))
+             (cons "" (split-string rationale "\n" nil)))))
+         (width
+          (+ 2
+             (max (string-width heading)
+                  (cl-loop for line in content-lines
+                           maximize (string-width line) into maximum
+                           finally return (or maximum 1)))))
+         (border-face 'diffs-review-annotation-border)
+         (top-left
+          (concat
+           (propertize "  ╭─ " 'face border-face)
+           (propertize heading
+                       'face 'diffs-review-annotation-heading)
+           (propertize
+            (concat
+             " "
+             (make-string (- width (string-width heading) 1) ?─))
+            'face border-face)))
+         (right-position
+          ;; Integer `:align-to' positions use frame columns, which do not
+          ;; follow buffer-local text scaling.  Keep the whole target in
+          ;; current-buffer pixels so every border segment scales together.
+          `(,(+ (or prefix-pixels 0)
+                (string-pixel-width top-left (current-buffer)))))
          (lines
           (append
            (list
             (concat
-             (propertize (format "  ╰─ [%s] " author)
-                         'face 'diffs-review-annotation-border)
-             (propertize summary 'face 'diffs-review-annotation)))
-           (when (and rationale (not (string-empty-p rationale)))
-             (mapcar
-              (lambda (line)
-                (concat
-                 (propertize "     │ " 'face
-                             'diffs-review-annotation-border)
-                 (propertize line 'face 'diffs-review-annotation)))
-              (split-string rationale "\n")))))
+             top-left
+             (propertize "╮" 'face border-face)))
+           (mapcar
+            (lambda (line)
+              (concat
+               (propertize "  │ " 'face border-face)
+               (propertize line 'face 'diffs-review-annotation)
+               (propertize
+                " " 'face 'diffs-review-annotation
+                'display `(space :align-to ,right-position))
+               (propertize "│" 'face border-face)))
+            content-lines)
+           (list
+            (propertize
+             (concat "  ╰" (make-string (+ width 2) ?─) "╯")
+             'face border-face))))
          (display (concat "\n" (string-join lines "\n"))))
     ;; Count rendered lines rather than logical fields: imported or Agent
     ;; text may itself contain newlines, and the peer split column needs an
@@ -8358,7 +8545,10 @@ The result is a plist containing `:file', `:side', and `:line'."
                   (cdr target))))
       (diffs--review-add-annotation-overlay
        position
-       (car (diffs--review-annotation-display annotation))))))
+       (car
+        (diffs--review-annotation-display
+         annotation
+         (diffs--review-line-prefix-pixel-width position)))))))
 
 (defun diffs--review-project-split-annotations (owner annotations)
   "Project OWNER's ANNOTATIONS into the current split buffer."
@@ -8377,8 +8567,11 @@ The result is a plist containing `:file', `:side', and `:line'."
                       (car target)
                       (cdr target))))
                   ((< index (length diffs--split-rows))))
-        (pcase-let* ((`(,display . ,height)
-                      (diffs--review-annotation-display annotation))
+        (pcase-let* ((position (diffs--split-row-position index))
+                     (`(,display . ,height)
+                      (diffs--review-annotation-display
+                       annotation
+                       (diffs--review-line-prefix-pixel-width position)))
                      (string
                       (if (eq role (car target))
                           display
@@ -8386,7 +8579,7 @@ The result is a plist containing `:file', `:side', and `:line'."
                          (make-string height ?\n)
                          'face 'diffs-filler))))
           (diffs--review-add-annotation-overlay
-           (diffs--split-row-position index)
+           position
            string))))))
 
 (defun diffs--review-add-decision-overlay (begin end &rest properties)
@@ -8642,14 +8835,45 @@ both cached split views."
 
 (defun diffs--review-new-id ()
   "Return a locally unique review annotation id."
-  (concat
-   "diffs:"
-   (substring
-    (secure-hash
-     'sha1
-     (format "%s:%s:%s:%s"
-             (float-time) (emacs-pid) (random) (buffer-name)))
-    0 16)))
+  (diffs--review-new-prefixed-id "diffs:" 16))
+
+(defun diffs--review-new-attachment-id ()
+  "Return a locally unique live review attachment id."
+  (diffs--review-new-prefixed-id "diffs-attachment:" 20))
+
+(defun diffs--review-attachment-metadata (attachment)
+  "Return the public metadata subset of ATTACHMENT."
+  (list :id (plist-get attachment :id)
+        :label (plist-get attachment :label)
+        :mime (plist-get attachment :mime)
+        :bytes (plist-get attachment :bytes)
+        :sha256 (plist-get attachment :sha256)))
+
+(defun diffs--review-attachment-total-bytes (attachments)
+  "Return the total byte size of ATTACHMENTS."
+  (cl-loop for attachment in attachments
+           sum (or (plist-get attachment :bytes) 0)))
+
+(defun diffs--review-retain-attachments (attachments annotations)
+  "Return ATTACHMENTS still referenced by ANNOTATIONS."
+  (let ((ids
+         (cl-loop for annotation in annotations
+                  append
+                  (mapcar
+                   (lambda (metadata)
+                     (plist-get metadata :id))
+                   (plist-get annotation :attachments)))))
+    (cl-remove-if-not
+     (lambda (attachment)
+       (member (plist-get attachment :id) ids))
+     attachments)))
+
+(defun diffs--review-attachment-by-id (owner id)
+  "Return the live attachment named ID owned by OWNER."
+  (cl-find id
+           (buffer-local-value 'diffs--review-attachments owner)
+           :key (lambda (attachment) (plist-get attachment :id))
+           :test #'equal))
 
 (defun diffs--review-range (start end)
   "Validate and return inclusive one-based range START through END."
@@ -8659,9 +8883,10 @@ both cached split views."
   (list start end))
 
 (defun diffs--review-annotation-from-selection
-    (selection summary &optional rationale author source)
+    (selection summary &optional rationale author source attachments)
   "Build an annotation from SELECTION with SUMMARY.
-RATIONALE, AUTHOR, and SOURCE provide optional review metadata."
+RATIONALE, AUTHOR, SOURCE, and ATTACHMENTS provide optional review
+metadata."
   (let ((side (plist-get selection :side))
         (range
          (diffs--review-range
@@ -8675,38 +8900,86 @@ RATIONALE, AUTHOR, and SOURCE provide optional review metadata."
           :rationale rationale
           :author author
           :source (or source "user")
+          :attachments
+          (and attachments
+               (mapcar #'diffs--review-attachment-metadata attachments))
           :created-at (format-time-string "%FT%TZ" nil t))))
 
-(defun diffs-review-add-annotation (summary rationale)
-  "Attach a review annotation with SUMMARY and RATIONALE.
-Use the stable selection when present, otherwise select the current
-diff line first."
-  (interactive
-   (list (read-string "Review comment: ")
-         (read-string "Rationale (optional): ")))
-  (when (string-empty-p summary)
-    (user-error "A review comment requires a summary"))
-  (let* ((owner (diffs--review-owner-buffer))
-         (selection
-          (or (and owner
-                   (buffer-local-value 'diffs--review-selection owner))
-              (diffs--review-range-at-point)))
+(defun diffs--review-store-annotation
+    (owner selection summary &optional rationale author source attachments)
+  "Atomically add a review annotation to OWNER.
+SELECTION and SUMMARY are required.  RATIONALE, AUTHOR, SOURCE, and
+ATTACHMENTS provide optional metadata and live image data."
+  (unless (buffer-live-p owner)
+    (user-error "The diffs review is no longer live"))
+  (unless (and (stringp summary) (not (string-empty-p summary)))
+    (user-error "A review comment requires content"))
+  (unless (diffs--review-selection-valid-p owner selection)
+    (user-error "The selected diff lines changed; reopen the comment"))
+  (let* ((before-selection
+          (buffer-local-value 'diffs--review-selection owner))
+         (before-annotations
+          (buffer-local-value 'diffs--review-annotations owner))
+         (before-attachments
+          (buffer-local-value 'diffs--review-attachments owner))
+         (total
+          (+ (diffs--review-attachment-total-bytes before-attachments)
+             (diffs--review-attachment-total-bytes attachments)))
          (annotation
           (diffs--review-annotation-from-selection
            selection summary
-           (unless (string-empty-p rationale) rationale)
-           (or user-full-name user-login-name)
-           "user")))
-    (unless (buffer-live-p owner)
-      (user-error "Not in a diffs review view"))
-    (with-current-buffer owner
-      (unless diffs--review-selection
-        (setq diffs--review-selection selection))
-      (setq diffs--review-annotations
-            (append diffs--review-annotations (list annotation))))
-    (diffs--review-refresh-overlays owner)
-    (message "Added review comment %s" (plist-get annotation :id))
-    annotation))
+           (and rationale (not (string-empty-p rationale)) rationale)
+           author source attachments)))
+    (when (> total diffs-review-image-total-max-bytes)
+      (user-error "Review images exceed the %s session limit"
+                  (file-size-human-readable
+                   diffs-review-image-total-max-bytes)))
+    (dolist (attachment attachments)
+      (when (diffs--review-attachment-by-id
+             owner (plist-get attachment :id))
+        (error "Duplicate review attachment id %s"
+               (plist-get attachment :id))))
+    (condition-case error-data
+        (progn
+          (with-current-buffer owner
+            (unless diffs--review-selection
+              (setq diffs--review-selection selection))
+            (setq diffs--review-annotations
+                  (append diffs--review-annotations (list annotation))
+                  diffs--review-attachments
+                  (append diffs--review-attachments attachments)))
+          (diffs--review-refresh-overlays owner)
+          (message "Added review comment %s" (plist-get annotation :id))
+          annotation)
+      (error
+       (with-current-buffer owner
+         (setq diffs--review-selection before-selection
+               diffs--review-annotations before-annotations
+               diffs--review-attachments before-attachments))
+       (condition-case nil
+           (diffs--review-refresh-overlays owner)
+         (error nil))
+       (signal (car error-data) (cdr error-data))))))
+
+(defun diffs-review-add-annotation (&optional summary rationale)
+  "Attach a review annotation with SUMMARY and RATIONALE.
+Interactively, open the single multiline comment composer.  Lisp callers
+may still supply SUMMARY and RATIONALE to add a text-only annotation
+immediately.  The stable selection is preferred; otherwise use the
+current diff line."
+  (interactive (list :compose nil))
+  (if (eq summary :compose)
+      (progn
+        (require 'diffs-review-compose)
+        (diffs-review-compose))
+    (let* ((owner (diffs--review-owner-buffer))
+           (selection
+            (or (and owner
+                     (buffer-local-value 'diffs--review-selection owner))
+                (diffs--review-range-at-point))))
+      (diffs--review-store-annotation
+       owner selection summary rationale
+       (or user-full-name user-login-name) "user"))))
 
 (defun diffs-review-annotations ()
   "Return a copy of annotations in the current diffs review."
@@ -8717,17 +8990,24 @@ diff line first."
 (defun diffs--review-replace-annotations (owner annotations)
   "Replace OWNER's annotations with ANNOTATIONS atomically.
 Restore the prior state when view projection fails."
-  (let ((before
-         (buffer-local-value 'diffs--review-annotations owner)))
+  (let* ((before
+          (buffer-local-value 'diffs--review-annotations owner))
+         (before-attachments
+          (buffer-local-value 'diffs--review-attachments owner))
+         (attachments
+          (diffs--review-retain-attachments
+           before-attachments annotations)))
     (condition-case error-data
         (progn
           (with-current-buffer owner
-            (setq diffs--review-annotations annotations))
+            (setq diffs--review-annotations annotations
+                  diffs--review-attachments attachments))
           (diffs--review-refresh-overlays owner)
           annotations)
       (error
        (with-current-buffer owner
-         (setq diffs--review-annotations before))
+         (setq diffs--review-annotations before
+               diffs--review-attachments before-attachments))
        (condition-case nil
            (diffs--review-refresh-overlays owner)
          (error nil))
@@ -9043,6 +9323,15 @@ When SECTION is non-nil, require the annotation target to belong to it."
            annotations))))
     (nreverse annotations)))
 
+(defun diffs--review-attachment-json-object (attachment)
+  "Return an alist JSON metadata object for ATTACHMENT."
+  (list
+   (cons "id" (plist-get attachment :id))
+   (cons "label" (plist-get attachment :label))
+   (cons "mime" (plist-get attachment :mime))
+   (cons "bytes" (plist-get attachment :bytes))
+   (cons "sha256" (plist-get attachment :sha256))))
+
 (defun diffs--review-annotation-json-object (annotation)
   "Return an alist JSON object for ANNOTATION."
   (delq
@@ -9062,6 +9351,12 @@ When SECTION is non-nil, require the annotation target to belong to it."
          (cons "author" (plist-get annotation :author)))
     (and (plist-get annotation :source)
          (cons "source" (plist-get annotation :source)))
+    (and (plist-get annotation :attachments)
+         (cons
+          "attachments"
+          (vconcat
+           (mapcar #'diffs--review-attachment-json-object
+                   (plist-get annotation :attachments)))))
     (and (plist-get annotation :tags)
          (cons "tags" (vconcat (plist-get annotation :tags))))
     (and (plist-get annotation :confidence)
@@ -9077,6 +9372,12 @@ When SECTION is non-nil, require the annotation target to belong to it."
     (unless (buffer-live-p owner)
       (user-error "Not in a diffs review view"))
     (with-current-buffer owner
+      (when (cl-some
+             (lambda (annotation)
+               (plist-get annotation :attachments))
+             diffs--review-annotations)
+        (user-error
+         "Image comments are live-session only and cannot use a Hunk sidecar"))
       (let (files)
         (dolist (section diffs--sections)
           (let* ((path (plist-get section :file))
@@ -9181,6 +9482,25 @@ than choosing silently when multiple sessions match."
             "Multiple live diffs reviews match %s; use a session id"
             (or selector "the current context"))))))))
 
+(defun diffs-review-attachment-json (selector id)
+  "Return the attachment named ID from live review SELECTOR as JSON.
+The result includes attachment metadata and base64 data.  This explicit
+API is intended for `diffs session attachment get'; normal review and
+comment JSON never embeds binary payloads."
+  (unless (and (stringp id) (not (string-empty-p id)))
+    (user-error "Attachment id must be a non-empty string"))
+  (let* ((owner (diffs--review-resolve-owner selector))
+         (attachment (diffs--review-attachment-by-id owner id)))
+    (unless attachment
+      (user-error "No live review attachment matches %s" id))
+    (diffs--review-json-serialize
+     (append
+      (diffs--review-attachment-json-object attachment)
+      (list
+       (cons "data"
+             (base64-encode-string
+              (plist-get attachment :data) t)))))))
+
 (defun diffs--review-session-json-object (owner)
   "Return compact live-session JSON metadata for OWNER."
   (with-current-buffer owner
@@ -9196,6 +9516,7 @@ than choosing silently when multiple sessions match."
            (cons "revision" diffs--revision))
       (cons "files" (length diffs--sections))
       (cons "annotations" (length diffs--review-annotations))
+      (cons "attachments" (length diffs--review-attachments))
       (cons "decisions" (length diffs--review-decisions))
       (and diffs--review-selection
            (cons

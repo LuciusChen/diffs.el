@@ -101,8 +101,9 @@ CURRENT is the selector already parsed, if any."
 (defun diffs-cli--parse-common (allowed)
   "Parse common options listed in ALLOWED.
 Return a plist with selector, json, patch, notes, file, type, focus,
-stdin, and yes values."
-  (let (selector json patch notes file type focus stdin yes positionals)
+stdin, yes, and output values."
+  (let (selector json patch notes file type focus stdin yes output
+                 positionals)
     (while diffs-cli--args
       (let ((argument (diffs-cli--take)))
         (pcase argument
@@ -143,6 +144,10 @@ stdin, and yes values."
            (unless (memq 'yes allowed)
              (diffs-cli--fail "unexpected option %s" argument))
            (setq yes t))
+          ("--output"
+           (unless (memq 'output allowed)
+             (diffs-cli--fail "unexpected option %s" argument))
+           (setq output (diffs-cli--take-value argument)))
           ((pred (lambda (value)
                    (string-prefix-p "-" value)))
            (diffs-cli--fail "unknown option %s" argument))
@@ -150,6 +155,7 @@ stdin, and yes values."
            (push argument positionals)))))
     (list :selector selector :json json :patch patch :notes notes
           :file file :type type :focus focus :stdin stdin :yes yes
+          :output output
           :positionals (nreverse positionals))))
 
 (defun diffs-cli--print-session-list (json compact)
@@ -161,11 +167,13 @@ stdin, and yes values."
           (princ "No live diffs sessions.\n")
         (dolist (session sessions)
           (princ
-           (format "%s  %s  %d files  %d comments\n"
+           (format "%s  %s  %d files  %d comments  %d images\n"
                    (diffs-cli--json-value session 'id)
                    (diffs-cli--json-value session 'repository)
                    (diffs-cli--json-value session 'files)
-                   (diffs-cli--json-value session 'annotations))))))))
+                   (diffs-cli--json-value session 'annotations)
+                   (or (diffs-cli--json-value session 'attachments)
+                       0))))))))
 
 (defun diffs-cli--session-list ()
   "Run `diffs session list'."
@@ -258,6 +266,67 @@ stdin, and yes values."
                   (plist-get options :type)))))
       (diffs-cli--print-json result (plist-get options :json)))))
 
+(defun diffs-cli--attachment-get ()
+  "Run `diffs session attachment get'."
+  (let* ((options
+          (diffs-cli--parse-common '(selector output)))
+         (positionals (plist-get options :positionals))
+         (output (plist-get options :output)))
+    (unless (= (length positionals) 1)
+      (diffs-cli--fail "attachment get requires one attachment id"))
+    (unless output
+      (diffs-cli--fail "attachment get requires --output FILE"))
+    (let* ((attachment
+            (diffs-cli--parsed-json
+             (diffs-cli--eval
+              (list 'diffs-review-attachment-json
+                    (plist-get options :selector)
+                    (car positionals)))))
+           (encoded (diffs-cli--json-value attachment 'data))
+           (expected-bytes (diffs-cli--json-value attachment 'bytes))
+           (expected-hash (diffs-cli--json-value attachment 'sha256)))
+      (unless (and (stringp encoded)
+                   (integerp expected-bytes)
+                   (stringp expected-hash))
+        (diffs-cli--fail "the live attachment response is incomplete"))
+      (let* ((data
+              (condition-case error-data
+                  (base64-decode-string encoded)
+                (error
+                 (diffs-cli--fail
+                  "invalid attachment data: %s"
+                  (error-message-string error-data)))))
+             (target (expand-file-name output))
+             (directory (file-name-directory target)))
+        (unless (= (string-bytes data) expected-bytes)
+          (diffs-cli--fail "attachment byte count does not match metadata"))
+        (unless (equal (secure-hash 'sha256 data) expected-hash)
+          (diffs-cli--fail "attachment checksum does not match metadata"))
+        (when (file-exists-p target)
+          (diffs-cli--fail "refusing to overwrite %s" target))
+        (unless (file-directory-p directory)
+          (diffs-cli--fail "output directory does not exist: %s" directory))
+        (let (temporary)
+          (condition-case error-data
+              (unwind-protect
+                  (progn
+                    (setq temporary
+                          (make-temp-file
+                           (expand-file-name
+                            ".diffs-attachment-" directory)))
+                    (let ((coding-system-for-write 'no-conversion))
+                      (write-region data nil temporary nil 'silent))
+                    (rename-file temporary target nil)
+                    (setq temporary nil))
+                (when (and temporary (file-exists-p temporary))
+                  (delete-file temporary)))
+            (file-error
+             (diffs-cli--fail
+              "cannot write %s: %s"
+              target (error-message-string error-data)))))
+        (princ
+         (format "Wrote %s (%d bytes)\n" target expected-bytes))))))
+
 (defun diffs-cli--usage ()
   "Print the diffs live-session CLI usage."
   (princ
@@ -275,7 +344,9 @@ stdin, and yes values."
     "        [--repo PATH | --session ID] COMMENT_ID [--json]\n"
     "  diffs [--server NAME] session comment clear\n"
     "        [--repo PATH | --session ID] [--file PATH]\n"
-    "        [--type all|user|agent] --yes [--json]\n")))
+    "        [--type all|user|agent] --yes [--json]\n"
+    "  diffs [--server NAME] session attachment get\n"
+    "        [--repo PATH | --session ID] ATTACHMENT_ID --output FILE\n")))
 
 (defun diffs-cli--main ()
   "Dispatch the diffs live-session CLI."
@@ -291,6 +362,11 @@ stdin, and yes values."
   (pcase (diffs-cli--take)
     ("list" (diffs-cli--session-list))
     ("review" (diffs-cli--session-review))
+    ("attachment"
+     (pcase (diffs-cli--take)
+       ("get" (diffs-cli--attachment-get))
+       (command
+        (diffs-cli--fail "unknown attachment command %s" command))))
     ("comment"
      (pcase (diffs-cli--take)
        ("list" (diffs-cli--comment-list))
@@ -303,7 +379,10 @@ stdin, and yes values."
      (diffs-cli--fail "unknown session command %s" command))))
 
 (unless (bound-and-true-p byte-compile-current-file)
-  (diffs-cli--main))
+  (diffs-cli--main)
+  ;; Do not let `--script' reinterpret its still-present CLI arguments as
+  ;; file names after our separate parser has consumed them.
+  (kill-emacs 0))
 
 (provide 'diffs-cli)
 ;;; diffs-cli.el ends here

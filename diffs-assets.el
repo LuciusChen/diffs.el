@@ -50,18 +50,34 @@ scraping the buffer.
    `accept`/`reject` choices. Treat them as review intent; do not change
    the underlying source unless the user separately requests it.
 
-3. Request raw patch text only when the compact structure and source
+3. A human comment can include `attachments` metadata and an
+   `[Image #N]` placeholder. Retrieve every relevant image explicitly,
+   then inspect the written image with the agent's image-reading
+   capability:
+
+   ```sh
+   diffs session attachment get --repo . ATTACHMENT_ID --output /tmp/diffs-review-image.png
+   ```
+
+   Choose a suffix matching the attachment MIME metadata and use a new
+   temporary output path because the CLI refuses to overwrite files.
+   After inspection, delete that caller-owned file unless the user asks
+   to retain it. The session copy exists only while its live Emacs review
+   remains open. Do not infer image contents from the placeholder or
+   metadata.
+
+4. Request raw patch text only when the compact structure and source
    files are insufficient:
 
    ```sh
    diffs session review --repo . --include-patch --include-notes --json
    ```
 
-4. Navigate conceptually by `filePath` plus one-based `oldRange` or
+5. Navigate conceptually by `filePath` plus one-based `oldRange` or
    `newRange`. Keep findings concise and anchored to the side where the
    issue exists.
 
-5. Apply one validated batch over stdin:
+6. Apply one validated batch over stdin:
 
    ```sh
    printf '%s\\n' \\
@@ -69,7 +85,7 @@ scraping the buffer.
      | diffs session comment apply --repo . --stdin --focus --json
    ```
 
-6. Use the returned comment ids for cleanup when necessary:
+7. Use the returned comment ids for cleanup when necessary:
 
    ```sh
    diffs session comment list --repo . --type agent --json
@@ -102,6 +118,8 @@ finding and `rationale` for impact or reasoning.
   comments.
 - Read `--type user` notes before changing code; they are the user's
   instructions attached in Emacs.
+- Retrieve and inspect relevant image attachments before acting on a
+  comment that cites them.
 - Treat the returned ids as session-local annotation identities.
 - Do not edit the underlying patch or source unless the user separately
   asks for fixes.

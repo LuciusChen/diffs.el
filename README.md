@@ -25,7 +25,7 @@ Alternatively, clone the repository, add its directory to `load-path`, and load 
 
 ## Why diffs.el
 
-- No renderer subprocess and no ANSI parsing. (The commands still use VC/Git or the configured `diff-command` to produce their input.) A 22k-line / 800-file review scans in about 21 ms and prepares stacked rendering in about 33 ms; on large diffs decorations are applied lazily through jit-lock, so only what you see is rendered.
+- No renderer subprocess and no ANSI parsing. (The commands still use VC/Git or the configured `diff-command` to produce their input.) A 22k-line / 800-file review scans in about 23 ms and prepares stacked rendering in about 33 ms; on large diffs decorations are applied lazily through jit-lock, so only what you see is rendered.
 - The diff text is never modified: `diff-goto-source` (`RET`), isearch, `diff-apply-hunk`, and the rest of `diff-mode` keep working; line numbers live in `line-prefix`, so copying and searching stay clean.
 - Theme-native: everything inherits from the standard `diff-*` faces.
 - Revision-aware syntax highlighting: the old side is fontified from the file contents at the reference revision.
@@ -71,7 +71,7 @@ Source navigation remains side-specific: `RET` or `M-RET` on the left visits the
 | `e` | Reveal more unchanged context |
 | `TAB` | Fold or unfold a hunk in stacked view |
 | `v` / `x` | Select / clear a stable review range |
-| `a` | Add a comment to the selected range |
+| `a` | Open the comment composer for the selected range |
 | `[` / `]` | Previous / next comment |
 | `A` / `R` / `U` | Accept / reject / reset a change block |
 | `C-c C-c` | Apply reviewed decisions without saving or staging |
@@ -112,13 +112,15 @@ Two-way and diff3 markers are supported. For diff3 input, Base remains visible w
 
 Press `v` on a changed line to select that old- or new-side source line. For a range, activate a normal Emacs region (`C-SPC`), extend it over changed lines on the same file and side, then press `v`. The stored selection is a one-based file/side/line range rather than a buffer position, so it survives stacked/split switches and context rebuilds.
 
-Press `a` to add a summary and optional rationale. Comments render below their target line; in split view the peer column receives an invisible equal-height spacer, so later code stays aligned. Use `[` and `]` to navigate comments, `x` to clear only the selection, and `M-x diffs-review-remove-annotation` or `M-x diffs-review-clear-annotations` to remove comments.
+Press `a` to open one editable comment buffer at the bottom of the frame. Its first paragraph becomes the summary; text after the first blank line becomes the optional rationale. The buffer uses ordinary `text-mode` editing: `C-c C-c` submits and restores the review windows, while `C-c C-k` cancels. Comments render below their target line as framed note boxes with normal foreground text and an exact file plus L/R line anchor; redisplay-aligned padding keeps the border aligned around mixed CJK, Emoji, and image placeholders, and is recomputed after text scaling or a theme transition. They do not reuse the source-code comment face or compete with syntax-highlight colors. In split view the peer column receives an invisible equal-height spacer, so later code stays aligned. Use `[` and `]` to navigate comments, `x` to clear only the selection, and `M-x diffs-review-remove-annotation` or `M-x diffs-review-clear-annotations` to remove comments.
 
-Comments are buffer-local state owned by the live review session. Quitting the complete review with `q` ends that session and discards comments that were not explicitly persisted. `M-x diffs-review-export` writes a Hunk-compatible version-1 sidecar using `oldRange`/`newRange`; `M-x diffs-review-import` restores it only after validating every known field and old/new target against the current diff. Unknown fields are ignored for compatibility with newer producers, and an annotation may carry both old and new ranges. An invalid import or display failure leaves existing comments intact.
+The normal yank/paste command in the composer prefers an available clipboard image and otherwise inserts text normally; use a prefix argument such as `C-u C-y` to bypass media detection and force an ordinary text yank. An image appears in the draft and rendered comment as `[Image #N]`; use `C-c C-d` on its draft placeholder to remove it. Image MIME must agree with the detected container, graphical sessions decode it once before acceptance, byte limits are enforced, and retained data lives only in the review owner or current draft—never in a default cache or implicit temporary file.
+
+Comments and image bytes are buffer-local state owned by the live review session. Quitting the complete review with `q` ends that session and discards them. `M-x diffs-review-export` writes text-only comments as a Hunk-compatible version-1 sidecar using `oldRange`/`newRange`; when any comment has an image, export refuses explicitly because Hunk version 1 has no attachment field, rather than dropping the image or embedding base64. `M-x diffs-review-import` restores text comments only after validating every known field and old/new target against the current diff. Unknown fields are ignored for compatibility with newer producers, and an annotation may carry both old and new ranges. An invalid import or display failure leaves existing comments intact.
 
 ### Live Agent sessions
 
-Code agents can read human comments and write their own directly against the live owner buffer. No sidecar, cache, or temporary export is involved. Start the normal Emacs server with `M-x server-start`, then run:
+Code agents can read human comments and write their own directly against the live owner buffer. Normal session reads use no sidecar, cache, or temporary export. Start the normal Emacs server with `M-x server-start`, then run:
 
 ```sh
 diffs session list --json
@@ -127,6 +129,14 @@ diffs session comment list --repo . --type user --json
 ```
 
 Each live review has a stable `diffs-session:…` id for the lifetime of its owner buffer. `--repo` selects the matching repository when there is only one session; use `--session ID` when the same repository has multiple reviews. Review snapshots also include the user's pending accept/reject decisions per file.
+
+Comment JSON exposes image label, MIME type, byte count, SHA-256, and session-local attachment id, but never embeds base64. An Agent or other client retrieves an image only when it needs to inspect it, choosing a new output path because the CLI refuses overwrites:
+
+```sh
+diffs session attachment get --repo . ATTACHMENT_ID --output /tmp/diffs-review-image.png
+```
+
+The command reads the binary from the selected live Emacs session, verifies its byte count and checksum, then atomically writes the requested path. It stops working as soon as the owner review is closed. The bundled skill performs this retrieval before interpreting a comment that cites `[Image #N]`, then removes its caller-owned temporary copy after inspection unless the user asks to retain it.
 
 Agents write one atomic stdin batch:
 
@@ -156,7 +166,7 @@ Emacs owns the live data. From a stacked or split review, `(diffs-review-annotat
 
 `SELECTOR` may be a live `diffs-session:…` id, a repository directory, or a working directory. A `nil` selector prefers the current review and otherwise succeeds only when exactly one live review exists. `TYPE` accepts `all`, `user`, or `agent`, as either a string or symbol. `FILE` is an optional current diff path. JSON-returning functions produce compact JSON strings and signal `user-error` rather than choosing silently when a selector is missing or ambiguous.
 
-Annotation plists use `:id`, `:file`, inclusive one-based `:old-range`/`:new-range`, `:summary`, and optional `:rationale`, `:author`, `:source`, `:tags`, `:confidence`, `:created-at`, and `:updated-at` fields. JSON comment objects expose the corresponding camel-case fields plus `filePath`; absent optional values are omitted.
+Annotation plists use `:id`, `:file`, inclusive one-based `:old-range`/`:new-range`, `:summary`, and optional `:rationale`, `:author`, `:source`, `:attachments`, `:tags`, `:confidence`, `:created-at`, and `:updated-at` fields. Each `:attachments` entry contains only `:id`, `:label`, `:mime`, `:bytes`, and `:sha256`; binary data remains private owner state. JSON comment objects expose the corresponding camel-case fields plus `filePath`, likewise without binary payloads; absent optional values are omitted.
 
 | Function | Result or effect |
 |---|---|
@@ -165,6 +175,7 @@ Annotation plists use `:id`, `:file`, inclusive one-based `:old-range`/`:new-ran
 | `(diffs-review-sessions-json)` | Describe every live review session |
 | `(diffs-review-json SELECTOR INCLUDE-PATCH INCLUDE-NOTES)` | Describe files, hunks, decisions, selection, and optionally raw patches and annotations in one live review |
 | `(diffs-review-comments-json SELECTOR TYPE FILE)` | Return filtered live comments |
+| `(diffs-review-attachment-json SELECTOR ID)` | Return metadata and base64 for one explicitly requested live attachment |
 | `(diffs-review-apply-comments-json JSON SELECTOR FOCUS)` | Validate and atomically add one non-empty Agent comment batch; optionally navigate to its first comment |
 | `(diffs-review-remove-comment-json SELECTOR ID)` | Remove one session-local comment id |
 | `(diffs-review-clear-comments-json SELECTOR FILE TYPE)` | Remove matching live comments and return their ids |
@@ -194,7 +205,7 @@ Long lines are truncated by default and support horizontal scrolling. Horizontal
 
 Small split reviews bulk-insert complete old/new text, so normal isearch, copying, source navigation, and scrollbar semantics work immediately. Expensive visual work—line backgrounds, gutters, fringe bars, source syntax, and within-line emphasis—is materialized only for the viewport plus `diffs-split-overscan`, and both columns are updated together while scrolling. Large stacked buffers retain this lazy path even when `so-long-mode` or another large-buffer policy disables `font-lock-mode`. Completed rows and the rendered pair are cached, so returning to a split with the same width is effectively immediate.
 
-`diffs-split-virtualization` defaults to `auto`: non-wrapping unresolved reviews at or above `diffs-split-virtualization-threshold` use the paged model, while smaller reviews use `complete`. Paged rendering cheaply estimates hunk heights, keeps a newline skeleton for native scrolling, and materializes only nearby chunks in both columns; content-based alignment corrects an estimate atomically when that chunk first appears, and cold chunks are evicted again. Standard isearch, copying, and review commands first build and bulk-install one exact complete projection so they continue to see offscreen text. Wrapped and decision-aware views automatically use the complete model. Set the policy explicitly to `complete` or `paged` to override automatic size selection. Direct Lisp consumers that inspect an active paged split with `buffer-string` or `search-forward` before an interactive search/copy command see only materialized chunks.
+`diffs-split-virtualization` defaults to `auto`: non-wrapping unresolved reviews use the paged model when either their estimated split rows or their changed-content work reaches `diffs-split-virtualization-threshold`; smaller reviews use `complete`. The work estimate is collected during the normal linear scan and approximates correspondence/refinement cost from contiguous replacement sizes and line lengths, so a small but computationally expensive review is not mistaken for a cheap one. Paged rendering keeps a newline skeleton for native scrolling and materializes only nearby chunks in both columns; content-based alignment corrects an estimate atomically when that chunk first appears, and cold chunks are evicted again. Standard isearch, copying, and review commands first build and bulk-install one exact complete projection so they continue to see offscreen text. Wrapped and decision-aware views automatically use the complete model. Set the policy explicitly to `complete` or `paged` to override automatic selection. Direct Lisp consumers that inspect an active paged split with `buffer-string` or `search-forward` before an interactive search/copy command see only materialized chunks.
 
 ## Within-line changes
 
@@ -283,32 +294,45 @@ All options belong to the `diffs` customization group.
 | `diffs-line-pair-threshold` | `0.6` | Maximum normalized edit distance for corresponding lines |
 | `diffs-line-pair-limit` | `64` | Largest change block per side using global alignment |
 
+### Review comments
+
+| Option | Default | Purpose |
+|---|---:|---|
+| `diffs-review-image-max-bytes` | 15 MiB | Largest accepted pasted image |
+| `diffs-review-image-total-max-bytes` | 64 MiB | Total image data retained by one live review, including its current draft |
+
 ### Large-review rendering
 
 | Option | Default | Purpose |
 |---|---:|---|
-| `diffs-lazy-threshold` | `10000` | Start applying stacked decorations through jit-lock |
-| `diffs-split-virtualization` | `auto` | Choose by estimated split size, or force `complete`/`paged` |
-| `diffs-split-virtualization-threshold` | `5000` | Estimated split rows at which `auto` selects `paged` |
+| `diffs-lazy-threshold` | `10000` | Use jit-lock when stacked line count or changed-content work reaches the threshold |
+| `diffs-split-virtualization` | `auto` | Choose from estimated rows/work, or force `complete`/`paged` |
+| `diffs-split-virtualization-threshold` | `5000` | Estimated split rows or changed-content work at which `auto` selects `paged` |
 | `diffs-split-overscan` | `60` | Extra split rows prepared above and below the viewport |
 | `diffs-render-cache-limit` | `64` | Shared syntax-rendered source revisions retained globally |
 | `diffs-syntax-idle-delay` | `0.05` | Idle delay before one queued source revision is fontified |
 
 The Agent installer destinations are controlled by `diffs-review-cli-install-path`, `diffs-review-skill-install-directory`, and `diffs-review-assets-directory`.
 
-On an M-series Mac running Emacs 32, the included synthetic benchmark (800 files, 22,000 lines, 536 KB) measures about 21 ms for scanning, 33 ms for lazy stacked setup, 2 ms to materialize its first viewport, 60 ms for the first side-by-side render, 21 ms to materialize a first deep split viewport, and 5 ms for a cached toggle. The default `auto` policy selects paged rendering for this fixture. These measurements include line numbers, fringe bars, source syntax, and native corresponding-line/word refinement with the default non-wrapping split. The same fixture exercises the public split-view `A` and `R` decision path at about 269 ms and 326 ms. Run it on your machine with:
+On an M-series Mac running Emacs 32, the volume benchmark (800 files, 22,000 lines, 536 KB) measures about 23 ms for scanning, 33 ms for lazy stacked setup, 2 ms to materialize its first viewport, 59 ms for the first side-by-side render, 21 ms to materialize a first deep split viewport, and 5 ms for a cached toggle. The default `auto` policy selects paged rendering for this fixture. This profile isolates file indexing, virtualization, projection, and decision-rebuild scaling; its public split-view `A` and `R` paths measure about 264 ms and 314 ms.
+
+The same default command also runs a content-complexity profile with multiple hunks per file, unequal and reordered 9–15-line replacement blocks, token-rich punctuation and camelCase identifiers, CJK, combining characters, emoji, and guarded 1,000+ character replacements. Its 16-file, 1,514-line, 313 KB fixture has only 1,514 physical lines but an estimated 51,987 units of changed-content work, so `auto` correctly selects lazy stacked decoration and paged split rendering. It measures about 15 ms for stacked setup, 105 ms for the first 100-line stacked viewport, 72 ms for the first split, 283 ms for a first deep viewport, 19 ms for a cached toggle, and 618 ms when an operation explicitly requests the complete searchable projection. It separately reports one cold hunk at about 13 ms for line pairing and 18 ms for pairing plus within-line refinement.
+
+Run both profiles on your machine with:
 
 ```sh
 make benchmark
 ```
 
-The large tier uses 4,000 files and 110,000 lines to expose scaling defects hidden by the default fixture. The automatic paged path currently measures about 102 ms for scanning, 141 ms for stacked setup, 3 ms for its first viewport, 182 ms for the first split, 22 ms for a deep split viewport, 6 ms for a cached toggle, and 1.23/1.54 seconds for `A`/`R`. Run it after changing row collection, physical indexing, viewport lookup, or decision rebuilding:
+Run only the complex-content profile with `make benchmark-complex`.
+
+The large volume tier uses 4,000 files and 110,000 lines to expose scaling defects hidden by the default volume fixture. The automatic paged path currently measures about 102 ms for scanning, 141 ms for stacked setup, 3 ms for its first viewport, 182 ms for the first split, 22 ms for a deep split viewport, 6 ms for a cached toggle, and 1.23/1.54 seconds for `A`/`R`. Run it after changing row collection, physical indexing, viewport lookup, or decision rebuilding:
 
 ```sh
 make benchmark-large
 ```
 
-Set `DIFFS_BENCH_VIRTUALIZATION=complete` or `DIFFS_BENCH_VIRTUALIZATION=paged` to force either model. The complete path currently takes about 218 ms / 1.08 seconds for the first split and 1.0/2.6 ms for a cached toggle on the default/large tiers. The automatic paged pair upgrades to its exact searchable projection in about 280 ms / 1.36 seconds; subsequent search and copy operations reuse it. Decision timings remain near the complete model because decisions deliberately fall back to it.
+Set `DIFFS_BENCH_VIRTUALIZATION=complete` or `DIFFS_BENCH_VIRTUALIZATION=paged` to force either model. The complete path currently takes about 218 ms / 1.08 seconds for the first split and 1.0/2.6 ms for a cached toggle on the volume and large-volume tiers. The automatic paged pair upgrades to its exact searchable projection in about 280 ms / 1.36 seconds; subsequent search and copy operations reuse it. Decision timings remain near the complete model because decisions deliberately fall back to it.
 
 ## Integrations
 
