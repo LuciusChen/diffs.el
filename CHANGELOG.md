@@ -2,6 +2,7 @@
 
 ## Unreleased (0.13.0)
 
+- Present independently selected files as neutral A/B inputs: stacked headers show both labeled paths, complete/paged/sticky split headers show only their own side, comments use the corresponding path and A/B coordinate, and apply confirmation names file B while the stable old/new review and Agent APIs remain unchanged.
 - Replace minibuffer comment entry with one bottom-side `text-mode` composer that maps the first paragraph to summary and later text to rationale, supports submit/cancel without disturbing the review layout, and preserves only one draft per live owner.
 - Accept MIME-matched, structurally screened clipboard images as `[Image #N]` live-session comment attachments with graphical decode validation, draft removal, and configurable byte limits. Normal review JSON exposes metadata without base64, `diffs session attachment get` verifies and atomically writes an explicitly requested binary for Agents, owner shutdown frees draft and committed data, and Hunk sidecar export refuses instead of silently dropping images.
 - Render inline review comments as framed note boxes with normal foreground text plus a file/L-or-R-line anchor, instead of inheriting the source-code documentation-comment face or competing with syntax-highlight colors.

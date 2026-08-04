@@ -299,6 +299,16 @@
                     (null (cdr align)))))
     (car align)))
 
+(defun diffs-tests--assert-file-comparison-side-header
+    (header label own-suffix peer-suffix)
+  "Assert HEADER uses LABEL and OWN-SUFFIX, but not PEER-SUFFIX."
+  (should
+   (string-match-p
+    (format "\\`%s · .*%s" label (regexp-quote own-suffix))
+    header))
+  (should-not
+   (string-match-p (regexp-quote peer-suffix) header)))
+
 (defun diffs-tests--review-annotation-expected-right-edge (display prefix)
   "Return expected right-border pixels for DISPLAY after PREFIX."
   (let ((corner (string-match "╮" display)))
@@ -2331,26 +2341,49 @@
                    (equal
                     (append (diffs--section-lines section 'new) nil)
                     '("before" "(setq value 'new)" "after")))
-                  (should
-                   (string-match-p
-                    (regexp-quote
-                     "…/old/sample.el → …/new/sample.el")
-                    (diffs--file-header section 'split)))))
+                  (let ((stacked-header
+                         (diffs--file-header section 'stacked)))
+                    (should
+                     (string-match-p
+                      "A · .*old/sample\\.el → B · .*new/sample\\.el"
+                      stacked-header)))
+                  (pcase-let* ((`(,chunks ,_anchors ,_count)
+                                 (diffs--split-paged-index))
+                                (rows
+                                 (diffs--split-paged-chunk-rows
+                                  (aref chunks 0)))
+                                (old-header (car (aref (nth 0 rows) 0)))
+                                (new-header (car (aref (nth 1 rows) 0))))
+                    (diffs-tests--assert-file-comparison-side-header
+                     old-header "A" "old/sample.el" "new/sample.el")
+                    (diffs-tests--assert-file-comparison-side-header
+                     new-header "B" "new/sample.el" "old/sample.el"))))
               (let* ((cache
                       (buffer-local-value 'diffs--split-cache owner))
                      (old-view (plist-get cache :old))
                      (new-view (plist-get cache :new)))
                 (dolist (spec
-                         (list (list old-view 'del old)
-                               (list new-view 'add new)))
-                  (pcase-let ((`(,view ,kind ,file) spec))
+                         (list (list old-view 'del old "A" "old" "new")
+                               (list new-view 'add new "B" "new" "old")))
+                  (pcase-let ((`(,view ,kind ,file ,label
+                                      ,own-directory ,peer-directory)
+                               spec))
                     (with-current-buffer view
-                      (let ((index
+                      (let ((header (car (aref diffs--split-rows 0)))
+                            (index
                              (cl-loop
                               for row across diffs--split-rows
                               for row-index from 0
                               when (eq (nth 3 row) kind)
                               return row-index)))
+                        (diffs-tests--assert-file-comparison-side-header
+                         header label
+                         (format "%s/sample.el" own-directory)
+                         (format "%s/sample.el" peer-directory))
+                        (diffs-tests--assert-file-comparison-side-header
+                         (diffs--split-header-line) label
+                         (format "%s/sample.el" own-directory)
+                         (format "%s/sample.el" peer-directory))
                         (goto-char
                          (diffs--split-row-position index))
                         (diffs--split-materialize-range
@@ -2367,18 +2400,38 @@
                   (diffs-review-select)
                   (diffs-review-add-annotation
                    "Keep the old-side review identity." "")
-                  (should
-                   (cl-some
-                    (lambda (overlay)
-                      (when-let* ((text
-                                   (overlay-get overlay 'after-string)))
-                        (string-match-p
-                         "Keep the old-side review identity" text)))
-                    diffs--review-overlays)))
+                  (let ((text
+                         (car
+                          (diffs-tests--review-annotation-projection
+                           "Keep the old-side review identity"))))
+                    (should
+                     (string-match-p "old/sample\\.el A2" text))
+                    (should-not
+                     (string-match-p "new/sample\\.el" text))))
+                (with-current-buffer new-view
+                  (goto-char (point-min))
+                  (search-forward "(setq value 'new)")
+                  (beginning-of-line)
+                  (diffs-review-select)
+                  (diffs-review-add-annotation
+                   "Keep the new-side review identity." "")
+                  (let ((text
+                         (car
+                          (diffs-tests--review-annotation-projection
+                           "Keep the new-side review identity"))))
+                    (should
+                     (string-match-p "new/sample\\.el B2" text))
+                    (should-not
+                     (string-match-p "old/sample\\.el" text))))
                 (let ((annotation
-                       (car
+                       (cl-find-if
+                        (lambda (candidate)
+                          (equal
+                           (plist-get candidate :summary)
+                           "Keep the old-side review identity."))
                         (buffer-local-value
                          'diffs--review-annotations owner))))
+                  (should annotation)
                   (should (equal (plist-get annotation :file) new))
                   (should
                    (equal (plist-get annotation :old-range) '(2 2)))))
@@ -2395,9 +2448,15 @@
                   (search-forward "(setq value 'new)")
                   (beginning-of-line)
                   (diffs-review-reject-change)
-                  (cl-letf (((symbol-function 'yes-or-no-p)
-                             (lambda (&rest _) t)))
-                    (diffs-review-apply-decisions))))
+                  (let (confirmation)
+                    (cl-letf (((symbol-function 'yes-or-no-p)
+                               (lambda (prompt)
+                                 (setq confirmation prompt)
+                                 t)))
+                      (diffs-review-apply-decisions))
+                    (should
+                     (equal confirmation
+                            "Apply 1 reviewed decision to file B? ")))))
               (setq target-buffer (find-buffer-visiting new))
               (should (buffer-live-p target-buffer))
               (with-current-buffer target-buffer

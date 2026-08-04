@@ -371,8 +371,8 @@ the idle worker."
 (defcustom diffs-file-header-function #'diffs-default-file-header
   "Function that renders a file header from one context plist.
 The function returns a string or nil.  The context includes `:view',
-`:section', `:file', `:old-file', `:adds', `:dels', `:item-type',
-`:item-id', and `:item-version'."
+`:side', `:independent-sources', `:section', `:file', `:old-file',
+`:adds', `:dels', `:item-type', `:item-id', and `:item-version'."
   :type 'function
   :group 'diffs)
 
@@ -628,6 +628,9 @@ direction `down'.")
 
 (defconst diffs--source-render-version 1
   "Version of syntax-rendered source cache entries.")
+
+(defconst diffs--split-render-version 1
+  "Version of side-by-side row payloads and cache identities.")
 
 (defconst diffs--file-header-path-width 72
   "Maximum display width used for paths in default file headers.")
@@ -2205,6 +2208,31 @@ defaults to `diffs--short-display-path'."
        separator
        (diffs--file-label file new-width)))))
 
+(defun diffs--file-comparison-side-label (file side width)
+  "Return FILE labeled as comparison SIDE within WIDTH columns."
+  (let* ((prefix (if (eq side 'old) "A · " "B · "))
+         (available (- width (string-width prefix))))
+    (if (> available 0)
+        (concat prefix (diffs--file-label file available))
+      (truncate-string-to-width prefix width))))
+
+(defun diffs--display-file-comparison-label
+    (old-file file width &optional side)
+  "Return an A/B label for OLD-FILE and FILE within WIDTH.
+When SIDE is `old' or `new', return only that side's file."
+  (if side
+      (diffs--file-comparison-side-label
+       (if (eq side 'old) old-file file) side width)
+    (let* ((separator " → ")
+           (available
+            (max 2 (- width (string-width separator))))
+           (old-width (/ available 2))
+           (new-width (- available old-width)))
+      (concat
+       (diffs--file-comparison-side-label old-file 'old old-width)
+       separator
+       (diffs--file-comparison-side-label file 'new new-width)))))
+
 (defun diffs--put (beg end &rest props)
   "Set PROPS on BEG..END, marking them as owned by diffs."
   (add-text-properties beg end (append '(diffs t) props)))
@@ -2229,10 +2257,12 @@ defaults to `diffs--short-display-path'."
    :item-id (plist-get section :item-id)
    :item-version (plist-get section :item-version)))
 
-(defun diffs--file-header-context (section view)
-  "Return public file-header context for SECTION in VIEW."
+(defun diffs--file-header-context (section view &optional side)
+  "Return public file-header context for SECTION in VIEW and SIDE."
   (list
    :view view
+   :side (and diffs--independent-sources side)
+   :independent-sources diffs--independent-sources
    :section (diffs--public-section-context section)
    :file (plist-get section :file)
    :old-file (plist-get section :old-file)
@@ -2247,9 +2277,15 @@ defaults to `diffs--short-display-path'."
   "Return the default file header for layout CONTEXT."
   (let* ((file (or (plist-get context :file) "?"))
          (old-file (or (plist-get context :old-file) file))
+         (independent (plist-get context :independent-sources))
+         (side (and (eq (plist-get context :view) 'split)
+                    (plist-get context :side)))
          (label
-          (diffs--display-file-label
-           old-file file diffs--file-header-path-width)))
+          (if independent
+              (diffs--display-file-comparison-label
+               old-file file diffs--file-header-path-width side)
+            (diffs--display-file-label
+             old-file file diffs--file-header-path-width))))
     (if (eq (plist-get context :item-type) 'file)
         (diffs--file-header-text
          (diffs--file-label
@@ -2264,22 +2300,32 @@ defaults to `diffs--short-display-path'."
         (format "−%d" (or (plist-get context :dels) 0))
         'face 'diffs-file-stats-removed)))))
 
-(defun diffs--file-header (section view)
-  "Render SECTION's file header for VIEW."
+(defun diffs--file-header (section view &optional side)
+  "Render SECTION's file header for VIEW and optional SIDE."
   (diffs--layout-result
    diffs-file-header-function
-   (diffs--file-header-context section view)
+   (diffs--file-header-context section view side)
    "`diffs-file-header-function'"))
 
-(defun diffs--sticky-file-header (section view width &optional owner)
+(defun diffs--split-file-headers (section)
+  "Return (OLD . NEW) split header strings for SECTION."
+  (if diffs--independent-sources
+      (cons (diffs--file-header section 'split 'old)
+            (diffs--file-header section 'split 'new))
+    (let ((header (diffs--file-header section 'split)))
+      (cons header header))))
+
+(defun diffs--sticky-file-header
+    (section view width &optional owner side)
   "Render SECTION's file header for sticky VIEW within WIDTH columns.
-When OWNER is live, use its presentation configuration."
+When OWNER is live, use its presentation configuration.  SIDE
+identifies the old or new split column."
   (when section
     (let ((diffs--file-header-path-width width))
       (if (buffer-live-p owner)
           (with-current-buffer owner
-            (diffs--file-header section view))
-        (diffs--file-header section view)))))
+            (diffs--file-header section view side))
+        (diffs--file-header section view side)))))
 
 (defun diffs--sticky-hunk-label (hunk)
   "Return sticky line-position and function context for HUNK."
@@ -4249,7 +4295,8 @@ INDEX may equal the row count, in which case return `point-max'."
          (hunk (diffs--split-property-at 'diffs-hunk position))
          (header
           (diffs--sticky-file-header
-           section 'split path-width diffs--split-unified)))
+           section 'split path-width diffs--split-unified
+           diffs--split-role)))
     (concat
      (or header "")
      (or (diffs--sticky-hunk-label hunk) ""))))
@@ -4480,9 +4527,13 @@ or hunk depending on KIND."
   (let ((row 0)
         chunks anchors)
     (dolist (section diffs--sections)
-      (let ((header (diffs--file-header section 'split)))
-        (when header
-          (push (vector 'header section header row 1) chunks)
+      (pcase-let ((`(,old-header . ,new-header)
+                   (diffs--split-file-headers section)))
+        (when (or old-header new-header)
+          (push (vector 'header section
+                        (cons (or old-header "") (or new-header ""))
+                        row 1)
+                chunks)
           (cl-incf row))
         (unless (plist-get section :hunks)
           (let ((count
@@ -4518,12 +4569,13 @@ Paired changed rows share a two-element PAIR vector."
     (cl-flet ((emit (o n)
                 (push o old-rows) (push n new-rows) (cl-incf row)))
       (dolist (sec diffs--sections)
-        (let* ((file (plist-get sec :file))
-               (header (diffs--file-header sec 'split)))
-          (when header
-            (emit (list header nil nil 'header file nil nil nil
+        (pcase-let* ((file (plist-get sec :file))
+                     (`(,old-header . ,new-header)
+                      (diffs--split-file-headers sec)))
+          (when (or old-header new-header)
+            (emit (list (or old-header "") nil nil 'header file nil nil nil
                         nil nil nil sec)
-                  (list header nil nil 'header file nil nil nil
+                  (list (or new-header "") nil nil 'header file nil nil nil
                         nil nil nil sec)))
           (unless (plist-get sec :hunks)
             (save-excursion
@@ -5047,10 +5099,13 @@ Return the signed row-count adjustment."
     (pcase (aref chunk 0)
       ('header
        (let* ((file (plist-get section :file))
-              (row (list payload nil nil 'header file nil nil nil
-                         nil nil nil nil section))
-              (rows (vector row)))
-         (list rows (vector (copy-sequence row)))))
+              (old-row
+               (list (car payload) nil nil 'header file nil nil nil
+                     nil nil nil nil section))
+              (new-row
+               (list (cdr payload) nil nil 'header file nil nil nil
+                     nil nil nil nil section)))
+         (list (vector old-row) (vector new-row))))
       ('meta
        (let ((file (plist-get section :file))
              old new)
@@ -6599,7 +6654,8 @@ error never strands the user in the unified view."
                 (max 8 (- (min (window-body-width w1)
                                (window-body-width w2))
                           width 1)))
-               (key (list modified-tick
+               (key (list diffs--split-render-version
+                          modified-tick
                           content-width width
                           wrap-lines
                           paged
@@ -8163,7 +8219,8 @@ or source-buffer undo to be applied correctly."
   "Apply reviewed results to source buffers without saving them.
 Accepted blocks already match the new-side source and require no edit.
 Rejected blocks are restored from the old side after every target is
-validated.  No source buffer is saved or staged automatically."
+validated.  For an independent file comparison, the target is file B.
+No source buffer is saved or staged automatically."
   (interactive)
   (let* ((owner (or (diffs--review-owner-buffer)
                     (user-error "Not in a diffs review view")))
@@ -8178,16 +8235,19 @@ validated.  No source buffer is saved or staged automatically."
           (and split-role
                (diffs--resolution-split-anchor owner)))
          (decisions
-          (buffer-local-value 'diffs--review-decisions owner)))
+          (buffer-local-value 'diffs--review-decisions owner))
+         (independent
+          (buffer-local-value 'diffs--independent-sources owner)))
     (unless decisions
       (user-error "No change decisions to apply"))
     (when (buffer-local-value 'diffs--target-revision owner)
       (user-error
        "Cannot apply decisions from a historical commit review"))
     (unless (yes-or-no-p
-             (format "Apply %d reviewed decision%s to source buffers? "
+             (format "Apply %d reviewed decision%s to %s? "
                      (length decisions)
-                     (if (= (length decisions) 1) "" "s")))
+                     (if (= (length decisions) 1) "" "s")
+                     (if independent "file B" "source buffers")))
       (user-error "Apply cancelled"))
     ;; Validate after confirmation.  A process, timer, or formatter can
     ;; change a source buffer while the minibuffer is active; preparing
@@ -8452,16 +8512,30 @@ overlay string."
               text)))
          (target (diffs--review-annotation-target annotation))
          (file (plist-get annotation :file))
+         (owner (diffs--review-owner-buffer))
+         (independent
+          (and (buffer-live-p owner)
+               (buffer-local-value 'diffs--independent-sources owner)))
+         (section
+          (and independent file
+               (diffs--review-section-for-file owner file)))
+         (display-file
+          (if (and section target (eq (car target) 'old))
+              (or (plist-get section :old-file) file)
+            file))
          (location
-          (when (or file target)
+          (when (or display-file target)
             (string-join
              (delq
               nil
               (list
-               (and file (diffs--short-display-path file 48))
+               (and display-file
+                    (diffs--short-display-path display-file 48))
                (and target
                     (format "%s%d"
-                            (if (eq (car target) 'old) "L" "R")
+                            (if independent
+                                (if (eq (car target) 'old) "A" "B")
+                              (if (eq (car target) 'old) "L" "R"))
                             (cdr target)))))
              " ")))
          (heading (string-join (delq nil (list label author location))
@@ -11676,8 +11750,9 @@ unchanged source in the same owner/index/navigation model as diffs."
 ;;;###autoload
 (defun diffs-files (old new)
   "Compare saved files OLD and NEW in one native review.
-OLD is the left side and NEW is the right side.  Refresh rereads both
-paths.  Review decisions, when applied explicitly, target NEW."
+OLD is file A on the left and NEW is file B on the right.  Refresh
+rereads both paths.  Review decisions, when applied explicitly, target
+file B (NEW)."
   (interactive
    (let* ((current
            (and buffer-file-name
@@ -11686,12 +11761,12 @@ paths.  Review decisions, when applied explicitly, target NEW."
           (old
            (read-file-name
             (format-prompt
-             "Old file"
+             "File A"
              (and current (file-name-nondirectory current)))
             nil current t))
           (new
            (read-file-name
-            "New file: " (file-name-directory old) nil t)))
+            "File B: " (file-name-directory old) nil t)))
      (list old new)))
   (setq old (expand-file-name old)
         new (expand-file-name new))
