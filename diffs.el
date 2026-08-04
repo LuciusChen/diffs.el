@@ -93,7 +93,10 @@
                   (file &rest arg-overrides))
 (declare-function nerd-icons-octicon "nerd-icons"
                   (icon-name &rest args))
-(declare-function diffs-review-compose "diffs-review-compose")
+(declare-function nerd-icons-codicon "nerd-icons"
+                  (icon-name &rest args))
+(declare-function diffs-review-compose "diffs-review-compose"
+                  (&optional annotation))
 (defvar vc-git-program)
 (defvar diff-hl-update-async)
 (defvar diff-hl-show-staged-changes)
@@ -138,6 +141,16 @@
 The integration is optional.  When nerd-icons is unavailable, diffs.el
 keeps the same text-only labels without signaling an error."
   :type 'boolean
+  :group 'diffs)
+
+(defcustom diffs-review-comment-display 'icon
+  "Default presentation for inline review comments.
+`icon' renders each comment as a compact discussion-quote icon until it
+is expanded interactively.  `expanded' renders the complete framed note
+box initially.  Per-comment toggles are live-review presentation state;
+they do not alter session comment data or this option."
+  :type '(choice (const :tag "Compact icon" icon)
+                 (const :tag "Expanded note box" expanded))
   :group 'diffs)
 
 (defcustom diffs-lazy-threshold 10000
@@ -447,6 +460,10 @@ the background in any theme.")
   '((t :inherit default))
   "Face for inline review annotation headings.")
 
+(defface diffs-review-comment-icon
+  '((t :inherit font-lock-constant-face :weight normal))
+  "Face for a collapsed review-comment icon.")
+
 (defface diffs-review-decision
   '((t :inherit success))
   "Face for accepted and rejected change-block decision labels.")
@@ -607,6 +624,14 @@ direction `down'.")
   "Review owner of an internal historical source buffer.")
 
 (defconst diffs--missing-content (make-symbol "diffs-missing-content"))
+
+(defalias 'diffs--hash-table-contains-p
+  (if (fboundp 'hash-table-contains-p)
+      #'hash-table-contains-p
+    (lambda (key table)
+      (let ((missing (make-symbol "diffs-missing-hash-key")))
+        (not (eq (gethash key table missing) missing)))))
+  "Return non-nil when TABLE contains KEY, including a nil value.")
 
 (defvar diffs--render-cache (make-hash-table :test #'equal)
   "Shared cache of syntax-rendered source line vectors.")
@@ -1347,10 +1372,10 @@ Return cached rendered lines immediately when available, otherwise nil."
          (cached (gethash section cache diffs--missing-content)))
     (cond
      ((vectorp cached) cached)
-     ((and (hash-table-contains-p section cache)
+     ((and (diffs--hash-table-contains-p section cache)
            (consp cached))
       nil)
-     ((hash-table-contains-p section cache)
+     ((diffs--hash-table-contains-p section cache)
       (remhash section cache)
       (diffs--section-raw-lines section side))
      (t
@@ -1389,19 +1414,19 @@ Return cached rendered lines immediately when available, otherwise nil."
          (cache (if old diffs--old-content-cache diffs--new-content-cache))
          (cached (gethash section cache diffs--missing-content)))
     (cond
-     ((and (hash-table-contains-p section cache)
+     ((and (diffs--hash-table-contains-p section cache)
            (vectorp cached))
       (if (diffs--source-render-current-p section side)
           cached
         (or (diffs--schedule-source-render section side cached)
             cached)))
-     ((and (hash-table-contains-p section cache)
+     ((and (diffs--hash-table-contains-p section cache)
            (consp cached))
       nil)
      ;; Older live reviews cached an uninterned symbol for a failed load.
      ;; Retry it once after a package reload instead of keeping that stale
      ;; negative result for the lifetime of the review.
-     ((hash-table-contains-p section cache)
+     ((diffs--hash-table-contains-p section cache)
       (remhash section cache)
       (diffs--section-lines section side))
      (t
@@ -2748,6 +2773,14 @@ non-nil, only apply properties to lines intersecting that region."
 (defvar-local diffs--return-marker nil
   "Source marker to restore after closing the diffs view.")
 
+(defvar-keymap diffs--review-annotation-map
+  :doc "Mouse bindings on rendered review annotations."
+  "<mouse-1>" #'diffs--review-edit-annotation-at-mouse)
+
+(defvar-keymap diffs--review-comment-icon-map
+  :doc "Mouse bindings on collapsed review-comment icons."
+  "<mouse-1>" #'diffs--review-toggle-comment-at-mouse)
+
 (defun diffs-quit ()
   "Quit the diffs view, restoring the previous window layout."
   (interactive)
@@ -2788,6 +2821,7 @@ non-nil, only apply properties to lines intersecting that region."
   "v" #'diffs-review-select
   "x" #'diffs-review-clear-selection
   "a" #'diffs-review-add-annotation
+  "E" #'diffs-review-edit-annotation
   "[" #'diffs-review-previous-annotation
   "]" #'diffs-review-next-annotation
   "A" #'diffs-review-accept-change
@@ -2802,9 +2836,14 @@ non-nil, only apply properties to lines intersecting that region."
   :doc "Keymap for decorating an arbitrary external diff buffer."
   :parent diffs--review-command-map)
 
+(defvar-keymap diffs--native-review-command-map
+  :doc "Bindings reserved for native read-only stacked reviews."
+  "c" #'diffs-review-toggle-comment)
+
 (defvar diffs-mode-map
   (make-composed-keymap
-   (list diffs--review-command-map
+   (list diffs--native-review-command-map
+         diffs--review-command-map
          diff-mode-shared-map
          diff-mode-map)
    special-mode-map)
@@ -2827,6 +2866,9 @@ non-nil, only apply properties to lines intersecting that region."
 
 (defvar-local diffs--review-annotations nil
   "Structured review annotations owned by this unified diffs buffer.")
+
+(defvar-local diffs--review-comment-display-overrides nil
+  "Per-comment display states owned by this unified diffs buffer.")
 
 (defvar-local diffs--review-attachments nil
   "Live binary image attachments owned by this unified diffs buffer.")
@@ -3618,13 +3660,13 @@ integers before refresh adoption begins."
     (with-current-buffer target
       (cl-mapc
        (lambda (source-section target-section)
-         (when (hash-table-contains-p
+         (when (diffs--hash-table-contains-p
                 source-section source-old)
            (puthash
             target-section
             (gethash source-section source-old)
             diffs--old-content-cache))
-         (when (hash-table-contains-p
+         (when (diffs--hash-table-contains-p
                 source-section source-new)
            (puthash
             target-section
@@ -3632,7 +3674,7 @@ integers before refresh adoption begins."
             diffs--new-content-cache))
          (when (and
                 (hash-table-p source-old-raw)
-                (hash-table-contains-p
+                (diffs--hash-table-contains-p
                  source-section source-old-raw))
            (let ((lines
                   (gethash source-section source-old-raw)))
@@ -3644,7 +3686,7 @@ integers before refresh adoption begins."
                 target-section 'old lines))))
          (when (and
                 (hash-table-p source-new-raw)
-                (hash-table-contains-p
+                (diffs--hash-table-contains-p
                  source-section source-new-raw))
            (let ((lines
                   (gethash source-section source-new-raw)))
@@ -3975,6 +4017,8 @@ integers before refresh adoption begins."
           (copy-tree (plist-get state :selection))
           diffs--review-annotations
           (copy-tree (plist-get state :annotations))
+          diffs--review-comment-display-overrides
+          (copy-tree (plist-get state :comment-displays))
           diffs--review-attachments
           (copy-tree (plist-get state :attachments))
           diffs--review-decisions
@@ -6155,6 +6199,8 @@ and treat the peer as the horizontal source of truth."
   "v" #'diffs-review-select
   "x" #'diffs-review-clear-selection
   "a" #'diffs-review-add-annotation
+  "c" #'diffs-review-toggle-comment
+  "E" #'diffs-review-edit-annotation
   "[" #'diffs-review-previous-annotation
   "]" #'diffs-review-next-annotation
   "A" #'diffs-review-accept-change
@@ -6789,6 +6835,8 @@ error never strands the user in the unified view."
   (with-current-buffer owner
     (list :selection (copy-tree diffs--review-selection)
           :annotations (copy-tree diffs--review-annotations)
+          :comment-displays
+          (copy-tree diffs--review-comment-display-overrides)
           :attachments (copy-tree diffs--review-attachments)
           :decisions (copy-tree diffs--review-decisions)
           :source-actions (copy-tree diffs--review-source-actions)
@@ -7552,6 +7600,15 @@ Retained entries are rebound to the newly scanned patch generation."
                (diffs--review-revalidate-annotation
                 owner annotation))
              annotations))
+            diffs--review-comment-display-overrides
+            (cl-remove-if-not
+             (lambda (entry)
+               (cl-find
+                (car entry) diffs--review-annotations
+                :key (lambda (annotation)
+                       (plist-get annotation :id))
+                :test #'equal))
+             (copy-tree (plist-get state :comment-displays)))
             diffs--review-attachments
             (diffs--review-retain-attachments
              (plist-get state :attachments)
@@ -8477,6 +8534,20 @@ The result is a plist containing `:file', `:side', and `:line'."
       (new-range (cons 'new (cadr new-range)))
       (old-range (cons 'old (cadr old-range))))))
 
+(defun diffs--review-annotation-selection (annotation)
+  "Return ANNOTATION's preferred stable source selection."
+  (let* ((new-range (plist-get annotation :new-range))
+         (old-range (plist-get annotation :old-range))
+         (side (if new-range 'new 'old))
+         (range (or new-range old-range)))
+    (unless range
+      (error "Review annotation %s has no target"
+             (plist-get annotation :id)))
+    (list :file (plist-get annotation :file)
+          :side side
+          :start (car range)
+          :end (cadr range))))
+
 (defun diffs--review-display-metrics-changed (&optional owner)
   "Reproject review overlays after display metrics change in OWNER."
   (when-let* ((owner (or owner (diffs--review-owner-buffer))))
@@ -8486,11 +8557,12 @@ The result is a plist containing `:file', `:side', and `:line'."
   "Return the displayed `line-prefix' width at POSITION in pixels."
   (let ((prefix (get-char-property position 'line-prefix)))
     (if (stringp prefix)
-        (string-pixel-width prefix (current-buffer))
+        (string-pixel-width prefix)
       0)))
 
-(defun diffs--review-annotation-display (annotation &optional prefix-pixels)
-  "Return (STRING . HEIGHT) for inline ANNOTATION display.
+(defun diffs--review-annotation-expanded-display
+    (annotation &optional prefix-pixels)
+  "Return (STRING . HEIGHT) for expanded inline ANNOTATION display.
 PREFIX-PIXELS is the displayed `line-prefix' width inherited by its
 overlay string."
   (let* ((source
@@ -8569,7 +8641,7 @@ overlay string."
           ;; follow buffer-local text scaling.  Keep the whole target in
           ;; current-buffer pixels so every border segment scales together.
           `(,(+ (or prefix-pixels 0)
-                (string-pixel-width top-left (current-buffer)))))
+                (string-pixel-width top-left))))
          (lines
           (append
            (list
@@ -8591,10 +8663,87 @@ overlay string."
              (concat "  ╰" (make-string (+ width 2) ?─) "╯")
              'face border-face))))
          (display (concat "\n" (string-join lines "\n"))))
+    (when-let* ((id (plist-get annotation :id)))
+      (add-text-properties
+       0 (length display)
+       (list 'diffs-review-annotation-id id
+             'keymap diffs--review-annotation-map
+             'help-echo "mouse-1: Edit this review comment")
+       display))
     ;; Count rendered lines rather than logical fields: imported or Agent
     ;; text may itself contain newlines, and the peer split column needs an
     ;; exactly equal-height spacer to preserve row alignment.
     (cons display (cl-count ?\n display))))
+
+(defun diffs--review-annotation-display-state (owner annotation)
+  "Return the effective display state for ANNOTATION in OWNER."
+  (or
+   (and (buffer-live-p owner)
+        (alist-get
+         (plist-get annotation :id)
+         (buffer-local-value
+          'diffs--review-comment-display-overrides owner)
+         nil nil #'equal))
+   (if (buffer-live-p owner)
+       (buffer-local-value 'diffs-review-comment-display owner)
+     diffs-review-comment-display)))
+
+(defun diffs--review-comment-icon ()
+  "Return the discussion-quote glyph used for a collapsed comment."
+  (or
+   (and
+    (diffs--nerd-icons-available-p)
+    (fboundp 'nerd-icons-codicon)
+    (cl-loop
+     ;; The quote variant was added after Nerd Fonts 3.2.  Ask the public
+     ;; API first, then use the older discussion glyph instead of emitting
+     ;; an unsupported private-use codepoint that a CJK font may capture.
+     for name in '("nf-cod-comment_discussion_quote"
+                   "nf-cod-comment_discussion")
+     thereis
+     (condition-case nil
+         (let ((icon
+                (nerd-icons-codicon
+                 name :face 'diffs-review-comment-icon)))
+           (and (stringp icon)
+                (not (string-empty-p icon))
+                icon))
+       (error nil))))
+   (propertize "💬" 'face 'diffs-review-comment-icon)))
+
+(defun diffs--review-annotation-icon-display (annotation)
+  "Return the compact (STRING . HEIGHT) display for ANNOTATION."
+  (let* ((id (plist-get annotation :id))
+         (summary
+          (replace-regexp-in-string
+           "[[:space:]\n\r]+" " "
+           (or (plist-get annotation :summary) "")))
+         (icon (diffs--review-comment-icon))
+         (display (concat " " icon)))
+    (add-text-properties
+     0 (length display)
+     (list 'diffs-review-annotation-id id
+           'keymap diffs--review-comment-icon-map
+           'help-echo
+           (format "mouse-1: Expand comment\n%s" summary))
+     display)
+    (let ((start (- (length display) (length icon))))
+      (add-text-properties
+       start (length display) '(mouse-face highlight) display))
+    ;; A collapsed comment belongs to its source row and must not add a
+    ;; vertical lane in stacked or split projection.
+    (cons display 0)))
+
+(defun diffs--review-annotation-display (annotation &optional prefix-pixels)
+  "Return (STRING . HEIGHT) for inline ANNOTATION display.
+PREFIX-PIXELS is the displayed `line-prefix' width inherited by an
+expanded annotation string."
+  (let ((owner (diffs--review-owner-buffer)))
+    (if (eq (diffs--review-annotation-display-state owner annotation)
+            'expanded)
+        (diffs--review-annotation-expanded-display
+         annotation prefix-pixels)
+      (diffs--review-annotation-icon-display annotation))))
 
 (defun diffs--review-add-annotation-overlay (position string)
   "Display annotation STRING after the line at POSITION."
@@ -9107,31 +9256,251 @@ current diff line."
     (copy-tree
      (buffer-local-value 'diffs--review-annotations owner))))
 
-(defun diffs--review-replace-annotations (owner annotations)
+(defun diffs--review-replace-annotations
+    (owner annotations &optional new-attachments)
   "Replace OWNER's annotations with ANNOTATIONS atomically.
+NEW-ATTACHMENTS supplies live image data introduced by the replacement.
 Restore the prior state when view projection fails."
   (let* ((before
           (buffer-local-value 'diffs--review-annotations owner))
+         (before-displays
+          (buffer-local-value
+           'diffs--review-comment-display-overrides owner))
          (before-attachments
           (buffer-local-value 'diffs--review-attachments owner))
-         (attachments
-          (diffs--review-retain-attachments
-           before-attachments annotations)))
-    (condition-case error-data
-        (progn
-          (with-current-buffer owner
-            (setq diffs--review-annotations annotations
-                  diffs--review-attachments attachments))
+         (available-attachments (copy-sequence before-attachments)))
+    (dolist (attachment new-attachments)
+      (if-let* ((existing
+                 (cl-find
+                  (plist-get attachment :id) available-attachments
+                  :key (lambda (item) (plist-get item :id))
+                  :test #'equal)))
+          (unless (equal existing attachment)
+            (error "Conflicting review attachment id %s"
+                   (plist-get attachment :id)))
+        (setq available-attachments
+              (append available-attachments (list attachment)))))
+    (let ((attachments
+           (diffs--review-retain-attachments
+            available-attachments annotations)))
+      (when (> (diffs--review-attachment-total-bytes attachments)
+               diffs-review-image-total-max-bytes)
+        (user-error "Review images exceed the %s session limit"
+                    (file-size-human-readable
+                     diffs-review-image-total-max-bytes)))
+      (condition-case error-data
+          (progn
+            (with-current-buffer owner
+              (setq diffs--review-annotations annotations
+                    diffs--review-comment-display-overrides
+                    (cl-remove-if-not
+                     (lambda (entry)
+                       (cl-find
+                        (car entry) annotations
+                        :key (lambda (annotation)
+                               (plist-get annotation :id))
+                        :test #'equal))
+                     diffs--review-comment-display-overrides)
+                    diffs--review-attachments attachments))
+            (diffs--review-refresh-overlays owner)
+            annotations)
+        (error
+         (with-current-buffer owner
+           (setq diffs--review-annotations before
+                 diffs--review-comment-display-overrides before-displays
+                 diffs--review-attachments before-attachments))
+         (condition-case nil
+             (diffs--review-refresh-overlays owner)
+           (error nil))
+         (signal (car error-data) (cdr error-data)))))))
+
+(defun diffs--review-update-annotation
+    (owner id summary rationale attachments)
+  "Update annotation ID in OWNER with comment text and ATTACHMENTS.
+SUMMARY is required and RATIONALE is optional.  Preserve the annotation's
+identity, target, provenance, and creation time."
+  (unless (buffer-live-p owner)
+    (user-error "The diffs review is no longer live"))
+  (unless (and (stringp summary) (not (string-empty-p summary)))
+    (user-error "A review comment requires content"))
+  (let* ((annotations
+          (buffer-local-value 'diffs--review-annotations owner))
+         (original
+          (cl-find id annotations
+                   :key (lambda (item) (plist-get item :id))
+                   :test #'equal)))
+    (unless original
+      (user-error "No annotation matches %s" id))
+    (unless
+        (diffs--review-selection-valid-p
+         owner (diffs--review-annotation-selection original))
+      (user-error "The commented diff lines changed; reopen the comment"))
+    (let ((updated (copy-tree original)))
+      (setf (plist-get updated :summary) summary
+            (plist-get updated :rationale)
+            (and rationale (not (string-empty-p rationale)) rationale)
+            (plist-get updated :attachments)
+            (and attachments
+                 (mapcar #'diffs--review-attachment-metadata attachments))
+            (plist-get updated :updated-at)
+            (format-time-string "%FT%TZ" nil t))
+      (diffs--review-replace-annotations
+       owner
+       (mapcar
+        (lambda (annotation)
+          (if (equal id (plist-get annotation :id))
+              updated
+            annotation))
+        annotations)
+       attachments)
+      (message "Updated review comment %s" id)
+      updated)))
+
+(defun diffs--review-annotation-id-at-event (event)
+  "Return the review annotation id represented by mouse EVENT."
+  (let* ((string-position (posn-string (event-start event)))
+         (string (car-safe string-position))
+         (index (cdr-safe string-position)))
+    (and (stringp string)
+         (integerp index)
+         (< index (length string))
+         (get-text-property
+          index 'diffs-review-annotation-id string))))
+
+(defun diffs--review-resolve-annotation (owner id prompt)
+  "Resolve a review annotation in OWNER for ID or point.
+PROMPT is used when several annotations cover the current source line."
+  (let ((annotations
+         (buffer-local-value 'diffs--review-annotations owner)))
+    (unless annotations
+      (user-error "No review annotations"))
+    (let* ((location (and (not id)
+                          (diffs--review-location-at (point))))
+           (candidates
+            (and location
+                 (cl-remove-if-not
+                  (lambda (annotation)
+                    (let ((range
+                           (plist-get
+                            annotation
+                            (if (eq (plist-get location :side) 'old)
+                                :old-range
+                              :new-range))))
+                      (and
+                       (equal (plist-get annotation :file)
+                              (plist-get location :file))
+                       range
+                       (<= (car range) (plist-get location :line))
+                       (<= (plist-get location :line) (cadr range)))))
+                  annotations)))
+           (annotation
+            (cond
+             (id
+              (cl-find id annotations
+                       :key (lambda (item) (plist-get item :id))
+                       :test #'equal))
+             ((null candidates) nil)
+             ((null (cdr candidates)) (car candidates))
+             (t
+              (let ((choices
+                     (mapcar
+                      (lambda (item)
+                        (cons
+                         (format
+                          "%s · %s"
+                          (truncate-string-to-width
+                           (replace-regexp-in-string
+                            "[[:space:]\n\r]+" " "
+                            (plist-get item :summary))
+                           60 nil nil "…")
+                          (plist-get item :id))
+                         item))
+                      candidates)))
+                (cdr
+                 (assoc (completing-read prompt choices nil t)
+                        choices)))))))
+      (or annotation
+          (if id
+              (user-error "No annotation matches %s" id)
+            (user-error "No review comment covers the line at point"))))))
+
+(defun diffs--review-edit-annotation-at-mouse (event)
+  "Edit the review annotation clicked by mouse EVENT."
+  (interactive "e")
+  (let ((id (diffs--review-annotation-id-at-event event)))
+    (unless id
+      (user-error "No review comment at the clicked position"))
+    (mouse-set-point event)
+    (diffs-review-edit-annotation id)))
+
+(defun diffs--review-toggle-comment-at-mouse (event)
+  "Toggle the collapsed review annotation clicked by mouse EVENT."
+  (interactive "e")
+  (let ((id (diffs--review-annotation-id-at-event event)))
+    (unless id
+      (user-error "No review comment at the clicked position"))
+    (mouse-set-point event)
+    (diffs-review-toggle-comment id)))
+
+;;;###autoload
+(defun diffs-review-edit-annotation (&optional id)
+  "Edit the review annotation at point while preserving its identity.
+When ID is non-nil, edit that annotation directly.  If several comments
+cover the current source line, select one by summary."
+  (interactive)
+  (let ((owner (diffs--review-owner-buffer)))
+    (unless (buffer-live-p owner)
+      (user-error "Not in a diffs review view"))
+    (let ((annotation
+           (diffs--review-resolve-annotation
+            owner id "Edit comment: ")))
+      (require 'diffs-review-compose)
+      (diffs-review-compose annotation))))
+
+;;;###autoload
+(defun diffs-review-toggle-comment (&optional id)
+  "Toggle the comment at point between icon and expanded display.
+When ID is non-nil, toggle that annotation directly.  This changes only
+live presentation state and never changes session comment data."
+  (interactive)
+  (let ((owner (diffs--review-owner-buffer)))
+    (unless (buffer-live-p owner)
+      (user-error "Not in a diffs review view"))
+    (let* ((annotation
+            (diffs--review-resolve-annotation
+             owner id "Toggle comment: "))
+           (id (plist-get annotation :id))
+           (current
+            (diffs--review-annotation-display-state owner annotation))
+           (next (if (eq current 'expanded) 'icon 'expanded))
+           (before
+            (copy-tree
+             (buffer-local-value
+              'diffs--review-comment-display-overrides owner)))
+           (default
+            (buffer-local-value 'diffs-review-comment-display owner)))
+      (with-current-buffer owner
+        (if (eq next default)
+            (setq diffs--review-comment-display-overrides
+                  (cl-delete
+                   id diffs--review-comment-display-overrides
+                   :key #'car :test #'equal))
+          (setf
+           (alist-get id diffs--review-comment-display-overrides
+                      nil nil #'equal)
+           next)))
+      (condition-case error-data
           (diffs--review-refresh-overlays owner)
-          annotations)
-      (error
-       (with-current-buffer owner
-         (setq diffs--review-annotations before
-               diffs--review-attachments before-attachments))
-       (condition-case nil
-           (diffs--review-refresh-overlays owner)
-         (error nil))
-       (signal (car error-data) (cdr error-data))))))
+        (error
+         (with-current-buffer owner
+           (setq diffs--review-comment-display-overrides before))
+         (condition-case nil
+             (diffs--review-refresh-overlays owner)
+           (error nil))
+         (signal (car error-data) (cdr error-data))))
+      (message "%s review comment"
+               (if (eq next 'expanded) "Expanded" "Collapsed"))
+      next)))
 
 (defun diffs--review-remove-annotation (owner id)
   "Remove annotation ID from OWNER and return non-nil when found."

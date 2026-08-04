@@ -35,6 +35,9 @@
 (defvar-local diffs--review-compose-selection nil
   "Stable source selection captured for this comment draft.")
 
+(defvar-local diffs--review-compose-annotation-id nil
+  "Existing annotation id edited by this draft, or nil for a new comment.")
+
 (defvar-local diffs--review-compose-attachments nil
   "Binary image attachments currently owned by this draft.")
 
@@ -261,8 +264,9 @@
 Use `diffs-review-compose-submit' to submit the draft or
 `diffs-review-compose-cancel' to discard it."
   (setq-local require-final-newline nil)
-  (setq-local yank-media-autoselect-function
-              #'diffs--review-compose-autoselect-images)
+  (when (boundp 'yank-media-autoselect-function)
+    (setq-local yank-media-autoselect-function
+                #'diffs--review-compose-autoselect-images))
   (yank-media-handler "^image/" #'diffs-review-compose-yank-image)
   (add-hook 'kill-buffer-hook #'diffs--review-compose-killed nil t))
 
@@ -275,6 +279,39 @@ Use `diffs-review-compose-submit' to submit the draft or
                'diffs--review-compose-owner buffer)
               owner)))
    (buffer-list)))
+
+(defun diffs--review-compose-annotation-content (annotation)
+  "Return editable text for ANNOTATION."
+  (let ((summary (plist-get annotation :summary))
+        (rationale (plist-get annotation :rationale)))
+    (concat summary
+            (if (and rationale (not (string-empty-p rationale)))
+                (concat "\n\n" rationale)
+              ""))))
+
+(defun diffs--review-compose-annotation-attachments (owner annotation)
+  "Return live OWNER attachments referenced by ANNOTATION."
+  (mapcar
+   (lambda (metadata)
+     (or (diffs--review-attachment-by-id
+          owner (plist-get metadata :id))
+         (user-error "Comment attachment %s is no longer live"
+                     (plist-get metadata :id))))
+   (plist-get annotation :attachments)))
+
+(defun diffs--review-compose-mark-attachments (attachments)
+  "Restore editable placeholder properties for ATTACHMENTS."
+  (dolist (attachment attachments)
+    (let ((placeholder (format "[%s]" (plist-get attachment :label))))
+      (save-excursion
+        (goto-char (point-min))
+        (while (search-forward placeholder nil t)
+          (add-text-properties
+           (- (point) (length placeholder)) (point)
+           (list
+            'diffs-review-attachment-id (plist-get attachment :id)
+            'face 'diffs-review-attachment
+            'rear-nonsticky '(diffs-review-attachment-id face))))))))
 
 (defun diffs--review-compose-display (buffer)
   "Display BUFFER in the comment side window and select it."
@@ -297,60 +334,109 @@ Use `diffs-review-compose-submit' to submit the draft or
       (set-buffer-modified-p nil)
       (kill-buffer draft))))
 
-(defun diffs--review-compose-header (selection)
-  "Return the composer header for stable SELECTION."
+(defun diffs--review-compose-header (selection &optional editing)
+  "Return the composer header for stable SELECTION.
+EDITING is non-nil for an existing annotation."
   (let ((start (plist-get selection :start))
         (end (plist-get selection :end)))
     (format
-     " Comment · %s %s%d%s   C-c C-c submit · C-c C-k cancel"
+     " %s · %s %s%d%s   C-c C-c submit · C-c C-k cancel"
+     (if editing "Edit comment" "Comment")
      (diffs--short-display-path (plist-get selection :file) 48)
      (if (eq (plist-get selection :side) 'old) "L" "R")
      start
      (if (= start end) "" (format "–%d" end)))))
 
-(defun diffs-review-compose ()
+(defun diffs-review-compose (&optional annotation)
   "Open the single editable comment draft for the current review.
-The current stable selection is preferred; otherwise the changed line at
-point becomes the target.  An existing draft for the same review is
-shown without replacing its text or target."
+When ANNOTATION is non-nil, prefill the composer to edit it in place.
+Otherwise the current stable selection is preferred, followed by the
+changed line at point.  An existing draft for the same review is shown
+without replacing its text or target."
   (interactive)
   (let* ((owner (diffs--review-owner-buffer))
          (selection
-          (or (and owner
-                   (buffer-local-value 'diffs--review-selection owner))
-              (diffs--review-range-at-point))))
+          (if annotation
+              (diffs--review-annotation-selection annotation)
+            (or (and owner
+                     (buffer-local-value 'diffs--review-selection owner))
+                (diffs--review-range-at-point)))))
     (unless (buffer-live-p owner)
       (user-error "Not in a diffs review view"))
+    (when (and annotation
+               (not
+                (cl-find
+                 (plist-get annotation :id)
+                 (buffer-local-value 'diffs--review-annotations owner)
+                 :key (lambda (item) (plist-get item :id))
+                 :test #'equal)))
+      (user-error "The review comment is no longer live"))
     (if-let* ((existing
                (diffs--review-compose-existing-buffer owner)))
         (progn
+          (message "Finish or cancel the existing comment draft first")
           (diffs--review-compose-display existing)
           existing)
       (diffs--review-ensure-session-state owner)
-      (let* ((configuration (current-window-configuration))
-             (session
-              (buffer-local-value 'diffs--review-session-id owner))
-             (buffer
-              (generate-new-buffer
-               (format "*diffs comment:%s*"
-                       (substring session
-                                  (length "diffs-session:"))))))
-        (with-current-buffer buffer
-          (setq default-directory
-                (buffer-local-value 'default-directory owner))
-          (diffs-review-compose-mode)
-          (setq diffs--review-compose-owner owner
-                diffs--review-compose-selection (copy-tree selection)
-                diffs--review-compose-window-configuration configuration
-                header-line-format
-                (diffs--review-compose-header selection))
-          (set-buffer-modified-p nil))
-        (with-current-buffer owner
-          (add-hook 'kill-buffer-hook
-                    #'diffs--review-compose-owner-killed nil t))
-        (diffs--review-compose-display buffer)
-        (goto-char (point-min))
-        buffer))))
+      (let* ((content
+              (and annotation
+                   (diffs--review-compose-annotation-content annotation)))
+             (attachments
+              (and annotation
+                   (diffs--review-compose-annotation-attachments
+                    owner annotation))))
+        (dolist (attachment attachments)
+          (unless
+              (string-match-p
+               (regexp-quote
+                (format "[%s]" (plist-get attachment :label)))
+               content)
+            (user-error
+             "Comment text no longer references attachment %s"
+             (plist-get attachment :id))))
+        (let* ((configuration (current-window-configuration))
+               (session
+                (buffer-local-value 'diffs--review-session-id owner))
+               (buffer
+                (generate-new-buffer
+                 (format "*diffs comment:%s*"
+                         (substring session
+                                    (length "diffs-session:"))))))
+          (with-current-buffer buffer
+            (setq default-directory
+                  (buffer-local-value 'default-directory owner))
+            (diffs-review-compose-mode)
+            (setq diffs--review-compose-owner owner
+                  diffs--review-compose-selection (copy-tree selection)
+                  diffs--review-compose-annotation-id
+                  (and annotation (plist-get annotation :id))
+                  diffs--review-compose-attachments attachments
+                  diffs--review-compose-image-number
+                  (or
+                   (cl-loop
+                    for attachment in attachments
+                    for label = (plist-get attachment :label)
+                    maximize
+                    (if (and
+                         (stringp label)
+                         (string-match
+                          "\\`Image #\\([0-9]+\\)\\'" label))
+                        (string-to-number (match-string 1 label))
+                      0))
+                   0)
+                  diffs--review-compose-window-configuration configuration
+                  header-line-format
+                  (diffs--review-compose-header selection annotation))
+            (when content
+              (insert content)
+              (diffs--review-compose-mark-attachments attachments))
+            (set-buffer-modified-p nil))
+          (with-current-buffer owner
+            (add-hook 'kill-buffer-hook
+                      #'diffs--review-compose-owner-killed nil t))
+          (diffs--review-compose-display buffer)
+          (goto-char (point-min))
+          buffer)))))
 
 (defun diffs--review-compose-yank-text ()
   "Yank text while preserving the ordinary `yank-pop' protocol."
@@ -419,12 +505,15 @@ yank."
                           end 'diffs-review-attachment-id)))
         (cl-incf end))
       (delete-region begin end))
-    (setq diffs--review-compose-attachments
-          (cl-remove id diffs--review-compose-attachments
-                     :key (lambda (attachment)
-                            (plist-get attachment :id))
-                     :test #'equal))
-    (message "Removed image attachment")))
+    (if (text-property-any
+         (point-min) (point-max) 'diffs-review-attachment-id id)
+        (message "Removed image attachment reference")
+      (setq diffs--review-compose-attachments
+            (cl-remove id diffs--review-compose-attachments
+                       :key (lambda (attachment)
+                              (plist-get attachment :id))
+                       :test #'equal))
+      (message "Removed image attachment"))))
 
 (defun diffs--review-compose-comment-text ()
   "Return (SUMMARY . RATIONALE) parsed from the current draft."
@@ -469,12 +558,17 @@ yank."
                 (diffs--review-compose-comment-text))
                (attachments
                 (diffs--review-compose-referenced-attachments)))
-    (diffs--review-store-annotation
-     diffs--review-compose-owner
-     diffs--review-compose-selection
-     summary rationale
-     (or user-full-name user-login-name)
-     "user" attachments)
+    (if diffs--review-compose-annotation-id
+        (diffs--review-update-annotation
+         diffs--review-compose-owner
+         diffs--review-compose-annotation-id
+         summary rationale attachments)
+      (diffs--review-store-annotation
+       diffs--review-compose-owner
+       diffs--review-compose-selection
+       summary rationale
+       (or user-full-name user-login-name)
+       "user" attachments))
     (diffs--review-compose-finish)))
 
 (defun diffs-review-compose-cancel ()

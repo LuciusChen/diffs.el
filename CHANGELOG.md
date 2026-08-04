@@ -2,6 +2,10 @@
 
 ## Unreleased (0.13.0)
 
+- Restore the declared Emacs 29.1 baseline for source-cache membership and review-comment pixel measurement, and exercise image paste against both older and newer public selection paths.
+- Keep a draft image attachment live while another copied placeholder still references it, releasing the binary only after its final draft reference disappears.
+- Show review comments as zero-height inline `nf-cod-comment_discussion_quote` icons by default, falling back to the older `nf-cod-comment_discussion` glyph when necessary, with `diffs-review-comment-display` for initially expanded boxes and `c` or mouse-1 for per-comment expansion. Presentation overrides survive layout switches and refreshes without entering live Agent session data.
+- Reopen the comment at point with `E`, or click its expanded box with mouse-1, in the existing multiline composer. Editing atomically preserves its id, source target, provenance, creation time, and live image attachments while updating text and `updatedAt`, so Agent sessions observe one stable comment instead of a remove/add pair.
 - Present independently selected files as neutral A/B inputs: stacked headers show both labeled paths, complete/paged/sticky split headers show only their own side, comments use the corresponding path and A/B coordinate, and apply confirmation names file B while the stable old/new review and Agent APIs remain unchanged.
 - Replace minibuffer comment entry with one bottom-side `text-mode` composer that maps the first paragraph to summary and later text to rationale, supports submit/cancel without disturbing the review layout, and preserves only one draft per live owner.
 - Accept MIME-matched, structurally screened clipboard images as `[Image #N]` live-session comment attachments with graphical decode validation, draft removal, and configurable byte limits. Normal review JSON exposes metadata without base64, `diffs session attachment get` verifies and atomically writes an explicitly requested binary for Agents, owner shutdown frees draft and committed data, and Hunk sidecar export refuses instead of silently dropping images.

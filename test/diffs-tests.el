@@ -287,6 +287,20 @@
             (diffs--review-line-prefix-pixel-width
              (line-beginning-position))))))
 
+(defun diffs-tests--review-annotation-display-by-id (id)
+  "Return the projected annotation display carrying ID."
+  (or
+   (cl-loop
+    for overlay in diffs--review-overlays
+    for display = (overlay-get overlay 'after-string)
+    when (and
+          (stringp display)
+          (equal id
+                 (get-text-property
+                  0 'diffs-review-annotation-id display)))
+    return display)
+   (ert-fail (format "Annotation %s has no projected display" id))))
+
 (defun diffs-tests--review-annotation-align-position (display)
   "Return the absolute pixel alignment encoded in annotation DISPLAY."
   (when-let* ((position
@@ -315,8 +329,7 @@
     (unless corner
       (ert-fail "Projected review annotation has no top-right corner"))
     (+ prefix
-       (string-pixel-width (substring display 1 corner)
-                           (current-buffer)))))
+       (string-pixel-width (substring display 1 corner)))))
 
 (defun diffs-tests--split-insert-row
     (string number source kind file width role)
@@ -2161,7 +2174,16 @@
               #'diffs-expand-context))
   (should (eq (keymap-lookup diffs-split-mode-map "e")
               #'diffs-split-expand-context))
-  (dolist (key '("c" "TAB" "<backtab>" "E"))
+  (should (eq (keymap-lookup diffs-minor-mode-map "E")
+              #'diffs-review-edit-annotation))
+  (should (eq (keymap-lookup diffs-split-mode-map "E")
+              #'diffs-review-edit-annotation))
+  (should (eq (keymap-lookup diffs-mode-map "c")
+              #'diffs-review-toggle-comment))
+  (should-not (keymap-lookup diffs-minor-mode-map "c"))
+  (should (eq (keymap-lookup diffs-split-mode-map "c")
+              #'diffs-review-toggle-comment))
+  (dolist (key '("TAB" "<backtab>"))
     (should-not (keymap-lookup diffs-minor-mode-map key))
     (should-not (keymap-lookup diffs-split-mode-map key)))
   (diffs-tests--with-diff diffs-tests--hidden-context
@@ -2278,6 +2300,7 @@
          owner
          target-buffer
          (calls 0)
+         (diffs-review-comment-display 'expanded)
          (diffs-default-view 'split))
     (unwind-protect
         (progn
@@ -3371,6 +3394,7 @@
 
 (ert-deftest diffs-review-selection-and-annotations-survive-layout-switches ()
   (let ((buf (generate-new-buffer " *diffs review selection test*"))
+        (diffs-review-comment-display 'expanded)
         old-buf new-buf)
     (unwind-protect
         (save-window-excursion
@@ -3494,6 +3518,210 @@
                            "Reason one\nreason two"))))
         (diffs-minor-mode -1)))))
 
+(ert-deftest diffs-review-edit-comment-reuses-composer-and-identity ()
+  (diffs-tests--with-diff diffs-tests--normal
+    (let ((owner (current-buffer)) draft original)
+      (save-window-excursion
+        (delete-other-windows)
+        (switch-to-buffer owner)
+        (diffs-minor-mode 1)
+        (goto-char (point-min))
+        (re-search-forward "^+(message \"new\")")
+        (beginning-of-line)
+        (diffs-review-add-annotation
+         "Original summary" "Original rationale")
+        (setq original (copy-tree (car diffs--review-annotations)))
+        (call-interactively #'diffs-review-edit-annotation)
+        (setq draft (current-buffer))
+        (should (derived-mode-p 'diffs-review-compose-mode))
+        (should
+         (equal diffs--review-compose-annotation-id
+                (plist-get original :id)))
+        (should
+         (equal (buffer-string)
+                "Original summary\n\nOriginal rationale"))
+        (erase-buffer)
+        (insert "Revised summary\ncontinues\n\nRevised rationale")
+        (diffs-review-compose-submit)
+        (should-not (buffer-live-p draft))
+        (should (eq (current-buffer) owner))
+        (let ((edited (car diffs--review-annotations)))
+          (should (= (length diffs--review-annotations) 1))
+          (should (equal (plist-get edited :id)
+                         (plist-get original :id)))
+          (should (equal (plist-get edited :file)
+                         (plist-get original :file)))
+          (should (equal (plist-get edited :new-range)
+                         (plist-get original :new-range)))
+          (should (equal (plist-get edited :author)
+                         (plist-get original :author)))
+          (should (equal (plist-get edited :source)
+                         (plist-get original :source)))
+          (should (equal (plist-get edited :created-at)
+                         (plist-get original :created-at)))
+          (should (stringp (plist-get edited :updated-at)))
+          (should (equal (plist-get edited :summary)
+                         "Revised summary\ncontinues"))
+          (should (equal (plist-get edited :rationale)
+                         "Revised rationale"))
+          (let ((json (diffs-review-comments-json nil "user")))
+            (should (string-match-p
+                     (regexp-quote (plist-get original :id)) json))
+            (should (string-match-p "Revised summary" json))
+            (should-not (string-match-p "Original summary" json))))
+        (diffs-minor-mode -1)))))
+
+(ert-deftest diffs-review-edit-comment-preserves-live-image-attachment ()
+  (diffs-tests--with-diff diffs-tests--normal
+    (let ((owner (current-buffer)) draft attachment attachment-id)
+      (save-window-excursion
+        (switch-to-buffer owner)
+        (diffs-minor-mode 1)
+        (goto-char (point-min))
+        (re-search-forward "^+(message \"new\")")
+        (beginning-of-line)
+        (setq attachment
+              (list :id "diffs-attachment:edit-test"
+                    :label "Image #1"
+                    :mime "image/png"
+                    :bytes (string-bytes diffs-tests--png)
+                    :sha256 (secure-hash 'sha256 diffs-tests--png)
+                    :data diffs-tests--png)
+              attachment-id (plist-get attachment :id))
+        (diffs--review-store-annotation
+         owner (diffs--review-range-at-point)
+         "Screenshot [Image #1]" nil "Reviewer" "user"
+         (list attachment))
+        (call-interactively #'diffs-review-edit-annotation)
+        (setq draft (current-buffer))
+        (goto-char (point-min))
+        (search-forward "[Image #1]")
+        (should
+         (equal
+          (get-text-property (1- (point))
+                             'diffs-review-attachment-id)
+          attachment-id))
+        (insert " remains relevant")
+        (diffs-review-compose-submit)
+        (should-not (buffer-live-p draft))
+        (should (= (length diffs--review-attachments) 1))
+        (should
+         (equal (plist-get
+                 (car (plist-get (car diffs--review-annotations)
+                                 :attachments))
+                 :id)
+                attachment-id))
+        (call-interactively #'diffs-review-edit-annotation)
+        (goto-char (point-min))
+        (search-forward "[Image #1]")
+        (diffs-review-compose-delete-attachment)
+        (diffs-review-compose-submit)
+        (should-not diffs--review-attachments)
+        (should-not
+         (plist-get (car diffs--review-annotations) :attachments))
+        (diffs-minor-mode -1)))))
+
+(ert-deftest diffs-review-comments-default-to-icon-and-toggle-expanded ()
+  (should (eq diffs-review-comment-display 'icon))
+  (cl-letf (((symbol-function 'diffs--nerd-icons-available-p)
+             (lambda () t))
+            ((symbol-function 'nerd-icons-codicon)
+             (lambda (name &rest _arguments)
+               (should (equal name
+                              "nf-cod-comment_discussion_quote"))
+               "QUOTE")))
+    (diffs-tests--with-diff diffs-tests--normal
+      (diffs-minor-mode 1)
+      (goto-char (point-min))
+      (re-search-forward "^+(message \"new\")")
+      (beginning-of-line)
+      (diffs-review-add-annotation "Compact by default." nil)
+      (let* ((annotation (car diffs--review-annotations))
+             (id (plist-get annotation :id)))
+        (let ((display
+               (diffs-tests--review-annotation-display-by-id id)))
+            (should (string-match-p "QUOTE" display))
+            (should-not (string-match-p "Compact by default" display))
+            (should (= (cl-count ?\n display) 0))
+            (should (= (cdr (diffs--review-annotation-icon-display
+                             annotation))
+                       0))
+            (should
+             (eq
+              (lookup-key
+               (get-text-property 0 'keymap display)
+               [mouse-1])
+              #'diffs--review-toggle-comment-at-mouse)))
+        (diffs-review-toggle-comment)
+        (should
+         (string-match-p
+          "Compact by default"
+          (diffs-tests--review-annotation-display-by-id id)))
+        (should
+         (eq (alist-get id diffs--review-comment-display-overrides
+                        nil nil #'equal)
+             'expanded))
+        (diffs-review-toggle-comment)
+        (should
+         (string-match-p
+          "QUOTE"
+          (diffs-tests--review-annotation-display-by-id id)))
+        (should-not
+         (assoc id diffs--review-comment-display-overrides)))
+      (diffs-minor-mode -1))))
+
+(ert-deftest diffs-review-comment-icon-falls-back-to-older-codicon ()
+  (let (requested)
+    (cl-letf (((symbol-function 'diffs--nerd-icons-available-p)
+               (lambda () t))
+              ((symbol-function 'nerd-icons-codicon)
+               (lambda (name &rest _arguments)
+                 (push name requested)
+                 (if (equal name "nf-cod-comment_discussion_quote")
+                     (error "New glyph is unavailable")
+                   "DISCUSSION"))))
+      (should (equal (diffs--review-comment-icon) "DISCUSSION"))
+      (should
+       (equal (nreverse requested)
+              '("nf-cod-comment_discussion_quote"
+                "nf-cod-comment_discussion"))))))
+
+(ert-deftest diffs-review-comments-can-default-to-expanded ()
+  (let ((diffs-review-comment-display 'expanded))
+    (cl-letf (((symbol-function 'diffs--nerd-icons-available-p)
+               (lambda () t))
+              ((symbol-function 'nerd-icons-codicon)
+               (lambda (&rest _arguments) "QUOTE")))
+      (diffs-tests--with-diff diffs-tests--normal
+        (diffs-minor-mode 1)
+        (goto-char (point-min))
+        (re-search-forward "^+(message \"new\")")
+        (beginning-of-line)
+        (diffs-review-add-annotation "Expanded by default." nil)
+        (let* ((annotation (car diffs--review-annotations))
+               (id (plist-get annotation :id)))
+          (should
+           (string-match-p
+            "Expanded by default"
+            (diffs-tests--review-annotation-display-by-id id)))
+          (diffs-review-toggle-comment)
+          (should
+           (string-match-p
+            "QUOTE"
+            (diffs-tests--review-annotation-display-by-id id)))
+          (should
+           (eq (alist-get id diffs--review-comment-display-overrides
+                          nil nil #'equal)
+               'icon))
+          (diffs-review-toggle-comment)
+          (should
+           (string-match-p
+            "Expanded by default"
+            (diffs-tests--review-annotation-display-by-id id)))
+          (should-not
+           (assoc id diffs--review-comment-display-overrides)))
+        (diffs-minor-mode -1)))))
+
 (ert-deftest diffs-review-composer-removes-a-draft-image ()
   (should diffs-tests--review-composer-was-lazy)
   (require 'diffs-review-compose)
@@ -3514,6 +3742,33 @@
         (goto-char attachment-end))
       (diffs-review-compose-delete-attachment)
       (should (equal (buffer-string) " trailing text"))
+      (should-not diffs--review-compose-attachments))))
+
+(ert-deftest diffs-review-composer-retains-a-shared-draft-image ()
+  (require 'diffs-review-compose)
+  (with-temp-buffer
+    (diffs-review-compose-mode)
+    (let ((attachment
+           (list :id "diffs-attachment:shared-test"
+                 :label "Image #1"
+                 :bytes 3
+                 :data "png")))
+      (setq diffs--review-compose-attachments (list attachment))
+      (diffs--review-compose-insert-attachment attachment)
+      (insert " and ")
+      (diffs--review-compose-insert-attachment attachment)
+      (goto-char (point-min))
+      (diffs-review-compose-delete-attachment)
+      (should (equal (buffer-string) " and [Image #1]"))
+      (should (equal diffs--review-compose-attachments
+                     (list attachment)))
+      (should
+       (equal
+        (mapcar (lambda (item) (plist-get item :id))
+                (diffs--review-compose-referenced-attachments))
+        '("diffs-attachment:shared-test")))
+      (goto-char (point-max))
+      (diffs-review-compose-delete-attachment)
       (should-not diffs--review-compose-attachments))))
 
 (ert-deftest diffs-review-image-attachments-stay-in-live-session ()
@@ -3551,6 +3806,11 @@
            (diffs-review-compose-yank-image 'image/png diffs-tests--png)
            :type 'user-error))
         (cl-letf (((symbol-function 'gui-get-selection)
+                   (lambda (_selection target)
+                     (pcase target
+                       ('TARGETS [image/png])
+                       ('image/png diffs-tests--png))))
+                  ((symbol-function 'gui-backend-get-selection)
                    (lambda (_selection target)
                      (pcase target
                        ('TARGETS [image/png])
@@ -3626,31 +3886,41 @@
           (kill-buffer buffer))))))
 
 (ert-deftest diffs-review-multiline-annotation-reports-rendered-height ()
-  (pcase-let*
-      ((`(,display . ,height)
-        (diffs--review-annotation-display
-         '(:summary "first\nsecond"
-           :rationale "reason one\nreason two"
-           :author "agent\nname"
-           :source "agent"
-           :file "src/example.el"
-           :new-range (1 2)))))
-    (should (= height 7))
-    (should (= height (cl-count ?\n display)))
-    (should (string-match-p
-             "Agent note · agent name · src/example.el R2" display))
-    (should (eq (get-text-property
-                 (string-match "Agent note" display) 'face display)
-                'diffs-review-annotation-heading))
-    (should (eq (get-text-property
-                 (string-match "first" display) 'face display)
-                'diffs-review-annotation))
-    (should (eq (get-text-property
-                 (string-match "╭" display) 'face display)
-                'diffs-review-annotation-border))))
+  (let ((diffs-review-comment-display 'expanded))
+    (pcase-let*
+        ((`(,display . ,height)
+          (diffs--review-annotation-display
+           '(:summary "first\nsecond"
+             :id "diffs:click-test"
+             :rationale "reason one\nreason two"
+             :author "agent\nname"
+             :source "agent"
+             :file "src/example.el"
+             :new-range (1 2)))))
+      (should (= height 7))
+      (should (= height (cl-count ?\n display)))
+      (should (string-match-p
+               "Agent note · agent name · src/example.el R2" display))
+      (should (eq (get-text-property
+                   (string-match "Agent note" display) 'face display)
+                  'diffs-review-annotation-heading))
+      (should (eq (get-text-property
+                   (string-match "first" display) 'face display)
+                  'diffs-review-annotation))
+      (should (eq (get-text-property
+                   (string-match "╭" display) 'face display)
+                  'diffs-review-annotation-border))
+      (should
+       (eq
+        (lookup-key
+         (get-text-property
+          (string-match "first" display) 'keymap display)
+         [mouse-1])
+        #'diffs--review-edit-annotation-at-mouse)))))
 
 (ert-deftest diffs-review-annotation-projectors-use-live-pixel-geometry ()
-  (diffs-tests--with-diff diffs-tests--normal
+  (let ((diffs-review-comment-display 'expanded))
+    (diffs-tests--with-diff diffs-tests--normal
     (save-window-excursion
       (switch-to-buffer (current-buffer))
       (diffs-minor-mode 1)
@@ -3677,10 +3947,11 @@
             (diffs-tests--review-annotation-expected-right-edge
              display prefix))))
       (diffs-split-quit)
-      (diffs-minor-mode -1))))
+      (diffs-minor-mode -1)))))
 
 (ert-deftest diffs-review-display-metric-hooks-reproject-annotations ()
-  (diffs-tests--with-diff diffs-tests--normal
+  (let ((diffs-review-comment-display 'expanded))
+    (diffs-tests--with-diff diffs-tests--normal
     (save-window-excursion
       (switch-to-buffer (current-buffer))
       (diffs-minor-mode 1)
@@ -3708,10 +3979,11 @@
                    "metric-sensitive-note")))
             324)))
       (diffs-split-quit)
-      (diffs-minor-mode -1))))
+      (diffs-minor-mode -1)))))
 
 (ert-deftest diffs-review-opposite-split-comments-share-one-lane ()
-  (diffs-tests--with-diff diffs-tests--normal
+  (let ((diffs-review-comment-display 'expanded))
+    (diffs-tests--with-diff diffs-tests--normal
     (save-window-excursion
       (switch-to-buffer (current-buffer))
       (diffs-minor-mode 1)
@@ -3746,7 +4018,7 @@
             (should (= (cl-count ?\n old-string)
                        (cl-count ?\n new-string))))))
       (diffs-split-quit)
-      (diffs-minor-mode -1))))
+      (diffs-minor-mode -1)))))
 
 (ert-deftest diffs-split-clearing-selection-removes-all-selection-face ()
   (let ((buf (generate-new-buffer " *diffs split selection face test*"))
@@ -4961,6 +5233,7 @@
                  (diffs-review-add-annotation
                   "Keep this review state." "")
                  :id))
+          (diffs-review-toggle-comment annotation-id)
           (let* ((data diffs-tests--png)
                  (attachment
                   (list :id "diffs-attachment:refresh-test"
@@ -4995,6 +5268,12 @@
             (plist-get (car diffs--review-annotations) :id)
             annotation-id))
           (should
+           (eq
+            (alist-get annotation-id
+                       diffs--review-comment-display-overrides
+                       nil nil #'equal)
+            'expanded))
+          (should
            (equal (plist-get (car diffs--review-attachments) :id)
                   attachment-id))
           (should
@@ -5012,6 +5291,7 @@
           (should (equal diffs--review-session-id session))
           (should-not diffs--review-selection)
           (should-not diffs--review-annotations)
+          (should-not diffs--review-comment-display-overrides)
           (should-not diffs--review-attachments)
           (should-not diffs--review-decisions))
       (when (buffer-live-p buffer)

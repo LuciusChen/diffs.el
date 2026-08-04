@@ -72,6 +72,8 @@ Source navigation remains side-specific: `RET` or `M-RET` on A visits the first 
 | `TAB` | Fold or unfold a hunk in stacked view |
 | `v` / `x` | Select / clear a stable review range |
 | `a` | Open the comment composer for the selected range |
+| `c` | Toggle the comment at point in native stacked and split reviews; external editable diff buffers retain self-insertion |
+| `E` | Edit the comment covering the current line |
 | `[` / `]` | Previous / next comment |
 | `A` / `R` / `U` | Accept / reject / reset a change block |
 | `C-c C-c` | Apply reviewed decisions without saving or staging |
@@ -112,9 +114,13 @@ Two-way and diff3 markers are supported. For diff3 input, Base remains visible w
 
 Press `v` on a changed line to select that old- or new-side source line. For a range, activate a normal Emacs region (`C-SPC`), extend it over changed lines on the same file and side, then press `v`. The stored selection is a one-based file/side/line range rather than a buffer position, so it survives stacked/split switches and context rebuilds.
 
-Press `a` to open one editable comment buffer at the bottom of the frame. Its first paragraph becomes the summary; text after the first blank line becomes the optional rationale. The buffer uses ordinary `text-mode` editing: `C-c C-c` submits and restores the review windows, while `C-c C-k` cancels. Comments render below their target line as framed note boxes with normal foreground text and an exact file plus L/R line anchor, or the corresponding A/B anchor in `diffs-files`; redisplay-aligned padding keeps the border aligned around mixed CJK, Emoji, and image placeholders, and is recomputed after text scaling or a theme transition. They do not reuse the source-code comment face or compete with syntax-highlight colors. In split view, old/new comments on the same aligned row share one vertical lane; the shorter side receives only enough invisible padding to match the taller comment. A comment without an opposite-side partner still receives an equal-height peer spacer, so later code stays aligned. Use `[` and `]` to navigate comments, `x` to clear only the selection, and `M-x diffs-review-remove-annotation` or `M-x diffs-review-clear-annotations` to remove comments.
+Press `a` to open one editable comment buffer at the bottom of the frame. Its first paragraph becomes the summary; text after the first blank line becomes the optional rationale. The buffer uses ordinary `text-mode` editing: `C-c C-c` submits and restores the review windows, while `C-c C-k` cancels. Comments initially render as the compact Nerd Fonts `nf-cod-comment_discussion_quote` icon at the end of their source row without consuming another visual row. A nerd-icons glyph table predating that icon falls back to `nf-cod-comment_discussion`, then to a Unicode speech bubble when nerd-icons is unavailable. Press `c` on a comment's source range in a native stacked or split review, or click its icon with mouse-1, to expand it; press `c` again to collapse it. An external editable `diff-mode` buffer retains `c` for insertion, so use mouse-1 or `M-x diffs-review-toggle-comment` there. Set `diffs-review-comment-display` to `expanded` when complete note boxes should be the initial presentation. Per-comment display choices survive stacked/split switches and refreshes but remain UI state rather than Agent-visible comment data.
 
-The normal yank/paste command in the composer prefers an available clipboard image and otherwise inserts text normally; use a prefix argument such as `C-u C-y` to bypass media detection and force an ordinary text yank. An image appears in the draft and rendered comment as `[Image #N]`; use `C-c C-d` on its draft placeholder to remove it. Image MIME must agree with the detected container, graphical sessions decode it once before acceptance, byte limits are enforced, and retained data lives only in the review owner or current draft—never in a default cache or implicit temporary file.
+Use `[` or `]` to visit a comment and press `E`, or click its expanded rendered box with mouse-1, to reopen the same composer. Editing preserves the comment id, target, provenance, creation time, and retained images; submission updates its text and `updatedAt`, so a live Agent session observes the same comment rather than a remove/add pair. If several comments cover the current line, `c` or `E` asks which summary to act on.
+
+Comments render below their target line as framed note boxes with normal foreground text and an exact file plus L/R line anchor, or the corresponding A/B anchor in `diffs-files`; redisplay-aligned padding keeps the border aligned around mixed CJK, Emoji, and image placeholders, and is recomputed after text scaling or a theme transition. They do not reuse the source-code comment face or compete with syntax-highlight colors. In split view, old/new comments on the same aligned row share one vertical lane; the shorter side receives only enough invisible padding to match the taller comment. A comment without an opposite-side partner still receives an equal-height peer spacer, so later code stays aligned. Use `x` to clear only the selection, and `M-x diffs-review-remove-annotation` or `M-x diffs-review-clear-annotations` to remove comments.
+
+The normal yank/paste command in the composer prefers an available clipboard image and otherwise inserts text normally; Emacs 29 may ask which representation to use when the clipboard offers several supported image MIME types. Use a prefix argument such as `C-u C-y` to bypass media detection and force an ordinary text yank. An image appears in the draft and rendered comment as `[Image #N]`; use `C-c C-d` on its draft placeholder to remove it. If the same attachment placeholder was copied, its binary remains live until the final reference is removed. Image MIME must agree with the detected container, graphical sessions decode it once before acceptance, byte limits are enforced, and retained data lives only in the review owner or current draft—never in a default cache or implicit temporary file.
 
 Comments and image bytes are buffer-local state owned by the live review session. Quitting the complete review with `q` ends that session and discards them. `M-x diffs-review-export` writes text-only comments as a Hunk-compatible version-1 sidecar using `oldRange`/`newRange`; when any comment has an image, export refuses explicitly because Hunk version 1 has no attachment field, rather than dropping the image or embedding base64. `M-x diffs-review-import` restores text comments only after validating every known field and old/new target against the current diff. Unknown fields are ignored for compatibility with newer producers, and an annotation may carry both old and new ranges. An invalid import or display failure leaves existing comments intact.
 
@@ -172,6 +178,8 @@ Annotation plists use `:id`, `:file`, inclusive one-based `:old-range`/`:new-ran
 |---|---|
 | `(diffs-review-selected-range)` | Return a copy of the current `:file`, `:side`, `:start`, and `:end` selection plist, or `nil` |
 | `(diffs-review-annotations)` | Return copies of all annotation plists in the current stacked or split review |
+| `(diffs-review-toggle-comment &optional ID)` | Toggle the comment at point, or optional comment `ID`, between icon and expanded display |
+| `(diffs-review-edit-annotation &optional ID)` | Open the bottom composer for the comment at point, or for optional comment `ID` |
 | `(diffs-review-sessions-json)` | Describe every live review session |
 | `(diffs-review-json SELECTOR INCLUDE-PATCH INCLUDE-NOTES)` | Describe files, hunks, decisions, selection, and optionally raw patches and annotations in one live review |
 | `(diffs-review-comments-json SELECTOR TYPE FILE)` | Return filtered live comments |
@@ -298,6 +306,7 @@ All options belong to the `diffs` customization group.
 
 | Option | Default | Purpose |
 |---|---:|---|
+| `diffs-review-comment-display` | `icon` | Initial comment presentation: compact `icon` or complete `expanded` note box |
 | `diffs-review-image-max-bytes` | 15 MiB | Largest accepted pasted image |
 | `diffs-review-image-total-max-bytes` | 64 MiB | Total image data retained by one live review, including its current draft |
 
