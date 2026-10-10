@@ -25,7 +25,7 @@ Alternatively, clone the repository, add its directory to `load-path`, and load 
 
 ## Why diffs.el
 
-- No renderer subprocess and no ANSI parsing. (The commands still use VC/Git or the configured `diff-command` to produce their input.) A 22k-line / 800-file review scans in about 23 ms and prepares stacked rendering in about 33 ms; on large diffs decorations are applied lazily through jit-lock, so only what you see is rendered.
+- No renderer subprocess and no ANSI parsing. (The commands still use VC/Git or the configured `diff-command` to produce their input.) A 22k-line / 800-file review scans in about 12 ms and prepares stacked rendering in about 20 ms; on large diffs decorations are applied lazily through jit-lock, so only what you see is rendered.
 - The diff text is never modified: `diff-goto-source` (`RET`), isearch, `diff-apply-hunk`, and the rest of `diff-mode` keep working; line numbers live in `line-prefix`, so copying and searching stay clean.
 - Theme-native: everything inherits from the standard `diff-*` faces.
 - Revision-aware syntax highlighting: the old side is fontified from the file contents at the reference revision.
@@ -323,25 +323,27 @@ All options belong to the `diffs` customization group.
 
 The Agent installer destinations are controlled by `diffs-review-cli-install-path`, `diffs-review-skill-install-directory`, and `diffs-review-assets-directory`.
 
-On an M-series Mac running Emacs 32, the volume benchmark (800 files, 22,000 lines, 536 KB) measures about 23 ms for scanning, 33 ms for lazy stacked setup, 2 ms to materialize its first viewport, 59 ms for the first side-by-side render, 21 ms to materialize a first deep split viewport, and 5 ms for a cached toggle. The default `auto` policy selects paged rendering for this fixture. This profile isolates file indexing, virtualization, projection, and decision-rebuild scaling; its public split-view `A` and `R` paths measure about 264 ms and 314 ms.
+On an M-series Mac running Emacs 32, the volume benchmark (800 files, 22,000 lines, 536 KB) measures about 12 ms for scanning, 20 ms for lazy stacked setup, 1 ms to materialize its first viewport, 24 ms for the first side-by-side render, 12 ms to materialize a first deep split viewport, and 2 ms for a cached toggle. The default `auto` policy selects paged rendering for this fixture. This profile isolates file indexing, virtualization, projection, and decision-rebuild scaling; its public split-view `A` and `R` paths measure about 79 ms and 101 ms. All benchmark numbers are medians of three runs of byte-compiled code: `make benchmark` compiles the package into a temporary directory first, because the same source loaded as interpreted code runs two to three times slower than what users get, and native compilation changed these timings by less than 20%. Set `DIFFS_BENCH_INTERPRETED=1` to measure the source instead.
 
-The same default command also runs a content-complexity profile with multiple hunks per file, unequal and reordered 9–15-line replacement blocks, token-rich punctuation and camelCase identifiers, CJK, combining characters, emoji, and guarded 1,000+ character replacements. Its 16-file, 1,514-line, 313 KB fixture has only 1,514 physical lines but an estimated 51,987 units of changed-content work, so `auto` correctly selects lazy stacked decoration and paged split rendering. It measures about 15 ms for stacked setup, 105 ms for the first 100-line stacked viewport, 72 ms for the first split, 283 ms for a first deep viewport, 19 ms for a cached toggle, and 618 ms when an operation explicitly requests the complete searchable projection. It separately reports one cold hunk at about 13 ms for line pairing and 18 ms for pairing plus within-line refinement.
+The same default command also runs a content-complexity profile with multiple hunks per file, unequal and reordered 9–15-line replacement blocks, token-rich punctuation and camelCase identifiers, CJK, combining characters, emoji, and guarded 1,000+ character replacements. Its 16-file, 1,514-line, 313 KB fixture has only 1,514 physical lines but an estimated 51,987 units of changed-content work, so `auto` correctly selects lazy stacked decoration and paged split rendering. It measures about 14 ms for stacked setup, 71 ms for the first 100-line stacked viewport, 49 ms for the first split, 154 ms for a first deep viewport, 13 ms for a cached toggle, and 613 ms when an operation explicitly requests the complete searchable projection. It separately reports one cold hunk at about 12 ms for line pairing and 13 ms for pairing plus within-line refinement.
 
-Run both profiles on your machine with:
+A third profile adds one 20,000-line file as a single hunk, because the paged model virtualizes whole hunks and a volume of small hunks cannot show what one large hunk costs. It measures about 23 ms for scanning, 31 ms for stacked setup, 14 ms for the first stacked viewport and 17 ms for one near the end, 795 ms for the first split, 587 ms for a deep split viewport, and 740 ms for the complete projection. `DIFFS_BENCH_LINES` sets the size.
+
+Run all three profiles on your machine with:
 
 ```sh
 make benchmark
 ```
 
-Run only the complex-content profile with `make benchmark-complex`.
+Run only the complex-content profile with `make benchmark-complex`, or only the single-hunk profile with `make benchmark-hunk`.
 
-The large volume tier uses 4,000 files and 110,000 lines to expose scaling defects hidden by the default volume fixture. The automatic paged path currently measures about 102 ms for scanning, 141 ms for stacked setup, 3 ms for its first viewport, 182 ms for the first split, 22 ms for a deep split viewport, 6 ms for a cached toggle, and 1.23/1.54 seconds for `A`/`R`. Run it after changing row collection, physical indexing, viewport lookup, or decision rebuilding:
+The large volume tier uses 4,000 files and 110,000 lines to expose scaling defects hidden by the default volume fixture. The automatic paged path currently measures about 59 ms for scanning, 86 ms for stacked setup, 1 ms for its first viewport, 70 ms for the first split, 12 ms for a deep split viewport, 3 ms for a cached toggle, and 0.47 seconds for each of `A` and `R`. Run it after changing row collection, physical indexing, viewport lookup, or decision rebuilding:
 
 ```sh
 make benchmark-large
 ```
 
-Set `DIFFS_BENCH_VIRTUALIZATION=complete` or `DIFFS_BENCH_VIRTUALIZATION=paged` to force either model. The complete path currently takes about 218 ms / 1.08 seconds for the first split and 1.0/2.6 ms for a cached toggle on the volume and large-volume tiers. The automatic paged pair upgrades to its exact searchable projection in about 280 ms / 1.36 seconds; subsequent search and copy operations reuse it. Decision timings remain near the complete model because decisions deliberately fall back to it.
+Set `DIFFS_BENCH_VIRTUALIZATION=complete` or `DIFFS_BENCH_VIRTUALIZATION=paged` to force either model. The complete path currently takes about 72 ms / 344 ms for the first split and 0.2/0.4 ms for a cached toggle on the volume and large-volume tiers. The automatic paged pair upgrades to its exact searchable projection in about 86 ms / 396 ms; subsequent search and copy operations reuse it. Decision timings remain near the complete model because decisions deliberately fall back to it.
 
 ## Integrations
 

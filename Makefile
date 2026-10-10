@@ -6,7 +6,7 @@ PACKAGE_FILES = diffs.el diffs-assets.el diffs-cli.el \
 LISP_FILES = $(patsubst %,"%",$(PACKAGE_FILES))
 
 .PHONY: test session-cli-test compile checkdoc package-lint lint check \
-	benchmark benchmark-complex benchmark-large
+	benchmark benchmark-complex benchmark-hunk benchmark-large
 
 # The Lisp forms below reach Emacs through the environment.  A backslash-
 # newline inside single quotes is dropped by the make 3.81 that ships with
@@ -76,9 +76,15 @@ benchmark:
 	  $(EMACS) -Q --batch -L . -l test/diffs-benchmark.el
 	DIFFS_BENCH_PROFILE=complex \
 	  $(EMACS) -Q --batch -L . -l test/diffs-benchmark.el
+	DIFFS_BENCH_PROFILE=hunk \
+	  $(EMACS) -Q --batch -L . -l test/diffs-benchmark.el
 
 benchmark-complex:
 	DIFFS_BENCH_PROFILE=complex \
+	  $(EMACS) -Q --batch -L . -l test/diffs-benchmark.el
+
+benchmark-hunk:
+	DIFFS_BENCH_PROFILE=hunk \
 	  $(EMACS) -Q --batch -L . -l test/diffs-benchmark.el
 
 benchmark-large:
