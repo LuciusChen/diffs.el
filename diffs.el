@@ -6632,10 +6632,10 @@ current selected again."
 ;; it.  Ending the search there shows the file and moves to its first
 ;; match, so nothing is built for a file the search does not settle on.
 
-(defvar-local diffs--split-notes-cache nil
-  "Cons of the rows of this split buffer and their folded-file note rows.")
+(defvar-local diffs--split-gates-cache nil
+  "Cons of a modification tick of this split buffer and its folded files.")
 
-(defun diffs--split-fold-gates ()
+(defun diffs--split-find-fold-gates ()
   "Return the folded files of this split buffer as (SECTION BEG END) lists.
 BEG and END delimit the text of the file's note row, in buffer order."
   (let ((notes
@@ -6646,24 +6646,29 @@ BEG and END delimit the text of the file's note row, in buffer order."
                                 (get-text-property
                                  0 'diffs-fold-note (aref chunk 2)))
                       collect (cons (aref chunk 1) (aref chunk 3)))
-           (unless (eq (car diffs--split-notes-cache) diffs--split-rows)
-             (setq diffs--split-notes-cache
-                   (cons diffs--split-rows
-                         (cl-loop for row across diffs--split-rows
-                                  for index from 0
-                                  when (and (stringp (car row))
-                                            (> (length (car row)) 0)
-                                            (get-text-property
-                                             0 'diffs-fold-note (car row)))
-                                  collect (cons (diffs--split-row-section row)
-                                                index)))))
-           (cdr diffs--split-notes-cache))))
+           (cl-loop for row across diffs--split-rows
+                    for index from 0
+                    when (and (stringp (car row))
+                              (> (length (car row)) 0)
+                              (get-text-property
+                               0 'diffs-fold-note (car row)))
+                    collect (cons (diffs--split-row-section row) index)))))
     (cl-loop for (section . index)
              in (cl-remove-duplicates notes :key #'car :test #'eq
                                       :from-end t)
              collect (list section
                            (diffs--split-row-position index)
                            (1- (diffs--split-row-position (1+ index)))))))
+
+(defun diffs--split-fold-gates ()
+  "Return the folded files of this split buffer as (SECTION BEG END) lists.
+The positions stay valid until the text changes, and a search asks for
+them once per match."
+  (let ((tick (buffer-chars-modified-tick)))
+    (unless (eql (car diffs--split-gates-cache) tick)
+      (setq diffs--split-gates-cache
+            (cons tick (diffs--split-find-fold-gates))))
+    (cdr diffs--split-gates-cache)))
 
 (defun diffs--folded-hunks-match-p (section string search side)
   "Return non-nil if SECTION's hunks have a match of STRING on SIDE.
@@ -6703,33 +6708,39 @@ side."
       (let ((case-fold-search fold))
         (diffs--folded-hunks-match-p section string search side)))))
 
-(defun diffs--split-isearch-gate (gates string search origin hit)
+(defun diffs--split-isearch-gate (gates string search origin hit bound)
   "Return the gate in GATES that a search from ORIGIN reaches before HIT.
-HIT is the (BEG . END) of the match SEARCH found in the rows, or nil.
-The gate is also one whose file hides a match of STRING."
+HIT is the (BEG . END) of the match SEARCH found in the rows, or nil,
+and BOUND limits the search.  The gate is also one whose file hides a
+match of STRING."
   (let ((forward isearch-forward))
     (cl-find-if
      (lambda (gate)
        (pcase-let ((`(,section ,beg ,end) gate))
          (and (if forward
-                  (and (> end origin) (or (null hit) (<= end (car hit))))
-                (and (< beg origin) (or (null hit) (>= beg (cdr hit)))))
+                  (and (> end origin)
+                       (or (null hit) (<= end (car hit)))
+                       (or (null bound) (<= end bound)))
+                (and (< beg origin)
+                     (or (null hit) (>= beg (cdr hit)))
+                     (or (null bound) (>= beg bound))))
               (diffs--split-hidden-match-p section string search))))
      (if forward gates (reverse gates)))))
 
 (defun diffs--split-isearch-search-fun ()
-  "Return isearch's search function, extended to stop on folded files."
+  "Return isearch's search function, extended to stop on folded files.
+Lazy highlighting and counting call it too, so a folded file that
+matches counts as one match and its note row is highlighted."
   (let ((search (isearch-search-fun-default)))
     (lambda (string &optional bound noerror count)
-      ;; Lazy highlighting passes a bound and only needs visible matches.
-      (let ((gates (and (not bound) (not count) (diffs--split-fold-gates))))
+      (let ((gates (and (not count) (diffs--split-fold-gates))))
         (if (not gates)
             (funcall search string bound noerror count)
           (let* ((origin (point))
                  (found (funcall search string bound noerror count))
                  (hit (and found (cons (match-beginning 0) (match-end 0))))
                  (gate (diffs--split-isearch-gate
-                        gates string search origin hit)))
+                        gates string search origin hit bound)))
             (if (not gate)
                 found
               (set-match-data (list (nth 1 gate) (nth 2 gate)))

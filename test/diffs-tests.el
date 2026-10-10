@@ -5851,6 +5851,37 @@ The pre-command hook runs first, as it does for a key."
       (should (string-search "needle at the end" (diffs-tests--line)))
       (should (looking-back "needle" (line-beginning-position))))))
 
+(ert-deftest diffs-split-fold-gates-follow-the-text-of-a-paged-split ()
+  ;; Drawing the second hunk of a.el moves the note row after it.
+  (let ((patch
+         (concat
+          "diff --git a/a.el b/a.el\n"
+          "--- a/a.el\n"
+          "+++ b/a.el\n"
+          "@@ -1,60 +1,60 @@\n"
+          (mapconcat (lambda (n) (format " entry %d\n" n))
+                     (number-sequence 1 60) "")
+          "@@ -300,2 +300,2 @@\n"
+          " tail\n"
+          "-old\n"
+          "+a much longer replacement line\n"
+          "diff --git a/yarn.lock b/yarn.lock\n"
+          "--- a/yarn.lock\n"
+          "+++ b/yarn.lock\n"
+          "@@ -1,2 +1,2 @@\n"
+          "-old\n"
+          "+new\n"
+          " same\n"))
+        (diffs-split-overscan 0))
+    (diffs-tests--with-split (patch 'paged buffer old-buffer new-buffer)
+      (let ((before (car (diffs--split-fold-gates))))
+        (diffs--split-paged-materialize-all)
+        (let ((after (car (diffs--split-fold-gates))))
+          (should (> (nth 1 after) (nth 1 before)))
+          (should (string-search "hidden lines"
+                                 (buffer-substring-no-properties
+                                  (nth 1 after) (nth 2 after)))))))))
+
 (ert-deftest diffs-split-search-matches-only-the-text-its-side-shows ()
   (dolist (virtualization '(complete paged))
     (diffs-tests--with-split
@@ -5928,20 +5959,49 @@ The pre-command hook runs first, as it does for a key."
           (sleep-for 0.05))
         (should (with-current-buffer buffer (diffs--section-folded-p lock)))))))
 
-(ert-deftest diffs-split-search-function-ignores-folded-files-when-bounded ()
-  ;; Lazy highlighting passes a bound and wants only the visible matches.
+(ert-deftest diffs-split-search-function-counts-folded-files-as-matches ()
+  ;; Lazy highlighting and counting step through the buffer with a bound.
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--folded-order-patch virtualization buffer old-buffer new-buffer)
+      (when diffs--split-paged-p
+        (diffs--split-paged-materialize-all))
+      (let ((isearch-forward t)
+            (case-fold-search nil)
+            (search (diffs--split-isearch-search-fun))
+            stops)
+        (goto-char (point-min))
+        ;; A search that stops advancing must fail the test, not hang it.
+        (cl-loop repeat 10
+                 while (funcall search "needle" (point-max) t)
+                 do (push (list (diffs-tests--line)
+                                (diffs-tests--section-file-at-point)
+                                (- (match-end 0) (match-beginning 0)))
+                          stops))
+        (setq stops (nreverse stops))
+        (should (= (length stops) 4))
+        (should (equal (car (nth 0 stops)) "needle a"))
+        (should (string-search "hidden lines" (car (nth 1 stops))))
+        (should (equal (cadr (nth 1 stops)) "package-lock.json"))
+        (should (equal (cadr (nth 2 stops)) "yarn.lock"))
+        (should (equal (car (nth 3 stops)) "needle b"))
+        ;; A note row is a match as long as its text.
+        (should (> (nth 2 (nth 1 stops)) (length "needle")))))))
+
+(ert-deftest diffs-split-search-function-keeps-a-folded-file-within-its-bound ()
   (diffs-tests--with-split
       (diffs-tests--lock-file-patch 'complete buffer old-buffer new-buffer)
-    (let ((isearch-forward t)
-          (case-fold-search nil)
-          (search (diffs--split-isearch-search-fun))
-          (note (car (diffs--split-fold-gates))))
-      (should note)
-      (goto-char (point-min))
-      (should-not (funcall search "1.0.1" (point-max) t))
-      (should (= (funcall search "1.0.1" nil t) (nth 2 note)))
-      (should (= (match-beginning 0) (nth 1 note)))
-      (should (= (match-end 0) (nth 2 note))))))
+    (let* ((case-fold-search nil)
+           (search (diffs--split-isearch-search-fun))
+           (note (car (diffs--split-fold-gates))))
+      (let ((isearch-forward t))
+        (goto-char (point-min))
+        (should-not (funcall search "1.0.1" (1- (nth 2 note)) t))
+        (should (= (funcall search "1.0.1" (nth 2 note) t) (nth 2 note))))
+      (let ((isearch-forward nil))
+        (goto-char (point-max))
+        (should-not (funcall search "1.0.1" (1+ (nth 1 note)) t))
+        (should (= (funcall search "1.0.1" (nth 1 note) t) (nth 1 note)))))))
 
 (ert-deftest diffs-imenu-shows-a-folded-file-before-jumping-to-its-hunk ()
   (diffs-tests--with-diff diffs-tests--lock-file-patch
