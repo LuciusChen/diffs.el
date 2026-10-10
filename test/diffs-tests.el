@@ -3772,6 +3772,7 @@
       (should-not diffs--review-compose-attachments))))
 
 (ert-deftest diffs-review-image-attachments-stay-in-live-session ()
+  (skip-unless (image-type-available-p 'png))
   (diffs-tests--with-diff diffs-tests--normal
     (let ((owner (current-buffer)) draft attachment-id annotation-id)
       (save-window-excursion
@@ -7736,6 +7737,10 @@
       (should (equal (buffer-string) text)))))
 
 (ert-deftest diffs-unified-view-adds-theme-native-fringe-bars ()
+  ;; Builds without a window system bind `define-fringe-bitmap' to a stub
+  ;; that registers nothing.
+  (skip-unless (progn (define-fringe-bitmap 'diffs-tests--probe [1] 1 1)
+                      (fringe-bitmap-p 'diffs-tests--probe)))
   (let ((diffs-line-numbers nil))
     (diffs-tests--with-diff diffs-tests--normal
       (diffs-minor-mode 1)
