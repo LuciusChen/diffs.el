@@ -377,7 +377,7 @@ Set `DIFFS_BENCH_VIRTUALIZATION=complete` or `DIFFS_BENCH_VIRTUALIZATION=paged` 
 
 ## Format handling
 
-Metadata-only Git changes such as renames and mode changes remain visible instead of being reported as an empty diff.  Quoted Git paths are decoded for source navigation.  Commit views use a first-parent two-way diff, including for merge commits, since the UI has an old and a new side.  A combined diff supplied directly remains visible as raw metadata instead of being hidden or rejected.
+Metadata-only Git changes such as renames and mode changes remain visible instead of being reported as an empty diff.  Quoted Git paths are decoded for source navigation.  Commit views use a first-parent two-way diff, including for merge commits, since the UI has an old and a new side.  A combined diff supplied directly remains visible as raw metadata instead of being hidden or rejected. A plain unified patch without `diff` or `Index:` lines is split into files at its `---` and `+++` headers; the hunk counts tell a header from removed and added lines that only look like one.
 
 ## Development
 

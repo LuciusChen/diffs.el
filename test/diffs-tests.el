@@ -70,6 +70,30 @@
    "-old bar\n"
    "+new bar\n"))
 
+(defconst diffs-tests--plain-two-files
+  (concat
+   "--- a/one.el\t2026-01-01\n"
+   "+++ b/one.el\t2026-01-02\n"
+   "@@ -1,2 +1,2 @@\n"
+   " keep\n"
+   "-old one\n"
+   "+new one\n"
+   "--- a/two.el\t2026-01-01\n"
+   "+++ b/two.el\t2026-01-02\n"
+   "@@ -1 +1 @@\n"
+   "-old two\n"
+   "+new two\n"))
+
+(defconst diffs-tests--header-like-content
+  (concat
+   "--- a/query.sql\n"
+   "+++ b/query.sql\n"
+   "@@ -1,3 +1,3 @@\n"
+   " select 1;\n"
+   "--- comment\n"
+   "+++ other\n"
+   " select 2;\n"))
+
 (defconst diffs-tests--hidden-context
   (concat
    "diff --git a/context.el b/context.el\n"
@@ -2028,6 +2052,68 @@
           (set-buffer-modified-p nil))
         (kill-buffer source-buffer))
       (delete-directory directory t))))
+
+(ert-deftest diffs-scan-splits-plain-unified-files-by-hunk-counts ()
+  (diffs-tests--with-diff diffs-tests--plain-two-files
+    (diffs--scan)
+    (should (equal (mapcar (lambda (section) (plist-get section :file))
+                           diffs--sections)
+                   '("one.el" "two.el")))
+    (should (equal (mapcar (lambda (section) (length (plist-get section :hunks)))
+                           diffs--sections)
+                   '(1 1)))
+    (should (equal diffs--stats '(2 2 2)))
+    (let ((first (car diffs--sections))
+          (second (cadr diffs--sections)))
+      (save-excursion
+        (goto-char (plist-get second :beg))
+        (should (looking-at "--- a/two\\.el")))
+      (should (= (plist-get first :end) (plist-get second :beg)))
+      (should (= (diffs--hunk-end (car (plist-get first :hunks)) first)
+                 (plist-get second :beg))))
+    ;; Decoration follows the split: each changed line names its own file.
+    (diffs-minor-mode 1)
+    (dolist (spec '(("+new one" . "one.el") ("+new two" . "two.el")))
+      (goto-char (point-min))
+      (search-forward (car spec))
+      (should (equal (get-text-property (line-beginning-position) 'diffs-file)
+                     (cdr spec))))))
+
+(ert-deftest diffs-scan-keeps-header-like-hunk-lines-in-their-hunk ()
+  ;; A removed "-- comment" and an added "++ other" read as file markers
+  ;; until the hunk's counts show they are inside it.
+  (dolist (text (list diffs-tests--header-like-content
+                      (concat "diff --git a/query.sql b/query.sql\n"
+                              diffs-tests--header-like-content)))
+    (diffs-tests--with-diff text
+      (diffs--scan)
+      (should (= (length diffs--sections) 1))
+      (let ((section (car diffs--sections)))
+        (should (equal (plist-get section :file) "query.sql"))
+        (should (= (length (plist-get section :hunks)) 1))
+        (should (= (plist-get section :adds) 1))
+        (should (= (plist-get section :dels) 1))))))
+
+(ert-deftest diffs-scan-splits-plain-files-after-no-newline-markers ()
+  (diffs-tests--with-diff
+      (concat "--- a/n1\n+++ b/n1\n@@ -1 +1 @@\n"
+              "-x\n\\ No newline at end of file\n"
+              "+y\n\\ No newline at end of file\n"
+              "--- a/n2\n+++ b/n2\n@@ -1 +1 @@\n-p\n+q\n")
+    (diffs--scan)
+    (should (equal (mapcar (lambda (section) (plist-get section :file))
+                           diffs--sections)
+                   '("n1" "n2")))))
+
+(ert-deftest diffs-scan-leaves-short-hunks-in-one-section ()
+  ;; The first hunk promises five lines but has one, so the counts cannot
+  ;; place a boundary; the section is not split on a guess.
+  (diffs-tests--with-diff
+      (concat "--- a/short\n+++ b/short\n@@ -1,5 +1,5 @@\n"
+              " ctx\n"
+              "--- a/other\n+++ b/other\n@@ -1 +1 @@\n-p\n+q\n")
+    (diffs--scan)
+    (should (= (length diffs--sections) 1))))
 
 (ert-deftest diffs-scan-counts-files-and-lines ()
   (diffs-tests--with-diff diffs-tests--normal
