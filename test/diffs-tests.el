@@ -2585,6 +2585,63 @@
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
 
+(ert-deftest diffs-split-expands-context-from-a-decided-block ()
+  (let ((buf (generate-new-buffer " *diffs decided context test*"))
+        (diffs-context-step 2)
+        old new)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buf)
+          (insert diffs-tests--hidden-context)
+          (diff-mode)
+          (diffs-minor-mode 1)
+          (let ((section (car diffs--sections)))
+            (puthash section
+                     ["old one" "old two" "old three" "old four"
+                      "old five"]
+                     diffs--old-content-cache)
+            (puthash section
+                     ["new one" "new two" "new three" "new four"
+                      "new five"]
+                     diffs--new-content-cache))
+          (setq buffer-read-only t)
+          (diffs-toggle-split)
+          (setq new (current-buffer)
+                old diffs--split-other)
+          (select-window (get-buffer-window old))
+          (goto-char (point-min))
+          (search-forward "old five")
+          (beginning-of-line)
+          (let ((inhibit-message t))
+            (diffs-review-accept-change))
+          ;; The decision rebuilt the split.  Its chosen rows mirror the
+          ;; accepted text and must still belong to the scanned hunk and
+          ;; section, not to copies of them.
+          (should (derived-mode-p 'diffs-split-mode))
+          (goto-char (point-min))
+          (search-forward "new five")
+          (beginning-of-line)
+          (let* ((owner diffs--split-unified)
+                 (section (car (buffer-local-value 'diffs--sections owner)))
+                 (hunk (car (plist-get section :hunks)))
+                 (row (diffs--split-row-at-position (point))))
+            (should (eq (nth 5 row) hunk))
+            (should (eq (diffs--split-row-section row) section))
+            (should (eq (get-text-property (point) 'diffs-hunk) hunk))
+            (let ((inhibit-message t))
+              (diffs-split-expand-context))
+            (should (derived-mode-p 'diffs-split-mode))
+            (should (= (plist-get (car (buffer-local-value
+                                        'diffs--context-gaps owner))
+                                  :visible)
+                       2))))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (diffs-minor-mode -1)))
+      (dolist (buffer (list old new buf))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
 (ert-deftest diffs-split-context-rebuild-restores-wrapped-chunk-offset ()
   (let* ((buf (generate-new-buffer " *diffs split wrapped restore test*"))
          (diffs-context-step 2)
