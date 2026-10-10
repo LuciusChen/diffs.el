@@ -11,6 +11,7 @@ A file can be folded to its header in both views, and files that match `diffs-co
 - Refresh keeps what it knew. The snapshot records, for each file that appears once, whether it was folded, and whether it was open although `diffs-collapsed-files` would fold it. The defaults apply only to files the snapshot does not mention, so a lock file opened by hand is not closed again by `g`. A failed refresh refolds from the same snapshot.
 - A review of a single file never opens folded, because that file was asked for by name.
 - Commands that move to a target inside a folded file show the file first: Imenu hunk entries, `[` and `]` between comments, and entering a diff at a source line when point lands inside a hunk. In the split view this rebuilds the pair.
+- Search reaches folded files. A folded file has no rows, so isearch in a split buffer cannot see its text. Each split buffer installs a search function for isearch. When a search would pass the note row of a folded file before its next match in the rows, the function looks for a match in the file's hunks in the unified buffer, on the lines this side shows, and stops on the note row when there is one. The stop is ordered with the visible matches, so a search meets files in document order. Ending the search on a note row with anything but a quit schedules a rebuild that shows the file and moves to its first match, or its last when searching backward. Nothing is built while the search goes on. Lazy highlighting passes a bound and sees only the rows.
 - Disabling `diffs-minor-mode` shows the folded files and leaves other outline folds to the user.
 
 ## Why
@@ -34,6 +35,8 @@ Folding by file also answers the request for it: a reviewer reads the source and
 - Redraw the stacked header with a hidden-line count whenever outline changes a fold. That needs `outline-view-change-hook`, which is obsolete since Emacs 29.1, and the fold marker already shows that the file is folded. The statistics in the header say how much changed.
 - Bind `TAB` in the stacked maps. `diff-mode` gives it `diff-hunk-next`, the heading keymap of outline already overrides it on headings, and `diffs-minor-mode-map` must not take it from editable diff buffers. Only the split map, which has no outline, gained a binding.
 - Fold when a file is first drawn only. Without refresh memory, `g` would close a lock file the reviewer had opened.
+- Show every folded file when a search starts. The string is not known yet, and a search for source text would open every lock file of the review.
+- Rebuild as soon as a search stops on a note row. A search is typed one character at a time, so the file would open for the first prefix that matched, and a rebuild costs as much as showing the file. Ending the search is the moment the reader has chosen the match.
 
 ## Consequences
 
@@ -46,4 +49,6 @@ Folding by file also answers the request for it: a reviewer reads the source and
 - A file folds as a unit only when its section starts on an outline heading, which `diff-mode` gives `diff --git` lines in Git-format patches. In other patches, such as `Index:` sections or a plain unified diff, the hunks fold one by one as before. Outline may take a bare `+++` line as a file heading there, but diffs.el draws that line inside the rendered header, so the file fold does not reach the split view.
 - The split view folds files, not hunks.
 - The changed-file index does not mark folded files.
+- A search stops once on a folded file, not once per match inside it; the matches are reached after the file is shown. Only isearch is covered, so `occur` and other commands that read the split text see the note row.
+- With `diffs-split-wrap-lines`, a match that straddles a wrapped row is not found among the rows, as for visible text. A stop on a note row can then show a file in which the search finds nothing, and it says so.
 - Refresh matches files by name. A file that appears twice in one review, as mixed items can, takes the defaults again.
