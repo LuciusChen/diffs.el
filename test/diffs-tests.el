@@ -7137,6 +7137,38 @@
       (should-not (search-forward
                    "diffs-review-write-json" nil t)))))
 
+(defun diffs-tests--fresh-emacs (&rest arguments)
+  "Run a fresh `emacs -Q' with ARGUMENTS and return (STATUS . OUTPUT)."
+  (with-temp-buffer
+    (let ((status
+           (apply #'call-process
+                  (expand-file-name invocation-name invocation-directory)
+                  nil t nil "-Q" arguments)))
+      (cons status (buffer-string)))))
+
+(ert-deftest diffs-cli-library-load-neither-runs-nor-ends-emacs ()
+  (let* ((cli (or (locate-library "diffs-cli.el" t)
+                  (error "Cannot locate diffs-cli.el")))
+         (directory (file-name-directory cli)))
+    ;; Requiring the file defines its functions and returns.
+    (pcase-let ((`(,status . ,output)
+                 (diffs-tests--fresh-emacs
+                  "--batch" "-L" directory "--eval"
+                  "(progn (require 'diffs-cli)
+                          (kill-emacs (if (featurep 'diffs-cli) 0 3)))")))
+      (should (equal (list status output) '(0 ""))))
+    ;; Loading it with trailing arguments does not parse them as a command.
+    (pcase-let ((`(,status . ,output)
+                 (diffs-tests--fresh-emacs
+                  "--batch" "-l" cli "--" "session" "list")))
+      (should (equal (list status output) '(0 ""))))
+    ;; As the `--script' target it still runs the command line.
+    (pcase-let ((`(,status . ,output)
+                 (diffs-tests--fresh-emacs "--script" cli "--" "bogus")))
+      (should (= status 1))
+      (should (string-match-p "diffs: expected the session command"
+                              output)))))
+
 (ert-deftest diffs-review-assets-survive-root-only-package-builds ()
   (let* ((directory (make-temp-file "diffs-package-build-" t))
          (build (expand-file-name "build/" directory))

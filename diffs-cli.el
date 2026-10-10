@@ -12,6 +12,9 @@
 
 ;; Connect a command-line coding agent directly to a live diffs.el
 ;; review through the user's existing Emacs server.
+;;
+;; `bin/diffs' runs this file with `emacs --script'.  Loading it any
+;; other way only defines its functions.
 
 ;;; Code:
 
@@ -28,6 +31,17 @@
       (cdr command-line-args-left)
     command-line-args-left)
   "Unconsumed diffs CLI arguments.")
+
+(defun diffs-cli--script-target-p ()
+  "Return non-nil when this file is the target of `--script'.
+Emacs rewrites `--script FILE' to `-scriptload FILE' in
+`command-line-args'."
+  (and noninteractive
+       load-file-name
+       (let ((tail (or (member "-scriptload" command-line-args)
+                       (member "--script" command-line-args))))
+         (and (cadr tail)
+              (file-equal-p (cadr tail) load-file-name)))))
 
 (defun diffs-cli--fail (format-string &rest arguments)
   "Print FORMAT-STRING with ARGUMENTS and terminate unsuccessfully."
@@ -378,7 +392,7 @@ stdin, yes, and output values."
     (command
      (diffs-cli--fail "unknown session command %s" command))))
 
-(unless (bound-and-true-p byte-compile-current-file)
+(when (diffs-cli--script-target-p)
   (diffs-cli--main)
   ;; Do not let `--script' reinterpret its still-present CLI arguments as
   ;; file names after our separate parser has consumed them.
