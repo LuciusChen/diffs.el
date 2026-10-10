@@ -7838,6 +7838,53 @@
       (should (eq (car faces) 'diff-refine-added))
       (should (memq 'diffs-split-added-line faces)))))
 
+(ert-deftest diffs-split-fontifies-a-materialized-range-in-one-call ()
+  ;; `diff-mode' fontifies source syntax per hunk, and each call has to find
+  ;; its hunk again, so one call per row costs more as the hunk grows.
+  (let ((buf (generate-new-buffer " *diffs one fontify call test*"))
+        (calls 0)
+        old new)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buf)
+          (insert "diff --git a/big.el b/big.el\n"
+                  "new file mode 100644\n"
+                  "--- /dev/null\n+++ b/big.el\n"
+                  "@@ -0,0 +1,300 @@\n")
+          (dotimes (line 300)
+            (insert (format "+(setq var-%d (list %d \"value\" 'sym))\n"
+                            line line)))
+          (diff-mode)
+          (setq-local font-lock-mode t)
+          (diffs-minor-mode 1)
+          (setq buffer-read-only t)
+          (let ((diffs-split-virtualization 'complete))
+            (diffs-toggle-split))
+          (setq new (current-buffer)
+                old diffs--split-other)
+          (let ((count (length diffs--split-rows)))
+            (should (> count 300))
+            (fillarray diffs--split-decorated nil)
+            (let ((original (symbol-function 'font-lock-ensure)))
+              (cl-letf (((symbol-function 'font-lock-ensure)
+                         (lambda (&rest arguments)
+                           (cl-incf calls)
+                           (apply original arguments))))
+                (diffs--split-materialize-range 0 count)))
+            (should (= calls 1))
+            ;; Every row is decorated, with its source syntax.
+            (dotimes (index count)
+              (should (aref diffs--split-decorated index)))
+            (goto-char (diffs--split-row-position 10))
+            (should (search-forward "setq" (line-end-position) t))
+            (should (diffs-tests--face-includes-p
+                     (get-text-property (match-beginning 0) 'face)
+                     'font-lock-keyword-face)))
+          (diffs-split-quit))
+      (dolist (buffer (list old new buf))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
 (ert-deftest diffs-split-changed-lines-keep-source-syntax-faces ()
   (diffs-tests--with-diff
       (concat

@@ -5587,9 +5587,11 @@ non-nil."
                       diffs-review-next-annotation))))
     (diffs--split-paged-materialize-all)))
 
-(defun diffs--split-source-face-runs (row)
+(defun diffs--split-source-face-runs (row &optional fontified)
   "Return source syntax spans for split ROW.
-Each run is (START END FACE), with offsets relative to ROW's text."
+Each run is (START END FACE), with offsets relative to ROW's text.
+FONTIFIED is a (BEGIN . END) span of the unified buffer that the caller
+has already fontified."
   (when-let* ((unified diffs--split-unified)
               ((buffer-live-p unified)))
     (let ((origin (nth 6 row))
@@ -5601,13 +5603,18 @@ Each run is (START END FACE), with offsets relative to ROW's text."
               (when (< source-start source-end)
                 ;; `diff-mode' needs the marker at line start to select the
                 ;; source language before it creates syntax overlays.
-                (font-lock-ensure
-                 (save-excursion
-                   (goto-char source-start)
-                   (line-beginning-position))
-                 (save-excursion
-                   (goto-char source-end)
-                   (min (point-max) (1+ (line-end-position)))))
+                (let ((line-begin
+                       (save-excursion
+                         (goto-char source-start)
+                         (line-beginning-position)))
+                      (line-end
+                       (save-excursion
+                         (goto-char source-end)
+                         (min (point-max) (1+ (line-end-position))))))
+                  (unless (and fontified
+                               (<= (car fontified) line-begin)
+                               (<= line-end (cdr fontified)))
+                    (font-lock-ensure line-begin line-end)))
                 ;; Diff mode stores its added/removed/context presentation
                 ;; in text `face' properties and deliberately materializes
                 ;; source-language font-lock as overlays.  Copy only those
@@ -5705,12 +5712,13 @@ Each run is (START END FACE), with offsets relative to ROW's text."
          position next '(diffs-source-face nil))
         (setq position next)))))
 
-(defun diffs--split-apply-source-faces (begin end row)
-  "Replace source syntax faces for ROW between BEGIN and END."
+(defun diffs--split-apply-source-faces (begin end row &optional fontified)
+  "Replace source syntax faces for ROW between BEGIN and END.
+FONTIFIED is the unified span already fontified by the caller."
   (let ((content-end
          (min end (+ begin (length (car row))))))
     (diffs--split-clear-source-faces begin content-end)
-    (dolist (run (diffs--split-source-face-runs row))
+    (dolist (run (diffs--split-source-face-runs row fontified))
       (let ((start (+ begin (nth 0 run)))
             (finish (+ begin (nth 1 run)))
             (face (nth 2 run)))
@@ -5767,9 +5775,10 @@ Runs use offsets relative to ROW's physical text."
             (push (cons (- start offset) (- end offset)) runs))))
       (nreverse runs))))
 
-(defun diffs--split-decorate-row (begin end row width role)
+(defun diffs--split-decorate-row (begin end row width role &optional fontified)
   "Materialize visual properties for ROW between BEGIN and END.
-WIDTH is the number-column width and ROLE is `old' or `new'."
+WIDTH is the number-column width and ROLE is `old' or `new'.  FONTIFIED
+is the unified span the caller has already fontified."
   (pcase-let ((`(,_str ,num ,_src ,kind ,file ,hunk . ,_) row))
     (let* ((content-end (min end (+ begin (length (car row)))))
            (face
@@ -5832,7 +5841,7 @@ WIDTH is the number-column width and ROLE is `old' or `new'."
              'diffs-hunk hunk
              'diffs-kind kind
              'diffs-number num))
-      (diffs--split-apply-source-faces begin end row)
+      (diffs--split-apply-source-faces begin end row fontified)
       (let ((refine-face
              (if (eq role 'old)
                  'diff-refine-removed
@@ -5901,6 +5910,38 @@ WIDTH is the gutter width.  Return the indexed hunk anchor line numbers."
        count chunks width))
     anchors))
 
+(defun diffs--split-fontify-origins (start end)
+  "Fontify the unified text behind split rows START to END in one call.
+Return the fontified (BEGIN . END) span of the unified buffer, or nil.
+`diff-mode' highlights source syntax per hunk, and every call has to find
+its hunk again, so fontifying row by row costs more as the hunk grows."
+  (when-let* ((unified diffs--split-unified)
+              ((buffer-live-p unified)))
+    (let (low high)
+      (cl-loop
+       for index from (max 0 start) below (min end (length diffs--split-rows))
+       for row = (aref diffs--split-rows index)
+       for origin = (and row
+                         (not (aref diffs--split-decorated index))
+                         (nth 6 row))
+       when (consp origin)
+       do (let ((begin (+ (car origin) (cdr origin))))
+            (setq low (min (or low begin) begin)
+                  high (max (or high begin)
+                            (+ begin (length (car row)))))))
+      (when low
+        (with-current-buffer unified
+          (let ((line-begin
+                 (save-excursion
+                   (goto-char low)
+                   (line-beginning-position)))
+                (line-end
+                 (save-excursion
+                   (goto-char (min high (point-max)))
+                   (min (point-max) (1+ (line-end-position))))))
+            (font-lock-ensure line-begin line-end)
+            (cons line-begin line-end)))))))
+
 (defun diffs--split-materialize-range (start end)
   "Decorate split rows in the half-open index range START..END.
 Return (START END RESIZED) using corrected paged row coordinates."
@@ -5911,6 +5952,7 @@ Return (START END RESIZED) using corrected paged row coordinates."
                (`(,range-start ,range-end ,resized) range)
                (limit
                 (min range-end (length diffs--split-rows)))
+               (fontified (diffs--split-fontify-origins range-start limit))
                (inhibit-read-only t))
     (with-silent-modifications
       (cl-loop
@@ -5924,7 +5966,8 @@ Return (START END RESIZED) using corrected paged row coordinates."
         (diffs--split-row-position (1+ index))
         row
         diffs--split-render-width
-        diffs--split-role)
+        diffs--split-role
+        fontified)
        (aset diffs--split-decorated index t)))
     (list range-start range-end resized)))
 
