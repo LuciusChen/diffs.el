@@ -7,7 +7,7 @@
 ;; Assisted-by: OpenAI Codex:gpt-5.6-sol, Claude code:fable-5
 ;; URL: https://github.com/LuciusChen/diffs.el
 ;; Version: 0.13.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "29.4"))
 ;; Keywords: vc, tools
 ;;
 ;; This file is part of diffs.el.

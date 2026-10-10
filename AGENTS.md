@@ -168,7 +168,7 @@ Elisp and package-development rules adapted from the clutch development guide fo
 
 ## Version and Compatibility Baseline
 
-- diffs.el targets Emacs 29.1+.
+- diffs.el targets Emacs 29.4+.
 - Do not use Emacs 30+ APIs without a version guard or local compatibility path.
 - Do not silently raise the Emacs baseline. Update package metadata, README, changelog, and a design record when a higher baseline is justified.
 - Keep the package pure Elisp. Git/VC may produce source input, but rendering must not require an external renderer subprocess.
