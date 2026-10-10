@@ -3582,6 +3582,67 @@
               (when (buffer-live-p buffer)
                 (kill-buffer buffer)))))))))
 
+(defun diffs-tests--run-default-window-buffer-change (frame)
+  "Run the default value of `window-buffer-change-functions' for FRAME.
+Batch Emacs never reaches the redisplay step that does this."
+  (dolist (function (default-value 'window-buffer-change-functions))
+    (funcall function frame)))
+
+(ert-deftest diffs-sticky-header-is-released-when-its-window-shows-another-buffer ()
+  (dolist (view '(stacked complete))
+    (ert-info ((format "view: %s" view))
+      (diffs-tests--with-diff
+          (concat "diff --git a/foo.el b/foo.el\n"
+                  "--- a/foo.el\n+++ b/foo.el\n@@ -1,41 +1,41 @@\n"
+                  (mapconcat (lambda (n) (format " context %d\n" n))
+                             (number-sequence 1 40) "")
+                  "-(message \"old\")\n+(message \"new\")\n")
+        (let ((other (generate-new-buffer " *diffs sticky other*"))
+              (original (selected-window)))
+          (unwind-protect
+              (save-window-excursion
+                (delete-other-windows)
+                (switch-to-buffer (current-buffer))
+                ;; Enabling the mode installs a stacked header over this
+                ;; one, and it must come back when the owner leaves.
+                (when (eq view 'stacked)
+                  (set-window-parameter (selected-window)
+                                        'header-line-format "custom"))
+                (diffs-minor-mode 1)
+                (unless (eq view 'stacked)
+                  (let ((diffs-split-virtualization view))
+                    (diffs-toggle-split)))
+                (goto-char (point-min))
+                (search-forward "(message \"new\")")
+                (beginning-of-line)
+                (let ((window (selected-window))
+                      (frame (selected-frame)))
+                  (set-window-start window (point))
+                  (run-hook-with-args 'window-scroll-functions
+                                      window (point))
+                  (let ((sticky (window-parameter window 'header-line-format)))
+                    (should sticky)
+                    (should-not (equal sticky "custom"))
+                    (should (eq (window-parameter
+                                 window diffs--sticky-header-owner-parameter)
+                                (window-buffer window)))
+                    ;; A window that still shows its owner keeps the header.
+                    (diffs-tests--run-default-window-buffer-change frame)
+                    (should (eq (window-parameter window 'header-line-format)
+                                sticky)))
+                  ;; Leaving the owner releases the header and restores the
+                  ;; one it replaced, without the owner's local hooks.
+                  (set-window-buffer window other)
+                  (diffs-tests--run-default-window-buffer-change frame)
+                  (should (equal (window-parameter window 'header-line-format)
+                                 (and (eq view 'stacked) "custom")))
+                  (should-not
+                   (window-parameter
+                    window diffs--sticky-header-owner-parameter))))
+            ;; Window parameters outlive `save-window-excursion'.
+            (set-window-parameter original 'header-line-format nil)
+            (kill-buffer other)))))))
+
 (ert-deftest diffs-review-edit-comment-reuses-composer-and-identity ()
   (diffs-tests--with-diff diffs-tests--normal
     (let ((owner (current-buffer)) draft original)
@@ -7604,10 +7665,10 @@
               (should
                (window-parameter second-window 'header-line-format))
               (set-window-buffer second-window plain)
-              ;; Batch Emacs does not enter redisplay, so drive the
-              ;; standard old-buffer hook that interactive redisplay runs.
-              (run-hook-with-args
-               'window-buffer-change-functions second-window)
+              ;; Batch Emacs does not enter redisplay, so run the default
+              ;; value of the hook as interactive redisplay does.
+              (diffs-tests--run-default-window-buffer-change
+               (window-frame second-window))
               (should
                (equal
                 (window-parameter
