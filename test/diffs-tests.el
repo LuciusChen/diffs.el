@@ -5214,6 +5214,29 @@
         (kill-buffer diff-buffer))
       (delete-directory directory t))))
 
+(ert-deftest diffs-file-header-display-keeps-the-block-newline-real ()
+  ;; A fold hides from the end of the first header line.  The display
+  ;; string must stop short of the block's last newline, otherwise the
+  ;; display string of the first hunk separator is the next thing
+  ;; redisplay meets and it shows through the hidden text.
+  (diffs-tests--with-diff (concat diffs-tests--normal
+                                  "diff --git a/old.txt b/new.txt\n"
+                                  "similarity index 100%\n"
+                                  "rename from old.txt\n"
+                                  "rename to new.txt\n")
+    (diffs-minor-mode 1)
+    (should (= (length diffs--sections) 2))
+    (dolist (section diffs--sections)
+      (let* ((beg (plist-get section :beg))
+             (end (diffs--section-header-end section))
+             (display (get-text-property beg 'display)))
+        (should (eq (char-before end) ?\n))
+        (should (stringp display))
+        (should-not (string-search "\n" display))
+        (should (= (next-single-property-change beg 'display nil end)
+                   (1- end)))
+        (should-not (get-text-property (1- end) 'display))))))
+
 (ert-deftest diffs-review-refresh-preserves-and-revalidates-live-state ()
   (let ((buffer
          (generate-new-buffer " *diffs refresh state test*"))

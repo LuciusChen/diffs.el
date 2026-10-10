@@ -2521,12 +2521,19 @@ NEW-LINE, SIDE, CONTINUATION, and FACE describe its presentation."
       (point))))
 
 (defun diffs--decorate-header (sec)
-  "Display the header block of section SEC as one styled line."
-  (let* ((end (diffs--section-header-end sec))
-         (header (diffs--file-header sec 'stacked))
-         (line (and header (concat header "\n"))))
-    (diffs--put (plist-get sec :beg) end
-                'display (or line ""))))
+  "Display the header block of section SEC as one styled line.
+The display replaces the block's text but not its final newline, so
+a fold that starts inside the block ends the line on that newline
+\(see `outline-flag-region').  A display string that ended at the
+block boundary would let the next display string, the first hunk
+separator, show through the hidden text."
+  (let* ((beg (plist-get sec :beg))
+         (end (diffs--section-header-end sec))
+         (header (diffs--file-header sec 'stacked)))
+    (if (and header (not (string-empty-p header)))
+        (diffs--put beg (if (eq (char-before end) ?\n) (1- end) end)
+                    'display header)
+      (diffs--put beg end 'display ""))))
 
 (defun diffs--hunk-end (hunk sec)
   "Return the end position of HUNK in section SEC."
