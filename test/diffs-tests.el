@@ -5545,103 +5545,87 @@ then shows the following one, the last repeating."
     (diffs--split-materialize-range 0 (length diffs--split-rows)))
   (buffer-substring-no-properties (point-min) (point-max)))
 
+(defmacro diffs-tests--with-split (spec &rest body)
+  "Run BODY in the new side of a split review of a patch.
+SPEC is (PATCH VIRTUALIZATION BUFFER OLD-BUFFER NEW-BUFFER).  Bind
+BUFFER to the unified owner, and OLD-BUFFER and NEW-BUFFER to the two
+sides of its split."
+  (declare (indent 1) (debug t))
+  (pcase-let ((`(,patch ,virtualization ,buffer ,old-buffer ,new-buffer)
+               spec))
+    `(let ((,buffer (generate-new-buffer " *diffs fold split test*"))
+           (diffs-split-virtualization ,virtualization)
+           ,old-buffer ,new-buffer)
+       (unwind-protect
+           (save-window-excursion
+             (switch-to-buffer ,buffer)
+             (insert ,patch)
+             (diff-mode)
+             (diffs-minor-mode 1)
+             (setq buffer-read-only t)
+             (diffs-toggle-split)
+             (setq ,new-buffer (current-buffer)
+                   ,old-buffer diffs--split-other)
+             ,@body
+             (diffs-split-quit))
+         (dolist (live (list ,old-buffer ,new-buffer ,buffer))
+           (when (buffer-live-p live)
+             (kill-buffer live)))))))
+
 (ert-deftest diffs-split-shows-a-folded-file-as-its-header-and-a-note ()
   (dolist (virtualization '(complete paged))
-    (let ((buffer (generate-new-buffer " *diffs fold split test*"))
-          (diffs-split-virtualization virtualization)
-          old-buffer new-buffer)
-      (unwind-protect
-          (save-window-excursion
-            (switch-to-buffer buffer)
-            (insert diffs-tests--lock-file-patch)
-            (diff-mode)
-            (diffs-minor-mode 1)
-            (setq buffer-read-only t)
-            (diffs-toggle-split)
-            (setq new-buffer (current-buffer)
-                  old-buffer diffs--split-other)
-            (should (eq diffs--split-paged-p (eq virtualization 'paged)))
-            (let ((text (diffs-tests--split-text)))
-              (should (string-search "package-lock.json" text))
-              (should (string-search "4 hidden lines" text))
-              (should (string-search "(message \"new\")" text))
-              (should (string-search "new bar" text))
-              (should-not (string-search "1.0.1" text))
-              (should (= (length diffs--split-anchors) 2)))
-            (diffs-split-quit))
-        (dolist (live (list old-buffer new-buffer buffer))
-          (when (buffer-live-p live)
-            (kill-buffer live)))))))
+    (diffs-tests--with-split
+        (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+      (should (eq diffs--split-paged-p (eq virtualization 'paged)))
+      (let ((text (diffs-tests--split-text)))
+        (should (string-search "package-lock.json" text))
+        (should (string-search "4 hidden lines" text))
+        (should (string-search "(message \"new\")" text))
+        (should (string-search "new bar" text))
+        (should-not (string-search "1.0.1" text))
+        (should (= (length diffs--split-anchors) 2))))))
 
 (ert-deftest diffs-split-follows-a-fold-made-in-the-unified-view ()
-  (let ((buffer (generate-new-buffer " *diffs fold split test*"))
-        old-buffer new-buffer)
-    (unwind-protect
-        (save-window-excursion
-          (switch-to-buffer buffer)
-          (insert diffs-tests--lock-file-patch)
-          (diff-mode)
-          (diffs-minor-mode 1)
-          (setq buffer-read-only t)
-          (diffs-toggle-split)
-          (setq new-buffer (current-buffer)
-                old-buffer diffs--split-other)
-          (should-not (string-search "1.0.1" (diffs-tests--split-text)))
-          (diffs-split-quit)
-          (set-buffer buffer)
-          ;; The pair is cached, but a fold changes what it shows.
-          (diffs--set-section-fold
-           (diffs-tests--section-for "package-lock.json") nil)
-          (diffs-toggle-split)
-          (should (string-search "1.0.1" (diffs-tests--split-text)))
-          (should (= (length diffs--split-anchors) 3))
-          (diffs-split-quit))
-      (dolist (live (list old-buffer new-buffer buffer))
-        (when (buffer-live-p live)
-          (kill-buffer live))))))
+  (diffs-tests--with-split
+      (diffs-tests--lock-file-patch
+       diffs-split-virtualization buffer old-buffer new-buffer)
+    (should-not (string-search "1.0.1" (diffs-tests--split-text)))
+    (diffs-split-quit)
+    (set-buffer buffer)
+    ;; The pair is cached, but a fold changes what it shows.
+    (diffs--set-section-fold
+     (diffs-tests--section-for "package-lock.json") nil)
+    (diffs-toggle-split)
+    (should (string-search "1.0.1" (diffs-tests--split-text)))
+    (should (= (length diffs--split-anchors) 3))))
 
 (ert-deftest diffs-toggle-file-fold-in-the-split-view-rebuilds-the-pair ()
   (dolist (virtualization '(complete paged))
-    (let ((buffer (generate-new-buffer " *diffs fold split test*"))
-          (diffs-split-virtualization virtualization)
-          old-buffer new-buffer)
-      (unwind-protect
-          (save-window-excursion
-            (switch-to-buffer buffer)
-            (insert diffs-tests--lock-file-patch)
-            (diff-mode)
-            (diffs-minor-mode 1)
-            (setq buffer-read-only t)
-            (diffs-toggle-split)
-            (setq new-buffer (current-buffer)
-                  old-buffer diffs--split-other)
-            (let ((lock (with-current-buffer buffer
-                          (diffs-tests--section-for "package-lock.json"))))
-              ;; From the folded file's note the same key opens it.
-              (goto-char (point-min))
-              (search-forward "hidden lines")
-              (diffs-toggle-file-fold)
-              (should (derived-mode-p 'diffs-split-mode))
-              (should (eq (current-buffer) new-buffer))
-              (should (string-search "1.0.1" (diffs-tests--split-text)))
-              (should-not
-               (with-current-buffer buffer (diffs--section-folded-p lock)))
-              (should (equal (diffs--split-property-at 'diffs-file (point))
-                             "package-lock.json"))
-              (should (looking-at "package-lock.json"))
-              ;; From inside an open file, the key folds it again.
-              (search-forward "1.0.1")
-              (diffs-toggle-file-fold)
-              (should-not (string-search "1.0.1" (diffs-tests--split-text)))
-              (should
-               (with-current-buffer buffer (diffs--section-folded-p lock)))
-              (should (looking-at "package-lock.json"))
-              (should (eq (get-buffer-window new-buffer)
-                          (selected-window))))
-            (diffs-split-quit))
-        (dolist (live (list old-buffer new-buffer buffer))
-          (when (buffer-live-p live)
-            (kill-buffer live)))))))
+    (diffs-tests--with-split
+        (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+      (let ((lock (with-current-buffer buffer
+                    (diffs-tests--section-for "package-lock.json"))))
+        ;; From the folded file's note the same key opens it.
+        (goto-char (point-min))
+        (search-forward "hidden lines")
+        (diffs-toggle-file-fold)
+        (should (derived-mode-p 'diffs-split-mode))
+        (should (eq (current-buffer) new-buffer))
+        (should (string-search "1.0.1" (diffs-tests--split-text)))
+        (should-not
+         (with-current-buffer buffer (diffs--section-folded-p lock)))
+        (should (equal (diffs--split-property-at 'diffs-file (point))
+                       "package-lock.json"))
+        (should (looking-at "package-lock.json"))
+        ;; From inside an open file, the key folds it again.
+        (search-forward "1.0.1")
+        (diffs-toggle-file-fold)
+        (should-not (string-search "1.0.1" (diffs-tests--split-text)))
+        (should
+         (with-current-buffer buffer (diffs--section-folded-p lock)))
+        (should (looking-at "package-lock.json"))
+        (should (eq (get-buffer-window new-buffer)
+                    (selected-window)))))))
 
 (ert-deftest diffs-imenu-shows-a-folded-file-before-jumping-to-its-hunk ()
   (diffs-tests--with-diff diffs-tests--lock-file-patch
@@ -5662,37 +5646,22 @@ then shows the following one, the last repeating."
 
 (ert-deftest diffs-imenu-in-split-shows-a-folded-file-before-jumping-to-its-hunk ()
   (dolist (virtualization '(complete paged))
-    (let ((buffer (generate-new-buffer " *diffs fold imenu test*"))
-          (diffs-split-virtualization virtualization)
-          old-buffer new-buffer)
-      (unwind-protect
-          (save-window-excursion
-            (switch-to-buffer buffer)
-            (insert diffs-tests--lock-file-patch)
-            (diff-mode)
-            (diffs-minor-mode 1)
-            (setq buffer-read-only t)
-            (diffs-toggle-split)
-            (setq new-buffer (current-buffer)
-                  old-buffer diffs--split-other)
-            (let* ((index (funcall imenu-create-index-function))
-                   (entries (cdr (assoc "package-lock.json" index)))
-                   (lock (with-current-buffer buffer
-                           (diffs-tests--section-for "package-lock.json"))))
-              (should-not (string-search "1.0.1" (diffs-tests--split-text)))
-              (imenu (cadr entries))
-              (should (derived-mode-p 'diffs-split-mode))
-              (should-not
-               (with-current-buffer buffer (diffs--section-folded-p lock)))
-              (should (string-search "1.0.1" (diffs-tests--split-text)))
-              (should (equal (diffs--split-property-at 'diffs-file (point))
-                             "package-lock.json"))
-              (should (eq (diffs--split-property-at 'diffs-kind (point))
-                          'sep)))
-            (diffs-split-quit))
-        (dolist (live (list old-buffer new-buffer buffer))
-          (when (buffer-live-p live)
-            (kill-buffer live)))))))
+    (diffs-tests--with-split
+        (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+      (let* ((index (funcall imenu-create-index-function))
+             (entries (cdr (assoc "package-lock.json" index)))
+             (lock (with-current-buffer buffer
+                     (diffs-tests--section-for "package-lock.json"))))
+        (should-not (string-search "1.0.1" (diffs-tests--split-text)))
+        (imenu (cadr entries))
+        (should (derived-mode-p 'diffs-split-mode))
+        (should-not
+         (with-current-buffer buffer (diffs--section-folded-p lock)))
+        (should (string-search "1.0.1" (diffs-tests--split-text)))
+        (should (equal (diffs--split-property-at 'diffs-file (point))
+                       "package-lock.json"))
+        (should (eq (diffs--split-property-at 'diffs-kind (point))
+                    'sep))))))
 
 (defconst diffs-tests--version-bump "^+  \"version\""
   "Regexp matching the added line of the lock file's version bump.")
