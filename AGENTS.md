@@ -219,6 +219,8 @@ Elisp and package-development rules adapted from the clutch development guide fo
    make check
    ```
 
+   `make check` runs the ERT suite, the live session CLI test, byte-compilation with warnings as errors, checkdoc with the verb check enabled, and package-lint.  CI runs the same targets on Emacs 29.4 and 30.2.
+
 3. For rendering, caching, alignment, scrolling, or large-review changes:
 
    ```bash

@@ -381,10 +381,12 @@ Metadata-only Git changes such as renames and mode changes remain visible instea
 
 ## Development
 
-Run the complete ERT, live-session CLI, and zero-warning byte-compilation checks with:
+Run the complete ERT, live-session CLI, zero-warning byte-compilation, checkdoc, and package-lint checks with:
 
 ```sh
 make check
 ```
 
-Rendering, row-model, or viewport changes also require `make benchmark`; changes to physical indexing or decision rebuilding require `make benchmark-large`. Before committing, follow the complete diff, checkdoc, package-lint, documentation, and hands-on approval checklist in [AGENTS.md](AGENTS.md).
+`make lint` runs only checkdoc (with the docstring verb check enabled on every Emacs version) and package-lint, which needs the `package-lint` package from MELPA. GitHub Actions runs the same targets on Emacs 29.4 and 30.2.
+
+Rendering, row-model, or viewport changes also require `make benchmark`; changes to physical indexing or decision rebuilding require `make benchmark-large`. Before committing, follow the complete diff, documentation, and hands-on approval checklist in [AGENTS.md](AGENTS.md).
