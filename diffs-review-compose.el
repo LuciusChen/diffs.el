@@ -321,6 +321,7 @@ Use `diffs-review-compose-submit' to submit the draft or
           '((side . bottom)
             (slot . 0)
             (window-height . 0.3)))))
+    (diffs--update-sticky-header window)
     (select-window window)
     window))
 
