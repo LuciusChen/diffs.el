@@ -611,6 +611,11 @@ direction `down'.")
 (defvar-local diffs--refined-blocks nil
   "Hash table of change blocks already refined in the unified view.")
 
+(defvar-local diffs--hunk-index nil
+  "EQ hash table of lookup data built on first use for each hunk.
+Each value is a plist with `:checkpoints' and `:blocks'; see
+`diffs--hunk-data'.")
+
 (defvar-local diffs--minor-mode-saved-state nil
   "External buffer state saved while `diffs-minor-mode' is active.")
 
@@ -769,7 +774,8 @@ Return (PATH . END), where END is the next position in TEXT."
         diffs--new-content-cache nil
         diffs--old-raw-content-cache nil
         diffs--new-raw-content-cache nil
-        diffs--source-render-identities nil))
+        diffs--source-render-identities nil
+        diffs--hunk-index nil))
 
 (defun diffs--change-block-work (old-width new-width)
   "Return normalized comparison work for OLD-WIDTH and NEW-WIDTH."
@@ -1996,14 +2002,55 @@ Each block is (OLD-RECORDS . NEW-RECORDS), where a record is
         (flush)))
     (nreverse blocks)))
 
-(defun diffs--block-intersects-p (block begin end)
-  "Return non-nil when changed BLOCK intersects BEGIN..END."
-  (let* ((records (append (car block) (cdr block)))
-         (first (car records))
-         (last (car (last records))))
-    (and first
-         (< (aref first 0) end)
-         (> (aref last 1) begin))))
+(defun diffs--hunk-data (hunk key builder)
+  "Return HUNK's cached KEY data, calling BUILDER to make it on first use.
+The scan state owns the cache, so it is dropped with the sections."
+  (let* ((table (or diffs--hunk-index
+                    (setq diffs--hunk-index (make-hash-table :test #'eq))))
+         (entry (gethash hunk table)))
+    (if (plist-member entry key)
+        (plist-get entry key)
+      (let ((value (funcall builder)))
+        (puthash hunk (plist-put entry key value) table)
+        value))))
+
+(defun diffs--hunk-blocks (hunk end)
+  "Return the change blocks of HUNK, which ends at END, as a vector.
+Each element is (FIRST LAST BLOCK), where FIRST and LAST are the buffer
+positions at which the records of BLOCK start and end.  The vector is in
+buffer order."
+  (diffs--hunk-data
+   hunk :blocks
+   (lambda ()
+     (vconcat
+      (mapcar
+       (lambda (block)
+         (let ((records (append (car block) (cdr block))))
+           (list (aref (car records) 0)
+                 (aref (car (last records)) 1)
+                 block)))
+       (diffs--change-blocks hunk end))))))
+
+(defun diffs--hunk-blocks-near (hunk end region-begin region-end)
+  "Return the change blocks of HUNK, which ends at END, near a region.
+Only blocks intersecting REGION-BEGIN..REGION-END count; return every
+block when REGION-END is nil."
+  (let ((entries (diffs--hunk-blocks hunk end)))
+    (if (null region-end)
+        (mapcar (lambda (entry) (nth 2 entry)) entries)
+      (let ((low 0)
+            (high (length entries)))
+        ;; Blocks are disjoint and ordered, so the first one that ends
+        ;; after the region starts also starts the candidates.
+        (while (< low high)
+          (let ((middle (/ (+ low high) 2)))
+            (if (> (nth 1 (aref entries middle)) region-begin)
+                (setq high middle)
+              (setq low (1+ middle)))))
+        (cl-loop for index from low below (length entries)
+                 for entry = (aref entries index)
+                 while (< (nth 0 entry) region-end)
+                 collect (nth 2 entry))))))
 
 (defun diffs--make-intraline-overlay (begin end face)
   "Emphasize BEGIN..END with FACE in the unified view."
@@ -2048,12 +2095,10 @@ blocks intersecting that region."
   (unless (eq diffs-line-diff-type 'none)
     (unless diffs--refined-blocks
       (setq diffs--refined-blocks (make-hash-table :test #'eql)))
-    (dolist (block (diffs--change-blocks hunk end))
+    (dolist (block (diffs--hunk-blocks-near
+                    hunk end region-begin region-end))
       (let ((key (aref (caar block) 0)))
-        (when (and (not (gethash key diffs--refined-blocks))
-                   (or (null region-end)
-                       (diffs--block-intersects-p
-                        block region-begin region-end)))
+        (unless (gethash key diffs--refined-blocks)
           (diffs--refine-change-block block)
           (puthash key t diffs--refined-blocks))))))
 
@@ -2646,6 +2691,52 @@ NEW-LINE, SIDE, CONTINUATION, and FACE describe its presentation."
   (let ((gap (diffs--context-gap-at-point)))
     (diffs--set-context-visible gap (diffs--next-context-visible gap))))
 
+(defconst diffs--hunk-checkpoint-interval 256
+  "Hunk body lines between line-number checkpoints.")
+
+(defconst diffs--hunk-checkpoint-min-size 16000
+  "Hunk size in characters from which decoration uses checkpoints.")
+
+(defun diffs--hunk-checkpoints (hunk end)
+  "Return HUNK's line-number checkpoints up to END.
+The vector holds (POSITION OLD-LINE NEW-LINE) for every
+`diffs--hunk-checkpoint-interval'th body line, in buffer order."
+  (diffs--hunk-data
+   hunk :checkpoints
+   (lambda ()
+     (save-excursion
+       (goto-char (car hunk))
+       (forward-line 1)
+       (let ((old (nth 1 hunk))
+             (new (nth 2 hunk))
+             (index 0)
+             points)
+         (while (and (< (point) end) (not (eobp)))
+           (when (zerop (% index diffs--hunk-checkpoint-interval))
+             (push (list (point) old new) points))
+           (pcase (char-after)
+             ((or ?\s ?\n) (cl-incf old) (cl-incf new))
+             (?- (cl-incf old))
+             (?+ (cl-incf new)))
+           (cl-incf index)
+           (forward-line 1))
+         (vconcat (nreverse points)))))))
+
+(defun diffs--hunk-checkpoint (hunk end position)
+  "Return HUNK's checkpoint at or before POSITION, or nil for a small hunk.
+END is where HUNK ends.  The result is (POSITION OLD-LINE NEW-LINE) at
+the start of a body line."
+  (when (> (- end (car hunk)) diffs--hunk-checkpoint-min-size)
+    (let* ((points (diffs--hunk-checkpoints hunk end))
+           (low 0)
+           (high (length points)))
+      (while (< low high)
+        (let ((middle (/ (+ low high) 2)))
+          (if (<= (car (aref points middle)) position)
+              (setq low (1+ middle))
+            (setq high middle))))
+      (and (> low 0) (aref points (1- low))))))
+
 (defun diffs--decorate-hunk (hunk end section &optional rbeg rend)
   "Decorate HUNK (see `diffs--sections') ending at END.
 SECTION is its owning file section.  When RBEG and REND are
@@ -2662,7 +2753,15 @@ non-nil, only apply properties to lines intersecting that region."
                  (looking-at diffs--hunk-re))
         (diffs--decorate-hunk-header hunk section))
       (forward-line 1)
-      (while (and (< (point) end) (not (eobp)))
+      ;; A viewport of a large hunk starts at the nearest checkpoint, so
+      ;; the cost follows the viewport and not the hunk.
+      (when-let* ((rbeg)
+                  (checkpoint (diffs--hunk-checkpoint hunk end rbeg)))
+        (goto-char (nth 0 checkpoint))
+        (setq old-line (nth 1 checkpoint)
+              new-line (nth 2 checkpoint)))
+      (while (and (< (point) end) (not (eobp))
+                  (or (null rend) (< (point) rend)))
         (let* ((c (char-after))
                (old (memq c '(?- ?\s ?\n)))
                (new (memq c '(?+ ?\s ?\n)))
