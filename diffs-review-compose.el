@@ -21,6 +21,11 @@
 (require 'subr-x)
 (require 'yank-media)
 
+;; Defined only in Emacs builds with a window system; callers check
+;; `display-graphic-p' first.
+(declare-function image-size "image.c" (spec &optional pixels frame))
+(declare-function image-flush "image.c" (spec &optional frame))
+
 (defface diffs-review-attachment
   '((t :inherit shadow))
   "Face for an image attachment placeholder in a comment draft."

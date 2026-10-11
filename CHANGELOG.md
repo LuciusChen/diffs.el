@@ -2,6 +2,7 @@
 
 ## Unreleased (0.13.0)
 
+- Require Emacs 29.4 instead of 29.1. Emacs 29.1 cannot read a piped `/dev/stdin` with `insert-file-contents` ("Maximum buffer size exceeded"), which `diffs session comment apply --stdin` relies on, and CI now exercises 29.4 and 30.2.
 - Restore the declared Emacs 29.1 baseline for source-cache membership and review-comment pixel measurement, and exercise image paste against both older and newer public selection paths.
 - Keep a draft image attachment live while another copied placeholder still references it, releasing the binary only after its final draft reference disappears.
 - Show review comments as zero-height inline `nf-cod-comment_discussion_quote` icons by default, falling back to the older `nf-cod-comment_discussion` glyph when necessary, with `diffs-review-comment-display` for initially expanded boxes and `c` or mouse-1 for per-comment expansion. Presentation overrides survive layout switches and refreshes without entering live Agent session data.

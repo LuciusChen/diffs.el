@@ -6,7 +6,7 @@ It adds aligned old/new line numbers, full-width change backgrounds, fringe bars
 
 ![A split diffs.el review with syntax-aware word-level changes and an inline comment](docs/screenshots/split-word-diff-review.png)
 
-Diffs.el requires Emacs 29.1 or newer. Rendering is pure Elisp; VC, Git, or Emacs's built-in diff frontend is used only to produce the input patch.
+Diffs.el requires Emacs 29.4 or newer. Rendering is pure Elisp; VC, Git, or Emacs's built-in diff frontend is used only to produce the input patch.
 
 ## Installation
 
@@ -381,10 +381,12 @@ Metadata-only Git changes such as renames and mode changes remain visible instea
 
 ## Development
 
-Run the complete ERT, live-session CLI, and zero-warning byte-compilation checks with:
+Run the complete ERT, live-session CLI, zero-warning byte-compilation, checkdoc, and package-lint checks with:
 
 ```sh
 make check
 ```
 
-Rendering, row-model, or viewport changes also require `make benchmark`; changes to physical indexing or decision rebuilding require `make benchmark-large`. Before committing, follow the complete diff, checkdoc, package-lint, documentation, and hands-on approval checklist in [AGENTS.md](AGENTS.md).
+`make lint` runs only checkdoc (with the docstring verb check enabled on every Emacs version) and package-lint, which needs the `package-lint` package from MELPA. GitHub Actions runs the same targets on Emacs 29.4 and 30.2.
+
+Rendering, row-model, or viewport changes also require `make benchmark`; changes to physical indexing or decision rebuilding require `make benchmark-large`. Before committing, follow the complete diff, documentation, and hands-on approval checklist in [AGENTS.md](AGENTS.md).

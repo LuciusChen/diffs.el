@@ -7,7 +7,7 @@
 ;; Assisted-by: OpenAI Codex:gpt-5.6-sol, Claude code:fable-5
 ;; URL: https://github.com/LuciusChen/diffs.el
 ;; Version: 0.13.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "29.4"))
 ;; Keywords: vc, tools
 ;;
 ;; This file is part of diffs.el.
@@ -778,10 +778,11 @@ Return (PATH . END), where END is the next position in TEXT."
     0))
 
 (defun diffs--scan-hunk-stats (hunk-begin hunk-end)
-  "Return (ADDS DELS CHANGE-WORK) for HUNK-BEGIN through HUNK-END.
-CHANGE-WORK is a cheap proxy for corresponding-line and
-within-line comparison.  One unit approximates one pair of 80-character
-lines; individual line widths are capped at 1,000 characters."
+  "Return line counts and comparison work for HUNK-BEGIN to HUNK-END.
+The value is (ADDS DELS CHANGE-WORK).  CHANGE-WORK is a cheap proxy for
+corresponding-line and within-line comparison.  One unit approximates
+one pair of 80-character lines; individual line widths are capped at
+1,000 characters."
   (let ((adds 0)
         (dels 0)
         (old-width 0)
@@ -933,7 +934,7 @@ Return a section plist; see `diffs--sections'."
           (make-hash-table :test #'eq))))
 
 (defun diffs--scan ()
-  "Scan the buffer.  Sets `diffs--sections' and `diffs--stats'."
+  "Scan the buffer and set `diffs--sections' and `diffs--stats'."
   (diffs--clear-context)
   (save-excursion
     (goto-char (point-min))
@@ -1567,7 +1568,7 @@ Each row is (OLD-LINE NEW-LINE OLD-TEXT NEW-TEXT)."
             '(Zs Zl Zp))))
 
 (defun diffs--word-tokens (string)
-  "Tokenize STRING into words, whitespace runs, and punctuation.
+  "Tokenize STRING into words, whitespace spans, and punctuation.
 Return a vector of [TEXT START END] records using character offsets."
   (let ((position 0)
         (length (length string))
@@ -5587,7 +5588,7 @@ non-nil."
     (diffs--split-paged-materialize-all)))
 
 (defun diffs--split-source-face-runs (row)
-  "Return source face runs corresponding to split ROW.
+  "Return source syntax spans for split ROW.
 Each run is (START END FACE), with offsets relative to ROW's text."
   (when-let* ((unified diffs--split-unified)
               ((buffer-live-p unified)))
@@ -5745,7 +5746,7 @@ Each run is (START END FACE), with offsets relative to ROW's text."
           (force-window-update buffer))))))
 
 (defun diffs--split-intraline-runs (row role)
-  "Return visible within-line runs for ROW on ROLE.
+  "Return visible within-line emphasis spans for ROW on ROLE.
 Runs use offsets relative to ROW's physical text."
   (when-let* ((pair (nth 7 row))
               (origin (nth 6 row))
@@ -6856,7 +6857,7 @@ error never strands the user in the unified view."
 ;;;; Token interaction
 
 (defun diffs--token-section-for-row (owner row)
-  "Return the section in OWNER that contains split ROW."
+  "Return the section in OWNER for split ROW."
   (let ((section (diffs--split-row-section row))
         (hunk (nth 5 row))
         (origin (nth 6 row))
@@ -10038,7 +10039,7 @@ comment JSON never embeds binary payloads."
           ((symbolp type) type)
           ((stringp type) (intern type))
           (t (user-error "Invalid review comment type %S" type)))))
-    (unless (memq type '(all user agent))
+    (unless (memq type '(user agent all))
       (user-error "Comment type must be all, user, or agent"))
     type))
 
@@ -10295,7 +10296,7 @@ SELECTOR, INCLUDE-PATCH, and INCLUDE-NOTES are passed to
             (list 'new (nth 2 hunk) (nth 2 hunk))))))))
 
 (defun diffs--review-range-in-section-p (section side range)
-  "Return non-nil when SECTION contains SIDE RANGE in one hunk."
+  "Return non-nil if SIDE RANGE lies within one hunk of SECTION."
   (cl-some
    (lambda (hunk)
      (let* ((start (if (eq side 'old) (nth 1 hunk) (nth 2 hunk)))
@@ -10334,7 +10335,7 @@ When IGNORE-UNKNOWN is non-nil, permit fields outside ALLOWED."
           (push key seen))))))
 
 (defun diffs--review-json-field-present-p (object key)
-  "Return non-nil when JSON OBJECT contains KEY."
+  "Return non-nil if KEY is present in JSON OBJECT."
   (or (assoc key object) (assq (intern key) object)))
 
 (defun diffs--review-validate-comment-schema (comment)
@@ -11221,7 +11222,7 @@ Malformed, nested, and inconsistent markers signal `user-error'."
            :key (lambda (block) (plist-get block :id))))
 
 (defun diffs--conflict-block-contains-point-p (block)
-  "Return non-nil when BLOCK contains point or owns its empty anchor."
+  "Return non-nil if point is inside BLOCK or at its empty anchor."
   (let ((begin (marker-position (plist-get block :begin)))
         (end (marker-position (plist-get block :end))))
     (or (and (< begin end)
@@ -11496,7 +11497,7 @@ BEGIN, END, and OLD-LENGTH describe the changed region."
   (setq diffs--conflict-saved-during-session t))
 
 (defun diffs--conflict-window-state ()
-  "Return restorable starts for windows displaying the source buffer."
+  "Return restorable window positions for the source buffer."
   (mapcar
    (lambda (window)
      (list window
@@ -11505,7 +11506,7 @@ BEGIN, END, and OLD-LENGTH describe the changed region."
    (get-buffer-window-list (current-buffer) nil t)))
 
 (defun diffs--conflict-restore-window-state (state)
-  "Restore window starts and vertical scroll from STATE."
+  "Restore window positions and vertical scroll from STATE."
   (dolist (entry state)
     (pcase-let ((`(,window ,marker ,vscroll) entry))
       (when (and (window-live-p window)
