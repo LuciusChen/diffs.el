@@ -4781,7 +4781,10 @@ both columns."
                                (nth 6 adjusted) nil
                                (or (nth 8 adjusted) (nth 1 source))
                                source-side live-target block-section)))
-                        (emit (copy-tree row) (copy-tree row))))
+                        ;; Copy only the row's own cells.  The hunk and
+                        ;; section it carries must stay the scanned objects
+                        ;; that gap and anchor lookups compare with `eq'.
+                        (emit (copy-sequence row) (copy-sequence row))))
                     (if (eq action 'accept)
                         (cl-incf old-shift
                                  (- (length additions)
