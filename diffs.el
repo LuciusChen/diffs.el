@@ -2994,11 +2994,26 @@ When SPLIT is non-nil, render side-by-side header content."
         (when (diffs--clear-sticky-header-window window owner)
           (force-window-update window))))))
 
+(defun diffs--sticky-header-sweep (frame)
+  "Release sticky headers that windows of FRAME kept after leaving a buffer.
+A window that stops showing the buffer owning its sticky header keeps
+the header-line window parameter, which overrides the header line of
+the buffer it shows now.  Emacs 31 also runs a buffer's local
+`window-buffer-change-functions' for the windows that left it; older
+versions run only the default value, so this function is registered
+there."
+  (dolist (window (window-list frame 'nomini))
+    (when-let* ((owner (window-parameter
+                        window diffs--sticky-header-owner-parameter))
+                ((not (eq owner (window-buffer window)))))
+      (diffs--clear-sticky-header-window window owner))))
+
+(add-hook 'window-buffer-change-functions #'diffs--sticky-header-sweep)
+
 (defun diffs--sticky-header-window-buffer-change (window)
-  "Update or remove the current buffer's sticky header in WINDOW."
-  (if (eq (window-buffer window) (current-buffer))
-      (diffs--update-sticky-header window)
-    (diffs--clear-sticky-header-window window (current-buffer))))
+  "Update the current buffer's sticky header in a WINDOW displaying it."
+  (when (eq (window-buffer window) (current-buffer))
+    (diffs--update-sticky-header window)))
 
 (defun diffs--stacked-file-header-at-p (position)
   "Return non-nil when a rendered file header covers POSITION."
