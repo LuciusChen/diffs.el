@@ -160,7 +160,8 @@ Elisp and package-development rules adapted from the clutch development guide fo
 - Keep scanning linear in patch size.
 - Avoid one buffer mutation per offscreen row when bulk insertion or cached metadata can express the same state.
 - First split is the primary performance target; cached layout toggles must remain effectively immediate.
-- The default benchmark must retain both a high-volume profile for indexing and virtualization costs and a content-complexity profile for multi-line pairing, within-line refinement, syntax-rich text, Unicode, and long-line guards.
+- The default benchmark must retain a high-volume profile for indexing and virtualization costs, a content-complexity profile for multi-line pairing, within-line refinement, syntax-rich text, Unicode, and long-line guards, and a single-large-hunk profile, because the paged model virtualizes whole hunks.
+- Benchmarks run byte-compiled code.  `make benchmark` compiles the package into a temporary directory first; interpreted timings are two to three times slower and are not comparable with documented numbers.
 - Large-diff syntax and within-line rendering must remain visible-region bounded.
 - Any material regression in the 800-file/22,000-line benchmark requires an explanation and explicit user-value tradeoff.
 - Row collection, physical indexing, and decision rebuilding must also remain approximately linear in the 4,000-file/110,000-line `make benchmark-large` tier.

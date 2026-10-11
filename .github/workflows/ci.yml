@@ -42,6 +42,9 @@ jobs:
       - name: Byte compile
         run: make compile
 
+      - name: Benchmark smoke run
+        run: DIFFS_BENCH_FILES=40 DIFFS_BENCH_LINES=800 make benchmark
+
       - name: Checkdoc package files
         run: make checkdoc
 

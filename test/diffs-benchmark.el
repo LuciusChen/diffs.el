@@ -1,16 +1,48 @@
 ;;; diffs-benchmark.el --- Reproducible diffs.el benchmark -*- lexical-binding: t -*-
 
 (require 'benchmark)
+(require 'bytecomp)
 (require 'cl-lib)
+
+(defvar diffs-benchmark--compiled
+  (not (getenv "DIFFS_BENCH_INTERPRETED"))
+  "Non-nil when the package runs as byte-compiled code.
+Source loaded through `-L .' is interpreted, which runs two to three times
+slower than what users get, so the benchmark compiles it into a temporary
+directory first.  Set DIFFS_BENCH_INTERPRETED to measure the source.")
+
+(when diffs-benchmark--compiled
+  (let* ((source (file-name-directory
+                  (or (locate-library "diffs.el" t)
+                      (error "Cannot locate diffs.el"))))
+         (directory (make-temp-file "diffs-benchmark-" t))
+         (byte-compile-dest-file-function
+          (lambda (file)
+            (expand-file-name (concat (file-name-nondirectory file) "c")
+                              directory))))
+    (add-hook 'kill-emacs-hook (lambda () (delete-directory directory t)))
+    ;; Compiling a later file requires `diffs'.  With the directory first
+    ;; on `load-path' that loads the compiled file, not the source.
+    (add-to-list 'load-path directory)
+    (dolist (file '("diffs.el" "diffs-assets.el" "diffs-diff-hl.el"
+                    "diffs-review-compose.el"))
+      (byte-compile-file (expand-file-name file source)))))
+
 (require 'diffs)
 
 (defvar diffs-benchmark--profile
   (intern (or (getenv "DIFFS_BENCH_PROFILE") "volume")))
 
 (defvar diffs-benchmark--files
-  (string-to-number
-   (or (getenv "DIFFS_BENCH_FILES")
-       (if (eq diffs-benchmark--profile 'complex) "16" "800"))))
+  (if (eq diffs-benchmark--profile 'hunk)
+      1
+    (string-to-number
+     (or (getenv "DIFFS_BENCH_FILES")
+         (if (eq diffs-benchmark--profile 'complex) "16" "800")))))
+
+(defvar diffs-benchmark--hunk-lines
+  (string-to-number (or (getenv "DIFFS_BENCH_LINES") "20000"))
+  "Lines of the one added file in the `hunk' profile.")
 
 (defvar diffs-benchmark--virtualization
   (intern
@@ -96,11 +128,26 @@
         (insert " / 长行 🙂\")\n")))
     (buffer-string)))
 
+(defun diffs-benchmark--hunk-input ()
+  "Build a Git diff that adds one large file as a single hunk."
+  (with-temp-buffer
+    (insert "diff --git a/src/generated.el b/src/generated.el\n"
+            "new file mode 100644\n"
+            "index 0000000..2222222\n"
+            "--- /dev/null\n"
+            "+++ b/src/generated.el\n"
+            (format "@@ -0,0 +1,%d @@\n" diffs-benchmark--hunk-lines))
+    (dotimes (line diffs-benchmark--hunk-lines)
+      (insert (format "+(setq generated-%05d (list %d \"value %05d\" 'symbol))\n"
+                      line line line)))
+    (buffer-string)))
+
 (defun diffs-benchmark--input ()
   "Build the Git diff selected by `diffs-benchmark--profile'."
   (pcase diffs-benchmark--profile
     ('volume (diffs-benchmark--volume-input))
     ('complex (diffs-benchmark--complex-input))
+    ('hunk (diffs-benchmark--hunk-input))
     (_ (error "Unknown benchmark profile: %S"
               diffs-benchmark--profile))))
 
@@ -109,7 +156,7 @@
   (garbage-collect)
   (let ((result (benchmark-call function repetitions)))
     (princ
-     (format "%-20s %3d × %8.3f ms  GC %d / %.3f s\n"
+     (format "%-22s %3d × %8.3f ms  GC %d / %.3f s\n"
              name repetitions
              (* 1000 (/ (nth 0 result) (float repetitions)))
              (nth 1 result) (nth 2 result)))))
@@ -142,9 +189,11 @@
           ;; installs the actual redisplay worker below.
           (setq-local font-lock-mode t))
         (princ
-         (format (concat "Emacs %s; %s profile; %s split policy; "
+         (format (concat "Emacs %s; %s code; %s profile; %s split policy; "
                          "%d files; %d lines; %d bytes\n")
-                 emacs-version diffs-benchmark--profile
+                 emacs-version
+                 (if diffs-benchmark--compiled "byte-compiled" "interpreted")
+                 diffs-benchmark--profile
                  diffs-benchmark--virtualization
                  diffs-benchmark--files
                  (with-current-buffer buffer
@@ -199,7 +248,18 @@
                 (save-excursion
                   (goto-char (point-min))
                   (forward-line 100)
-                  (point)))))))
+                  (point))))))
+          (diffs-benchmark--measure
+           "deep stacked viewport" 1
+           (lambda ()
+             (with-current-buffer buffer
+               (goto-char (floor (* 0.95 (point-max))))
+               (let ((start (line-beginning-position)))
+                 (jit-lock-fontify-now
+                  start
+                  (save-excursion
+                    (forward-line 100)
+                    (point))))))))
         (switch-to-buffer buffer)
         (diffs-benchmark--measure
          "first split" 1
