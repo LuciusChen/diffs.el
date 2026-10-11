@@ -5673,9 +5673,9 @@ The pre-command hook runs first, as it does for a key."
   (mapc (lambda (char) (isearch-printing-char char 1)) string))
 
 (defun diffs-tests--isearch-end ()
-  "End the search in progress and let what it scheduled run."
+  "End the search in progress, then finish the command that ended it."
   (isearch-done)
-  (sleep-for 0.05))
+  (run-hooks 'post-command-hook))
 
 (defun diffs-tests--line ()
   "Return the plain text of the current line."
@@ -5923,7 +5923,7 @@ The pre-command hook runs first, as it does for a key."
           (condition-case nil
               (isearch-abort)
             (quit nil))
-          (sleep-for 0.05))
+          (run-hooks 'post-command-hook))
         (should (with-current-buffer buffer (diffs--section-folded-p lock)))
         (should (= (point) (point-min)))
         ;; A search that ends before it finds anything has no match to
@@ -5941,7 +5941,7 @@ The pre-command hook runs first, as it does for a key."
                 (condition-case nil
                     (isearch-abort)
                   (quit nil))
-                (sleep-for 0.05)
+                (run-hooks 'post-command-hook)
                 (should (= (point) note)))
             (when isearch-mode (isearch-done t))))
         (should (with-current-buffer buffer (diffs--section-folded-p lock)))
@@ -5951,13 +5951,66 @@ The pre-command hook runs first, as it does for a key."
           (should (string-search "hidden lines" (diffs-tests--line)))
           (diffs-tests--isearch-end))
         (should (with-current-buffer buffer (diffs--section-folded-p lock)))
-        ;; Ending the search in another window does not rebuild the pair.
+        ;; A command that leaves another window selected does not rebuild
+        ;; the pair under it.
         (diffs-tests--isearching nil
           (diffs-tests--isearch-type "1.0.1")
           (isearch-done)
           (select-window (get-buffer-window old-buffer))
-          (sleep-for 0.05))
+          (set-buffer new-buffer)
+          (run-hooks 'post-command-hook))
         (should (with-current-buffer buffer (diffs--section-folded-p lock)))))))
+
+(ert-deftest diffs-split-search-shows-the-file-only-when-its-command-is-done ()
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+      (let ((lock (with-current-buffer buffer
+                    (diffs-tests--section-for "package-lock.json"))))
+        ;; Nothing happens until the command that ended the search is done.
+        (diffs-tests--isearching nil
+          (diffs-tests--isearch-type "1.0.1")
+          (isearch-done))
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+        (run-hooks 'post-command-hook)
+        (should-not (with-current-buffer buffer (diffs--section-folded-p lock)))
+        (diffs-toggle-file-fold)
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+        ;; A command that starts first makes the pending show stale.
+        (diffs-tests--isearching nil
+          (diffs-tests--isearch-type "1.0.1")
+          (isearch-done))
+        (run-hooks 'pre-command-hook)
+        (run-hooks 'post-command-hook)
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+        ;; A search that is going again when the command is done is left
+        ;; alone, as when the search string is edited in the minibuffer.
+        (diffs-tests--isearching nil
+          (diffs-tests--isearch-type "1.0.1")
+          (isearch-done)
+          (isearch-mode t)
+          (run-hooks 'post-command-hook)
+          (should isearch-mode)
+          (isearch-done t))
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))))))
+
+(ert-deftest diffs-split-search-ends-on-a-note-row-before-the-file-is-opened-by-hand ()
+  ;; The search that ended on the note row must not act on a later search.
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+      (diffs-tests--isearching nil
+        (diffs-tests--isearch-type "1.0.1")
+        (should (string-search "hidden lines" (diffs-tests--line)))
+        (isearch-done))
+      (goto-char (point-min))
+      (search-forward "hidden lines")
+      (diffs-toggle-file-fold)
+      (diffs-tests--isearching nil
+        (diffs-tests--isearch-type "1.0.1")
+        (should isearch-success)
+        (should (string-search "1.0.1" (diffs-tests--line)))
+        (isearch-done t)))))
 
 (ert-deftest diffs-split-search-function-counts-folded-files-as-matches ()
   ;; Lazy highlighting and counting step through the buffer with a bound.

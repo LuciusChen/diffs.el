@@ -6408,6 +6408,7 @@ and treat the peer as the horizontal source of truth."
             #'diffs--review-display-metrics-changed nil t)
   (add-hook 'kill-buffer-hook #'diffs--clear-sticky-headers nil t)
   (add-hook 'pre-command-hook #'diffs--split-pre-command nil t)
+  (add-hook 'pre-command-hook #'diffs--split-isearch-forget nil t)
   (add-hook 'post-command-hook #'diffs--split-post-command nil t)
   (setq-local isearch-search-fun-function #'diffs--split-isearch-search-fun)
   (add-hook 'isearch-mode-end-hook #'diffs--split-isearch-end nil t)
@@ -6785,16 +6786,39 @@ matches counts as one match and its note row is highlighted."
       (message "No match for \"%s\" in %s"
                isearch-string (plist-get section :file)))))
 
-(defun diffs--split-isearch-reveal (buffer section state)
-  "Show folded SECTION from split BUFFER and go to its first match of STATE."
-  (when (eq (window-buffer (selected-window)) buffer)
-    (with-current-buffer buffer
-      (diffs--split-set-fold section nil)
-      (diffs--split-goto-section section)
-      (diffs--split-goto-hit section state))))
+(defvar-local diffs--split-pending-reveal nil
+  "The folded section to show and the search that stopped on it, or nil.")
+
+(defun diffs--split-isearch-forget ()
+  "Drop the pending reveal, as a new command has started."
+  (when diffs--split-pending-reveal
+    (setq diffs--split-pending-reveal nil)
+    (remove-hook 'post-command-hook #'diffs--split-isearch-reveal t)))
+
+(defun diffs--split-isearch-reveal ()
+  "Show the folded file that the search which just ended stopped on.
+This runs once, when the command that ended the search is done."
+  (remove-hook 'post-command-hook #'diffs--split-isearch-reveal t)
+  (let ((pending (prog1 diffs--split-pending-reveal
+                   (setq diffs--split-pending-reveal nil))))
+    ;; `isearch-edit-string' ends the search and starts it again within
+    ;; one command.
+    (when (and pending
+               (not isearch-mode)
+               (eq (window-buffer (selected-window)) (current-buffer)))
+      ;; An error in a command hook would discard the buffer's hooks.
+      (condition-case error
+          (let ((section (car pending)))
+            (diffs--split-set-fold section nil)
+            (diffs--split-goto-section section)
+            (diffs--split-goto-hit section (cdr pending)))
+        (error (message "diffs: cannot show %s: %s"
+                        (plist-get (car pending) :file)
+                        (error-message-string error)))))))
 
 (defun diffs--split-isearch-end ()
-  "Show the folded file on whose note row the search that ended stopped."
+  "Arrange to show the folded file on whose note row the search stopped.
+The file is shown when the command that ended the search is done."
   (when-let* (((not isearch-mode-end-hook-quit))
               (position (and isearch-other-end
                              (min (point) isearch-other-end)))
@@ -6803,10 +6827,9 @@ matches counts as one match and its note row is highlighted."
               ((let ((case-fold-search isearch-case-fold-search))
                  (diffs--split-hidden-match-p
                   section isearch-string (isearch-search-fun-default)))))
-    ;; The search is still ending.  Let the command that ended it finish
-    ;; before the windows change.
-    (run-at-time 0 nil #'diffs--split-isearch-reveal
-                 (current-buffer) section (diffs--split-isearch-state))))
+    (setq diffs--split-pending-reveal
+          (cons section (diffs--split-isearch-state)))
+    (add-hook 'post-command-hook #'diffs--split-isearch-reveal nil t)))
 
 (defun diffs--split-find-row
     (hunk source kind number physical-offset)
