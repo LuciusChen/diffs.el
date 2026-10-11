@@ -819,6 +819,51 @@ one pair of 80-character lines; individual line widths are capped at
     (cl-incf work (diffs--change-block-work old-width new-width))
     (list adds dels work)))
 
+(defun diffs--hunk-counted-end (hunk-begin limit old-count new-count)
+  "Return where the hunk at HUNK-BEGIN ends according to its line counts.
+OLD-COUNT and NEW-COUNT come from the hunk header.  The hunk ends once
+both are used up, after any no-newline marker that follows its last
+line.  A line that cannot belong to a hunk ends it early.  The result
+never passes LIMIT."
+  (save-excursion
+    (goto-char hunk-begin)
+    (forward-line 1)
+    (let ((old old-count)
+          (new new-count)
+          done)
+      (while (and (not done) (< (point) limit) (or (> old 0) (> new 0)))
+        (pcase (char-after)
+          ((or ?\s ?\n) (cl-decf old) (cl-decf new) (forward-line 1))
+          (?- (cl-decf old) (forward-line 1))
+          (?+ (cl-decf new) (forward-line 1))
+          (?\\ (forward-line 1))
+          (_ (setq done t))))
+      (while (and (< (point) limit) (eq (char-after) ?\\))
+        (forward-line 1))
+      (min (point) limit))))
+
+(defun diffs--next-plain-file-header (hunk-begin hunk-end old-count new-count)
+  "Return where a plain file header ends the hunk at HUNK-BEGIN, or nil.
+A unified patch without `diff' or `Index:' lines starts the next file
+with `--- OLD' and `+++ NEW' right after the last line of a hunk.  The
+counts OLD-COUNT and NEW-COUNT of the hunk header tell that boundary from
+removed and added lines inside the hunk that only look like those
+markers.  HUNK-END is the end found without the counts."
+  (save-excursion
+    (goto-char hunk-begin)
+    (end-of-line)
+    ;; Cheap literal search first: almost no hunk contains such a line.
+    (when (let (found)
+            (while (and (not found) (search-forward "\n--- " hunk-end t))
+              (setq found (progn (end-of-line) (looking-at "\n\\+\\+\\+ "))))
+            found)
+      (let ((end (diffs--hunk-counted-end
+                  hunk-begin hunk-end old-count new-count)))
+        (goto-char end)
+        (and (< end hunk-end)
+             (looking-at "--- .*\n\\+\\+\\+ ")
+             end)))))
+
 (defun diffs--scan-section (section-end)
   "Scan the file section starting at point, up to SECTION-END.
 Return a section plist; see `diffs--sections'."
@@ -848,6 +893,11 @@ Return a section plist; see `diffs--sections'."
                                                    section-end t)
                                 (line-beginning-position))
                            section-end))))
+          ;; The next file of a plain unified patch ends this section.
+          (when-let* ((next (diffs--next-plain-file-header
+                             hbeg hend oldc newc)))
+            (setq hend next
+                  section-end next))
           (pcase-let ((`(,hadds ,hdels ,hwork)
                        (diffs--scan-hunk-stats hbeg hend)))
             (push (list hbeg old new hend context
