@@ -180,8 +180,8 @@ indexes hunks cheaply, corrects their exact heights on first
 materialization, and materializes their text when they enter the
 viewport.
 Standard isearch, copying, and review commands materialize and retain
-the complete projection before inspecting offscreen rows.  Wrapping and
-decision-aware views continue to use the complete model."
+the complete projection before inspecting offscreen rows.  Wrapping, a
+range selection, a comment, or a decision keeps the complete model."
   :type '(choice (const :tag "Choose from estimated size" auto)
                  (const :tag "Complete searchable buffer" complete)
                  (const :tag "Paged visible hunks" paged))
@@ -191,8 +191,8 @@ decision-aware views continue to use the complete model."
   "Estimated split rows or change work at which `auto' uses paging.
 This threshold applies only when `diffs-split-virtualization' is
 `auto'.  Set it to zero to request paged rendering for every eligible
-split view.  Wrapping and decision-aware views always use the complete
-model."
+split view.  Wrapping, a range selection, a comment, or a decision
+always uses the complete model."
   :type 'natnum
   :group 'diffs)
 
