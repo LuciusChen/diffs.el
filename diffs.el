@@ -4769,8 +4769,10 @@ or hunk depending on KIND."
           (nreverse anchors)
           row)))
 
-(defun diffs--split-collect ()
+(defun diffs--split-collect (&optional sections)
   "Collect aligned row lists from the current unified diffs buffer.
+SECTIONS defaults to every section, a folded one collecting as its
+header and a note.  Given SECTIONS, collect only those, each open.
 Returns (OLD-ROWS NEW-ROWS ANCHORS); each logical row is
 \(STRING NUMBER SRC-LINE KIND FILE HUNK ORIGIN PAIR SOURCE-NUMBER
 SOURCE-SIDE LIVE-TARGET SECTION).  NUMBER is the displayed preview line, or nil
@@ -4783,9 +4785,9 @@ Paired changed rows share a two-element PAIR vector."
   (let (old-rows new-rows anchors (row 0))
     (cl-flet ((emit (o n)
                 (push o old-rows) (push n new-rows) (cl-incf row)))
-      (dolist (sec diffs--sections)
+      (dolist (sec (or sections diffs--sections))
         (pcase-let* ((file (plist-get sec :file))
-                     (folded (diffs--section-folded-p sec))
+                     (folded (and (not sections) (diffs--section-folded-p sec)))
                      (`(,old-header . ,new-header)
                       (diffs--split-file-headers sec)))
           (when (or old-header new-header)
@@ -6671,43 +6673,51 @@ them once per match."
             (cons tick (diffs--split-find-fold-gates))))
     (cdr diffs--split-gates-cache)))
 
-(defun diffs--folded-hunks-match-p (section string search side)
-  "Return non-nil if SECTION's hunks have a match of STRING on SIDE.
-SEARCH is isearch's search function.  Only text the split view shows on
-SIDE counts: not the diff markers, the hunk headers, or the other side.
-Call this in the unified buffer."
-  (let ((end (plist-get section :end))
-        (shown (if (eq side 'old) '(?\s ?-) '(?\s ?+)))
-        (isearch-forward t))
-    (save-match-data
-      (save-excursion
-        (save-restriction
-          (widen)
-          (goto-char (car (car (plist-get section :hunks))))
-          (catch 'found
-            (while (funcall search string end t)
-              (let* ((beg (match-beginning 0))
-                     (line (save-excursion
-                             (goto-char beg)
-                             (line-beginning-position))))
-                (when (and (> beg line) (memq (char-after line) shown))
-                  (throw 'found t))
-                ;; An empty match leaves point where it was.
-                (when (= (point) beg)
-                  (if (< beg end)
-                      (forward-char 1)
-                    (throw 'found nil)))))
-            nil))))))
+(defvar-local diffs--split-hidden-cache nil
+  "Table from a folded section to the texts of its hunks' rows, or nil.")
+
+(defun diffs--folded-section-texts (section)
+  "Return the rows of SECTION's hunks as the split would draw them open.
+The result is (OLD . NEW), the text of each side with a newline after
+every row, as it would stand in the split buffer.  Call this in the
+unified buffer."
+  (pcase-let* ((`(,old ,new . ,_) (diffs--split-collect (list section)))
+               (`(,old-rows ,new-rows . ,_)
+                (diffs--split-physical-rows old new 8)))
+    (cl-flet ((text (rows)
+                (mapconcat (lambda (row)
+                             (if (eq (nth 3 row) 'header)
+                                 ""
+                               (concat (car row) "\n")))
+                           rows "")))
+      (cons (text old-rows) (text new-rows)))))
+
+(defun diffs--split-hidden-text (section)
+  "Return the text this side would show for the hunks of folded SECTION.
+It is kept until the pair is rebuilt, so a search builds it once."
+  (let* ((cache (or diffs--split-hidden-cache
+                    (setq diffs--split-hidden-cache
+                          (make-hash-table :test #'eq))))
+         (texts (or (gethash section cache)
+                    (puthash section
+                             (with-current-buffer diffs--split-unified
+                               (diffs--folded-section-texts section))
+                             cache))))
+    (if (eq diffs--split-role 'old) (car texts) (cdr texts))))
 
 (defun diffs--split-hidden-match-p (section string search)
   "Return non-nil when the folded SECTION hides a match of STRING.
-SEARCH is isearch's search function, and the match is on this buffer's
-side."
-  (let ((side diffs--split-role)
-        (fold case-fold-search))
-    (with-current-buffer diffs--split-unified
+SEARCH is isearch's search function.  It looks in the text this side
+shows once the file is open, so line anchors and matches across rows
+agree with the search after the file is shown."
+  (let ((text (diffs--split-hidden-text section))
+        (fold case-fold-search)
+        (isearch-forward t))
+    (with-temp-buffer
+      (insert text)
+      (goto-char (point-min))
       (let ((case-fold-search fold))
-        (diffs--folded-hunks-match-p section string search side)))))
+        (and (funcall search string nil t) t)))))
 
 (defun diffs--split-isearch-gate (gates string search origin hit bound)
   "Return the gate in GATES that a search from ORIGIN reaches before HIT.

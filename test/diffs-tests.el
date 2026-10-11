@@ -5882,6 +5882,183 @@ The pre-command hook runs first, as it does for a key."
                                  (buffer-substring-no-properties
                                   (nth 1 after) (nth 2 after)))))))))
 
+(defconst diffs-tests--projection-patch
+  (concat
+   diffs-tests--normal
+   "diff --git a/yarn.lock b/yarn.lock\n"
+   "--- a/yarn.lock\n"
+   "+++ b/yarn.lock\n"
+   "@@ -1,8 +1,7 @@\n"
+   " alpha\n"
+   " beta\n"
+   "-old one\n"
+   "-old two\n"
+   "-old three\n"
+   "+new one\n"
+   "+new two\n"
+   " gamma\n"
+   " delta\n"
+   "@@ -50,2 +49,2 @@\n"
+   " omega\n"
+   "-old tail\n"
+   "+new tail\n"
+   "@@ -52,2 +51,2 @@\n"
+   " tail2\n"
+   "-old x\n"
+   "+new x\n")
+  "A folded file of three hunks, one with a change block that is longer on
+one side than on the other.")
+
+(defun diffs-tests--searches-folded-and-open (lock buffer string regexp backward)
+  "Return what a search for STRING finds in folded LOCK, then when it is open.
+BUFFER owns the split.  The result is (FOLDED . OPEN): whether the
+search stops on the note row, and whether it finds the text after the
+file is shown."
+  (let (folded open)
+    (diffs-tests--isearch-start backward)
+    (when regexp
+      (isearch-toggle-regexp))
+    (unwind-protect
+        (progn
+          (isearch-yank-string string)
+          (setq folded (and isearch-success
+                            (string-search "hidden lines"
+                                           (diffs-tests--line))
+                            t)))
+      (isearch-done t))
+    (diffs--split-set-fold lock nil)
+    (diffs-tests--isearch-start backward)
+    (when regexp
+      (isearch-toggle-regexp))
+    (unwind-protect
+        (progn
+          (isearch-yank-string string)
+          (setq open (and isearch-success t)))
+      (isearch-done t))
+    (diffs--split-set-fold lock t)
+    (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+    (cons folded open)))
+
+(ert-deftest diffs-split-search-matches-line-anchors-in-a-folded-file ()
+  (dolist (virtualization '(complete paged))
+    (dolist (backward '(nil t))
+      (dolist (pattern '("^{" "^  \"version\": \"1\\.0\\.1\"" "\",$"))
+        (diffs-tests--with-split
+            (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+          (let ((lock (with-current-buffer buffer
+                        (diffs-tests--section-for "package-lock.json"))))
+            (diffs-tests--isearch-start backward)
+            (isearch-toggle-regexp)
+            (unwind-protect
+                (progn
+                  (diffs-tests--isearch-type pattern)
+                  (should isearch-success)
+                  (should (string-search "hidden lines" (diffs-tests--line)))
+                  (diffs-tests--isearch-end))
+              (when isearch-mode (isearch-done t)))
+            (should-not (with-current-buffer buffer
+                          (diffs--section-folded-p lock)))
+            (should (string-match-p pattern (diffs-tests--line)))))))))
+
+(ert-deftest diffs-split-search-matches-across-rows-of-a-folded-file ()
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--projection-patch virtualization buffer old-buffer new-buffer)
+      (let ((lock (with-current-buffer buffer
+                    (diffs-tests--section-for "yarn.lock"))))
+        ;; The new side shows its own lines one after the other, with a
+        ;; blank row where the other side has a line left over.
+        (dolist (case '(("alpha\nbeta\nnew one" . t)
+                        ("beta\n-old one" . nil)
+                        ("beta\nold one" . nil)
+                        ("new two\n\ngamma" . t)
+                        ("new two\ngamma" . nil)))
+          (should (equal (diffs-tests--searches-folded-and-open
+                          lock buffer (car case) nil nil)
+                         (cons (cdr case) (cdr case)))))
+        ;; The old side is the mirror image.
+        (select-window (get-buffer-window old-buffer))
+        (dolist (case '(("beta\nold one\nold two" . t)
+                        ("beta\n+new one" . nil)
+                        ("old three\ngamma" . t)
+                        ("old three\n\ngamma" . nil)))
+          (should (equal (diffs-tests--searches-folded-and-open
+                          lock buffer (car case) nil nil)
+                         (cons (cdr case) (cdr case)))))))))
+
+(ert-deftest diffs-split-search-finds-the-same-text-folded-and-open ()
+  (dolist (virtualization '(complete paged))
+    (dolist (backward '(nil t))
+      (diffs-tests--with-split
+          (diffs-tests--projection-patch virtualization buffer old-buffer new-buffer)
+        (let ((lock (with-current-buffer buffer
+                      (diffs-tests--section-for "yarn.lock"))))
+          (dolist (side '(new old))
+            (select-window (get-buffer-window (if (eq side 'new)
+                                                  new-buffer
+                                                old-buffer)))
+            (dolist (case '(("new one" . nil) ("old one" . nil)
+                            ("gamma" . nil) ("delta\n" . nil)
+                            ("^gamma$" . t) ("^new one$" . t) ("^old two$" . t)
+                            ("^-old" . t) ("^+new" . t) ("^ gamma" . t)
+                            ("gamma\\ndelta" . t) ("two\\nold three" . t)
+                            ("two\\n\\ngamma" . t) ("^new tail$" . t)
+                            ("omega\\n.*tail" . t) ("unmodified lines" . nil)
+                            ("new tail\\n⋯\\ntail2" . t) ("old tail\\ntail2" . t)
+                            ("^↓" . t) ("^⋯$" . t) ("zzz" . nil)))
+              (let ((outcome (diffs-tests--searches-folded-and-open
+                              lock buffer (car case) (cdr case) backward)))
+                (should (equal (car outcome) (cdr outcome)))))))))))
+
+(ert-deftest diffs-split-search-does-not-take-a-folded-files-header-for-hidden-text ()
+  (diffs-tests--with-split
+      (diffs-tests--lock-file-patch 'complete buffer old-buffer new-buffer)
+    (diffs-tests--isearching nil
+      (diffs-tests--isearch-type "package-lock")
+      (should (string-search "package-lock.json" (diffs-tests--line)))
+      (isearch-repeat-forward)
+      (should-not isearch-success)
+      (isearch-done t))))
+
+(ert-deftest diffs-split-search-builds-a-folded-files-text-once ()
+  (diffs-tests--with-split
+      (diffs-tests--lock-file-patch 'complete buffer old-buffer new-buffer)
+    (let ((collected 0))
+      (cl-letf* ((collect (symbol-function 'diffs--split-collect))
+                 ((symbol-function 'diffs--split-collect)
+                  (lambda (&rest arguments)
+                    (cl-incf collected)
+                    (apply collect arguments))))
+        (dolist (string '("1.0.1" "version" "1.0"))
+          (diffs-tests--isearching nil
+            (diffs-tests--isearch-type string)
+            (should (string-search "hidden lines" (diffs-tests--line)))
+            (isearch-done t)))
+        (should (= collected 1))))))
+
+(ert-deftest diffs-folded-section-texts-are-the-rows-the-split-draws-open ()
+  (diffs-tests--with-diff diffs-tests--hidden-context
+    (diffs--scan)
+    (let* ((section (car diffs--sections))
+           (gap (diffs--gap-for-hunk (car (plist-get section :hunks)))))
+      (puthash section ["old one" "old two" "old three" "old four" "old five"]
+               diffs--old-content-cache)
+      (puthash section ["new one" "new two" "new three" "new four" "new five"]
+               diffs--new-content-cache)
+      ;; With its context hidden, the hunk starts with a separator row.
+      (let ((texts (diffs--folded-section-texts section)))
+        (should (string-match-p "\\`[^\n]*unmodified lines[^\n]*\nold five\n\\'"
+                                (car texts)))
+        (should (string-match-p "\\`[^\n]*unmodified lines[^\n]*\nnew five\n\\'"
+                                (cdr texts))))
+      ;; With all of it shown the separator row is not drawn at all.
+      (diffs--set-context-visible gap 4)
+      (let ((texts (diffs--folded-section-texts section)))
+        (should (equal (car texts)
+                       "old one\nold two\nold three\nold four\nold five\n"))
+        (should (equal (cdr texts)
+                       "new one\nnew two\nnew three\nnew four\nnew five\n"))))))
+
 (ert-deftest diffs-split-search-matches-only-the-text-its-side-shows ()
   (dolist (virtualization '(complete paged))
     (diffs-tests--with-split
