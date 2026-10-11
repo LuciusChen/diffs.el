@@ -69,7 +69,7 @@ Source navigation remains side-specific: `RET` or `M-RET` on A visits the first 
 | `S-mouse-1` | Run token click hooks, or visit the exact source token |
 | `i` | Toggle the changed-file index |
 | `e` | Reveal more unchanged context |
-| `TAB` | Fold or unfold a hunk in stacked view |
+| `TAB` | Fold or unfold the file or hunk at a stacked heading; fold or unfold the file at point in split view |
 | `v` / `x` | Select / clear a stable review range |
 | `a` | Open the comment composer for the selected range |
 | `c` | Toggle the comment at point in native stacked and split reviews; external editable diff buffers retain self-insertion |
@@ -197,6 +197,16 @@ Collapsed hunk separators report how many unchanged lines they hide. A leading r
 
 Expanded lines are display overlays backed by the complete old and new file contents; the underlying patch is unchanged, so applying hunks, searching, and copying retain normal `diff-mode` behavior. Expanded lines appear immediately from raw source. Source-mode fontification runs from an idle queue and publishes faces afterward; rendered line vectors are shared through a bounded cache keyed by renderer version, repository, file, side, revision or worktree content, language mode, and theme generation. A transient source-mode fontification failure leaves the immediately available raw lines visible but is not cached as a successful render, so a later context read can retry. Theme changes invalidate rendered faces without discarding review-owned raw source.
 
+## Fold files
+
+A file folds to its header, so a review can skip generated output and spend its attention on the source. In the stacked view the fold is outline's: `TAB` on a file heading cycles it, and `M-x diffs-toggle-file-fold` folds or shows the file from anywhere inside it. In the side-by-side view `TAB` on any row of a file does the same. The state is shared, so a file folded in one view is folded in the other, and a folded file costs nothing to render: its hunks are not collected, aligned, or drawn, and the split shows its header and one `⋯ N hidden lines · press [TAB]` row.
+
+Files whose path matches `diffs-collapsed-files` open folded when a review holds more than one file. The default patterns are lock files such as `package-lock.json`, `yarn.lock`, `Cargo.lock`, `pnpm-lock.yaml`, and `go.sum`; set the option to nil to open every file. Refresh keeps the state of the files it already showed, so a lock file you opened by hand stays open. Commands that move to a target inside a folded file, which are Imenu hunk entries, comment navigation with `[` and `]`, and entering a diff at a source line, show the file first.
+
+Search reaches folded files. In the side-by-side view, `isearch` stops on the `⋯ N hidden lines` row of a folded file when the rows it would show on that side hold a match, in document order with the matches in the visible rows. The text searched is exactly what that side shows once the file is open, so line anchors such as `^`, matches across rows, the other side's lines, and the blank rows that align a change all behave as they do after opening it. The first search that reaches a folded file builds its rows without drawing them and keeps them until the pair is rebuilt. Ending the search there shows the file and moves to its first match, or to its last when searching backward. `C-g` leaves the file folded, and a file that the search only passes is never drawn. Lazy highlighting and the match count treat a matching folded file as one match. A match that straddles a wrapped row is not found, as in the visible rows.
+
+A file folds as a unit when its section starts on an outline heading, which `diff-mode` gives `diff --git` lines in Git-format patches. Hunks of other patches, such as a plain unified diff or `Index:` sections, still fold one by one with `TAB` in the stacked view. A folded file hides its comments and selection together with its rows; they return when the file is shown.
+
 ## Changed-file index and sticky context
 
 Once the in-content file header scrolls out of view, a sticky header takes its place instead of duplicating it on the first row. It reuses `diffs-file-header-function`, so its file label and statistics match the in-content header in stacked and split views, then adds the current file position (`[3/42]` in stacked), hunk line starts, and the hunk's function context when available. Sticky state belongs to each window, so two windows showing the same review can remain at different files without changing one another's header.
@@ -282,6 +292,7 @@ All options belong to the `diffs` customization group.
 | `diffs-hide-markers` | `t` | Hide leading unified-diff markers |
 | `diffs-prettify-headers` | `t` | Replace raw file/hunk headers with compact headers |
 | `diffs-file-icons` | `t` | Show nerd-icons file-type icons when the optional package is available |
+| `diffs-collapsed-files` | lock files | Regular expressions for files that open folded when a review holds several files |
 | `diffs-fringe-bars` | `t` | Show theme-native added/removed fringe bars |
 | `diffs-fringe-bar-width` | `2` | Fringe-bar width in pixels, clamped to 1–8 |
 | `diffs-split-full-width-backgrounds` | `t` | Extend split change backgrounds across each row |

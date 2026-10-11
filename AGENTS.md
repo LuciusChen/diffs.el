@@ -125,7 +125,22 @@ Elisp and package-development rules adapted from the clutch development guide fo
 - Split long lines truncate by default; wrapping is configurable.
 - `e` is the sole unchanged-context control in stacked and split views.
   Expansion is one-way and the separator disappears when complete;
-  `TAB` remains available for the separate hunk/outline folding action.
+  `TAB` remains available for the separate fold action.
+- `TAB` folds. On a stacked heading it is outline's own command, and in
+  split view it folds the file at point; `diffs-minor-mode-map` leaves it
+  alone so editable diff buffers keep self-insertion.
+- A file folds to its header in both views and the fold is outline's
+  state in the unified buffer, never a second state in a split buffer.
+  A folded file contributes a header and one note row to the split and
+  no hunk rows, and the split cache key carries the fold signature.
+  Commands that move to a target inside a folded file show it first.
+- Search in split view reaches folded files through their note rows: a
+  search that passes a folded file whose rows, as the split would draw
+  them open, match on this side stops on the note row, and ending the
+  search there shows the file and moves to its first match.  Hidden and
+  shown files are searched as one text model, the rows of the side, never
+  the raw patch.  Nothing is drawn for a file that a search only passes,
+  and quitting leaves it folded.
 - `A`, `R`, and `U` resolve or reset the change block at point; a prefix
   applies the action to the complete hunk. `C-c C-c` explicitly applies
   reviewed results to source buffers without saving or staging them.

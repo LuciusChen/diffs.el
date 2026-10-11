@@ -83,6 +83,8 @@
 (require 'eldoc)
 (require 'xref)
 (require 'imenu)
+(require 'outline)
+(require 'isearch)
 
 (declare-function vc-git-command "vc-git")
 (declare-function vc-git-root "vc-git")
@@ -134,6 +136,23 @@
 (defcustom diffs-prettify-headers t
   "When non-nil, replace file and hunk headers with a compact form."
   :type 'boolean
+  :group 'diffs)
+
+(defcustom diffs-collapsed-files
+  '("\\(?:\\`\\|/\\)[^/]*\\.lock\\'"
+    "\\(?:\\`\\|/\\)\\(?:package-lock\\|npm-shrinkwrap\\)\\.json\\'"
+    "\\(?:\\`\\|/\\)pnpm-lock\\.yaml\\'"
+    "\\(?:\\`\\|/\\)packages\\.lock\\.json\\'"
+    "\\(?:\\`\\|/\\)go\\.sum\\'")
+  "Regular expressions for files that start folded in a review.
+A file whose path matches one of them opens folded to its header, in
+both views, when the review holds more than one file.  The default
+matches lock files, whose diffs are long and rarely worth reading.
+A refresh keeps the state of files it already showed, so a file opened
+by hand stays open.  A search in the side-by-side view stops on the
+note row of a folded file whose hidden hunks match, and ending the
+search there shows the file.  Set to nil to open every file unfolded."
+  :type '(repeat regexp)
   :group 'diffs)
 
 (defcustom diffs-file-icons t
@@ -2616,12 +2635,19 @@ NEW-LINE, SIDE, CONTINUATION, and FACE describe its presentation."
       (point))))
 
 (defun diffs--decorate-header (sec)
-  "Display the header block of section SEC as one styled line."
-  (let* ((end (diffs--section-header-end sec))
-         (header (diffs--file-header sec 'stacked))
-         (line (and header (concat header "\n"))))
-    (diffs--put (plist-get sec :beg) end
-                'display (or line ""))))
+  "Display the header block of section SEC as one styled line.
+The display replaces the block's text but not its final newline, so
+a fold that starts inside the block ends the line on that newline
+\(see `outline-flag-region').  A display string that ended at the
+block boundary would let the next display string, the first hunk
+separator, show through the hidden text."
+  (let* ((beg (plist-get sec :beg))
+         (end (diffs--section-header-end sec))
+         (header (diffs--file-header sec 'stacked)))
+    (if (and header (not (string-empty-p header)))
+        (diffs--put beg (if (eq (char-before end) ?\n) (1- end) end)
+                    'display header)
+      (diffs--put beg end 'display ""))))
 
 (defun diffs--hunk-end (hunk sec)
   "Return the end position of HUNK in section SEC."
@@ -2914,6 +2940,136 @@ non-nil, only apply properties to lines intersecting that region."
   (if (diffs--lazy-stacked-p)
       (jit-lock-register #'diffs--jit-decorate)
     (diffs--decorate-eagerly)))
+
+;;;; File folding
+
+;; A folded file is an outline entry whose hunks are hidden.  Outline
+;; owns the state, so `TAB' on a file heading and the commands here
+;; agree, and the split view derives its rows from it.
+
+(defun diffs--section-foldable-p (section)
+  "Return non-nil when outline can fold SECTION to its header.
+A file with hunks under an outline heading owns those hunks as
+subheadings.  Other sections, such as a rename without content, have
+nothing to hide."
+  (and (plist-get section :hunks)
+       (save-excursion
+         (goto-char (plist-get section :beg))
+         (outline-on-heading-p t))))
+
+(defun diffs--section-folded-p (section)
+  "Return non-nil when SECTION is folded to its header.
+This tests the first hunk header, which is hidden by a fold of the whole
+file but shown by a fold that only hides the text before it or leaves the
+hunk headings visible."
+  (when-let* ((hunks (plist-get section :hunks)))
+    (and (invisible-p (car (car hunks)))
+         (diffs--section-foldable-p section))))
+
+(defun diffs--set-section-fold (section folded)
+  "Fold SECTION to its header when FOLDED, otherwise show all of it."
+  (save-excursion
+    (goto-char (plist-get section :beg))
+    (if folded (outline-hide-subtree) (outline-show-subtree))))
+
+(defun diffs--collapsed-files-regexp ()
+  "Return one regexp matching any of `diffs-collapsed-files', or nil."
+  (when diffs-collapsed-files
+    (mapconcat (lambda (regexp) (concat "\\(?:" regexp "\\)"))
+               diffs-collapsed-files "\\|")))
+
+(defun diffs--collapsed-file-p (section &optional regexp)
+  "Return non-nil when SECTION's file matches `diffs-collapsed-files'.
+REGEXP is the value of `diffs--collapsed-files-regexp', for callers that
+test many sections."
+  (let ((file (plist-get section :file))
+        (regexp (or regexp (diffs--collapsed-files-regexp))))
+    (and file regexp (string-match-p regexp file))))
+
+(defun diffs--file-counts ()
+  "Return a table from file name to the number of sections that show it."
+  (let ((count (make-hash-table :test #'equal)))
+    (dolist (section diffs--sections count)
+      (cl-incf (gethash (plist-get section :file) count 0)))))
+
+(defun diffs--fold-note (section)
+  "Return the split row text that stands for the hunks of folded SECTION.
+Search finds the rows of this text by their `diffs-fold-note' property."
+  (let ((hidden (- (count-lines (diffs--section-header-end section)
+                                (plist-get section :end))
+                   (length (plist-get section :hunks)))))
+    (propertize
+     (diffs--style-hunk-separator
+      (concat
+       (format "⋯ %d hidden line%s · press "
+               hidden (if (= hidden 1) "" "s"))
+       (propertize "[TAB]" 'help-echo "Press TAB to show this file")))
+     'diffs-fold-note t)))
+
+(defun diffs--fold-signature ()
+  "Return the indexes of the folded files, for cache keys."
+  (cl-loop for section in diffs--sections
+           when (diffs--section-folded-p section)
+           collect (plist-get section :index)))
+
+(defun diffs--fold-snapshot ()
+  "Return the fold state of the files that appear once, as a table.
+A folded file maps to `folded'.  A file that `diffs-collapsed-files'
+would fold but that is open maps to `open', so that a refresh does not
+close what was opened by hand.  Other files need no entry."
+  (let ((state (make-hash-table :test #'equal))
+        (count (diffs--file-counts))
+        (regexp (diffs--collapsed-files-regexp)))
+    (dolist (section diffs--sections state)
+      (let ((file (plist-get section :file)))
+        (when (= (gethash file count) 1)
+          (cond
+           ((diffs--section-folded-p section)
+            (puthash file 'folded state))
+           ((diffs--collapsed-file-p section regexp)
+            (puthash file 'open state))))))))
+
+(defun diffs--fold-initialize (&optional snapshot)
+  "Fold the files that should start folded.
+A file recorded in SNAPSHOT, from `diffs--fold-snapshot', gets the state
+it had.  Any other file is folded when it matches `diffs-collapsed-files'
+and the review holds more than one file: a single file was asked for."
+  (let ((regexp (diffs--collapsed-files-regexp))
+        (several (cdr diffs--sections))
+        (count (and snapshot (diffs--file-counts))))
+    (dolist (section diffs--sections)
+      (when (pcase (and snapshot
+                        (= (gethash (plist-get section :file) count) 1)
+                        (gethash (plist-get section :file) snapshot))
+              ('folded t)
+              ('open nil)
+              (_ (and several (diffs--collapsed-file-p section regexp))))
+        (when (diffs--section-foldable-p section)
+          (diffs--set-section-fold section t))))))
+
+(defun diffs--reveal-section (section)
+  "Show SECTION's hunks when it is folded."
+  (when (diffs--section-folded-p section)
+    (diffs--set-section-fold section nil)))
+
+(defun diffs-toggle-file-fold ()
+  "Fold the file at point to its header, or show it again.
+In the unified view this is outline's fold of the file, available from
+anywhere in it instead of only on its heading.  In the side-by-side view
+it makes the same fold in the unified buffer and rebuilds the pair."
+  (interactive)
+  (if (derived-mode-p 'diffs-split-mode)
+      (diffs--split-toggle-file-fold)
+    (unless diffs-minor-mode
+      (user-error "Not in a diffs buffer"))
+    (let ((section (or (diffs--section-at-pos (point))
+                       (user-error "Point is not in a file"))))
+      (unless (diffs--section-foldable-p section)
+        (user-error "This file has no hunks to fold"))
+      (let ((fold (not (diffs--section-folded-p section))))
+        (when fold
+          (goto-char (plist-get section :beg)))
+        (diffs--set-section-fold section fold)))))
 
 ;;;; Minor mode
 
@@ -3589,7 +3745,8 @@ hunk headers, and enables outline folding (TAB on headings).
           (diffs--update-sticky-header window))
         (setq-local outline-minor-mode-cycle t)
         (setq-local outline-minor-mode-highlight nil)
-        (outline-minor-mode 1))
+        (outline-minor-mode 1)
+        (diffs--fold-initialize))
     (jit-lock-unregister #'diffs--jit-decorate)
     (remove-hook 'text-scale-mode-hook #'diffs--define-fringe-bitmap t)
     (remove-hook 'text-scale-mode-hook
@@ -3609,6 +3766,7 @@ hunk headers, and enables outline folding (TAB on headings).
     (diffs--index-cleanup)
     (diffs--split-cache-clear)
     (diffs--clear-sticky-headers)
+    (mapc #'diffs--reveal-section diffs--sections)
     (diffs--undecorate)
     (diffs--minor-mode-restore-state)
     (when font-lock-mode
@@ -3760,6 +3918,7 @@ integers before refresh adoption begins."
           :index-visible diffs--index-visible
           :owner-overlays-stale diffs--review-owner-overlays-stale
           :context (diffs--refresh-context-state owner)
+          :folds (diffs--fold-snapshot)
           :split (diffs--refresh-split-state owner)
           :active-window-configuration
           (current-window-configuration)
@@ -4086,6 +4245,7 @@ integers before refresh adoption begins."
       (diffs--decorate-setup)
       (unless diffs--sections
         (user-error "No changes"))
+      (diffs--fold-initialize (plist-get state :folds))
       (set-buffer-modified-p modified))
     (diffs--refresh-copy-content-caches staged owner)
     (with-current-buffer owner
@@ -4214,6 +4374,7 @@ integers before refresh adoption begins."
     (dolist (spec (plist-get state :intraline-overlays))
       (diffs--make-intraline-overlay
        (nth 0 spec) (nth 1 spec) (nth 2 spec)))
+    (diffs--fold-initialize (plist-get state :folds))
     (when (diffs--lazy-stacked-p)
       (jit-lock-register #'diffs--jit-decorate))
     (setq diffs--split-cache
@@ -4684,7 +4845,8 @@ corrects each chunk's exact height when materialized."
       ;; but counting one keeps this policy computation hook-free and
       ;; slightly conservative around the threshold.
       (cl-incf count)
-      (if-let* ((hunks (plist-get section :hunks)))
+      (if-let* (((not (diffs--section-folded-p section)))
+                (hunks (plist-get section :hunks)))
           (dolist (hunk hunks)
             (let ((gap (diffs--gap-for-hunk hunk)))
               (cl-incf count
@@ -4695,13 +4857,16 @@ corrects each chunk's exact height when materialized."
                             1)))))
         ;; Metadata-only sections are normally tiny, but counting their
         ;; actual lines avoids selecting the complete model for a large
-        ;; binary or externally supplied patch item.
+        ;; binary or externally supplied patch item.  A folded file
+        ;; shows one note instead.
         (cl-incf count
-                 (max 0
-                      (1-
-                       (count-lines
-                        (plist-get section :beg)
-                        (plist-get section :end)))))))
+                 (if (diffs--section-folded-p section)
+                     1
+                   (max 0
+                        (1-
+                         (count-lines
+                          (plist-get section :beg)
+                          (plist-get section :end))))))))
     count))
 
 (defun diffs--split-paged-eligible-p (wrap-lines)
@@ -4737,14 +4902,19 @@ or hunk depending on KIND."
         chunks anchors)
     (dolist (section diffs--sections)
       (pcase-let ((`(,old-header . ,new-header)
-                   (diffs--split-file-headers section)))
+                   (diffs--split-file-headers section))
+                  (folded (diffs--section-folded-p section)))
         (when (or old-header new-header)
           (push (vector 'header section
                         (cons (or old-header "") (or new-header ""))
                         row 1)
                 chunks)
           (cl-incf row))
-        (unless (plist-get section :hunks)
+        (when folded
+          (push (vector 'meta section (diffs--fold-note section) row 1)
+                chunks)
+          (cl-incf row))
+        (unless (or folded (plist-get section :hunks))
           (let ((count
                  (save-excursion
                    (goto-char (plist-get section :beg))
@@ -4753,7 +4923,7 @@ or hunk depending on KIND."
             (when (> count 0)
               (push (vector 'meta section nil row count) chunks)
               (cl-incf row count))))
-        (dolist (hunk (plist-get section :hunks))
+        (dolist (hunk (unless folded (plist-get section :hunks)))
           (let ((count (diffs--split-hunk-row-count section hunk)))
             (push (1+ row) anchors)
             (when (> count 0)
@@ -4763,8 +4933,10 @@ or hunk depending on KIND."
           (nreverse anchors)
           row)))
 
-(defun diffs--split-collect ()
+(defun diffs--split-collect (&optional sections)
   "Collect aligned row lists from the current unified diffs buffer.
+SECTIONS defaults to every section, a folded one collecting as its
+header and a note.  Given SECTIONS, collect only those, each open.
 Returns (OLD-ROWS NEW-ROWS ANCHORS); each logical row is
 \(STRING NUMBER SRC-LINE KIND FILE HUNK ORIGIN PAIR SOURCE-NUMBER
 SOURCE-SIDE LIVE-TARGET SECTION).  NUMBER is the displayed preview line, or nil
@@ -4777,8 +4949,9 @@ Paired changed rows share a two-element PAIR vector."
   (let (old-rows new-rows anchors (row 0))
     (cl-flet ((emit (o n)
                 (push o old-rows) (push n new-rows) (cl-incf row)))
-      (dolist (sec diffs--sections)
+      (dolist (sec (or sections diffs--sections))
         (pcase-let* ((file (plist-get sec :file))
+                     (folded (and (not sections) (diffs--section-folded-p sec)))
                      (`(,old-header . ,new-header)
                       (diffs--split-file-headers sec)))
           (when (or old-header new-header)
@@ -4786,7 +4959,13 @@ Paired changed rows share a two-element PAIR vector."
                         nil nil nil sec)
                   (list (or new-header "") nil nil 'header file nil nil nil
                         nil nil nil sec)))
-          (unless (plist-get sec :hunks)
+          (when folded
+            (let ((note (diffs--fold-note sec)))
+              (emit (list note nil nil 'meta file nil nil nil
+                          nil nil nil sec)
+                    (list note nil nil 'meta file nil nil nil
+                          nil nil nil sec))))
+          (unless (or folded (plist-get sec :hunks))
             (save-excursion
               (goto-char (plist-get sec :beg))
               (forward-line 1)
@@ -4799,7 +4978,7 @@ Paired changed rows share a two-element PAIR vector."
                         (list text nil nil 'meta file nil nil nil
                               nil nil nil sec)))
                 (forward-line 1))))
-          (dolist (hunk (plist-get sec :hunks))
+          (dolist (hunk (unless folded (plist-get sec :hunks)))
             (push (1+ row) anchors)
             (pcase-let ((`(,old ,new)
                          (diffs--split-collect-hunk sec hunk t)))
@@ -5321,20 +5500,25 @@ Return the signed row-count adjustment."
       ('meta
        (let ((file (plist-get section :file))
              old new)
-         (save-excursion
-           (goto-char (plist-get section :beg))
-           (forward-line 1)
-           (while (< (point) (plist-get section :end))
-             (let* ((text
-                     (buffer-substring
-                      (line-beginning-position)
-                      (line-end-position)))
-                    (row
-                     (list text nil nil 'meta file nil nil nil
-                           nil nil nil nil section)))
+         (if (stringp payload)
+             (let ((row (list payload nil nil 'meta file nil nil nil
+                              nil nil nil nil section)))
                (push row old)
                (push (copy-sequence row) new))
-             (forward-line 1)))
+           (save-excursion
+             (goto-char (plist-get section :beg))
+             (forward-line 1)
+             (while (< (point) (plist-get section :end))
+               (let* ((text
+                       (buffer-substring
+                        (line-beginning-position)
+                        (line-end-position)))
+                      (row
+                       (list text nil nil 'meta file nil nil nil
+                             nil nil nil nil section)))
+                 (push row old)
+                 (push (copy-sequence row) new))
+               (forward-line 1))))
          (list (vconcat (nreverse old))
                (vconcat (nreverse new)))))
       ('hunk
@@ -6401,6 +6585,7 @@ and treat the peer as the horizontal source of truth."
         (diffs--update-split-sticky-headers w)))))
 
 (defvar-keymap diffs-split-mode-map
+  "TAB" #'diffs-toggle-file-fold
   "n" #'diffs-split-next-hunk
   "p" #'diffs-split-prev-hunk
   "RET" #'diffs-split-goto-source
@@ -6435,7 +6620,10 @@ and treat the peer as the horizontal source of truth."
             #'diffs--review-display-metrics-changed nil t)
   (add-hook 'kill-buffer-hook #'diffs--clear-sticky-headers nil t)
   (add-hook 'pre-command-hook #'diffs--split-pre-command nil t)
+  (add-hook 'pre-command-hook #'diffs--split-isearch-forget nil t)
   (add-hook 'post-command-hook #'diffs--split-post-command nil t)
+  (setq-local isearch-search-fun-function #'diffs--split-isearch-search-fun)
+  (add-hook 'isearch-mode-end-hook #'diffs--split-isearch-end nil t)
   (add-hook 'window-scroll-functions #'diffs--split-scroll-hook nil t)
   (add-hook 'window-buffer-change-functions
             #'diffs--sticky-header-window-buffer-change nil t)
@@ -6575,38 +6763,294 @@ NEW-START identify an optional hunk."
                hunks)
               (user-error
                "The selected hunk is no longer in this review")))))
+      (when (and hunk
+                 (with-current-buffer owner
+                   (diffs--section-folded-p section)))
+        (if split
+            (diffs--split-set-fold section nil)
+          (diffs--set-section-fold section nil)))
       (if (not split)
           (goto-char
            (if hunk (car hunk) (plist-get section :beg)))
-        (let ((row-index
-               (diffs--imenu-split-row-index section hunk)))
-          (unless row-index
-            (user-error "The selected target is not in the split view"))
-          (when diffs--split-paged-p
-            (diffs--split-materialize-range row-index (1+ row-index))
-            (setq row-index
-                  (diffs--imenu-split-row-index section hunk)))
-          (goto-char (diffs--split-row-position row-index))
-          (dolist
-              (peer
-               (get-buffer-window-list diffs--split-other nil t))
-            (set-window-point
-             peer
-             (with-current-buffer diffs--split-other
-               (diffs--split-row-position row-index))))
-          (diffs--split-sync-index (point))
-          (when-let*
-              ((window
-                (if (eq (window-buffer (selected-window))
-                        (current-buffer))
-                    (selected-window)
-                  (get-buffer-window (current-buffer) t))))
-            (set-window-point window (point))
-            (with-selected-window window
-              (recenter)
-              (diffs--split-materialize-window window)
-              (diffs--split-sync-from window)
-              (diffs--update-split-sticky-headers window))))))))
+        (diffs--split-goto-section section hunk)))))
+
+(defun diffs--split-show-position (position)
+  "Move this split buffer and its peer to POSITION and show it."
+  (let ((row-index (diffs--split-row-index-at-position position)))
+    (goto-char position)
+    (dolist
+        (peer
+         (get-buffer-window-list diffs--split-other nil t))
+      (set-window-point
+       peer
+       (with-current-buffer diffs--split-other
+         (diffs--split-row-position row-index))))
+    (diffs--split-sync-index (point))
+    (when-let*
+        ((window
+          (if (eq (window-buffer (selected-window))
+                  (current-buffer))
+              (selected-window)
+            (get-buffer-window (current-buffer) t))))
+      (set-window-point window (point))
+      (with-selected-window window
+        (recenter)
+        (diffs--split-materialize-window window)
+        (diffs--split-sync-from window)
+        (diffs--update-split-sticky-headers window)))))
+
+(defun diffs--split-goto-section (section &optional hunk)
+  "Move this split buffer and its peer to SECTION, or to its HUNK."
+  (let ((row-index
+         (diffs--imenu-split-row-index section hunk)))
+    (unless row-index
+      (user-error "The selected target is not in the split view"))
+    (when diffs--split-paged-p
+      (diffs--split-materialize-range row-index (1+ row-index))
+      (setq row-index
+            (diffs--imenu-split-row-index section hunk)))
+    (diffs--split-show-position (diffs--split-row-position row-index))))
+
+(defun diffs--split-set-fold (section folded)
+  "Fold SECTION when FOLDED, otherwise show it, and rebuild the split.
+The rebuilt pair is shown in place of the old one with the side that was
+current selected again."
+  (let ((unified diffs--split-unified)
+        (role diffs--split-role))
+    (diffs-split-quit)
+    (set-buffer unified)
+    (diffs--set-section-fold section folded)
+    (diffs-toggle-split)
+    (select-window
+     (get-buffer-window
+      (plist-get (buffer-local-value 'diffs--split-cache unified)
+                 (if (eq role 'old) :old :new))))))
+
+(defun diffs--split-toggle-file-fold ()
+  "Fold or unfold the file at point in the side-by-side view."
+  (let ((unified diffs--split-unified)
+        (section (or (diffs--split-section-at-position (point))
+                     (user-error "Point is not in a file"))))
+    (with-current-buffer unified
+      (unless (diffs--section-foldable-p section)
+        (user-error "This file has no hunks to fold")))
+    (diffs--split-set-fold
+     section
+     (not (with-current-buffer unified (diffs--section-folded-p section))))
+    (diffs--split-goto-section section)))
+
+;; A folded file has no rows in the split buffers, so isearch cannot see
+;; its hunks.  The note row stands in for them: a search that would pass
+;; the note row, with a match in the rows the file would show on this
+;; side, stops on it.  Ending the search there shows the file and moves
+;; to its first match, so no file is drawn that the search does not
+;; settle on.
+
+(defvar-local diffs--split-gates-cache nil
+  "Cons of a modification tick of this split buffer and its folded files.")
+
+(defun diffs--split-find-fold-gates ()
+  "Return the folded files of this split buffer as (SECTION BEG END) lists.
+BEG and END delimit the text of the file's note row, in buffer order."
+  (let ((notes
+         (if diffs--split-paged-p
+             (cl-loop for chunk across diffs--split-chunks
+                      when (and (eq (aref chunk 0) 'meta)
+                                (stringp (aref chunk 2))
+                                (get-text-property
+                                 0 'diffs-fold-note (aref chunk 2)))
+                      collect (cons (aref chunk 1) (aref chunk 3)))
+           (cl-loop for row across diffs--split-rows
+                    for index from 0
+                    when (and (stringp (car row))
+                              (> (length (car row)) 0)
+                              (get-text-property
+                               0 'diffs-fold-note (car row)))
+                    collect (cons (diffs--split-row-section row) index)))))
+    (cl-loop for (section . index)
+             in (cl-remove-duplicates notes :key #'car :test #'eq
+                                      :from-end t)
+             collect (list section
+                           (diffs--split-row-position index)
+                           (1- (diffs--split-row-position (1+ index)))))))
+
+(defun diffs--split-fold-gates ()
+  "Return the folded files of this split buffer as (SECTION BEG END) lists.
+The positions stay valid until the text changes, and a search asks for
+them once per match."
+  (let ((tick (buffer-chars-modified-tick)))
+    (unless (eql (car diffs--split-gates-cache) tick)
+      (setq diffs--split-gates-cache
+            (cons tick (diffs--split-find-fold-gates))))
+    (cdr diffs--split-gates-cache)))
+
+(defvar-local diffs--split-hidden-cache nil
+  "Table from a folded section to the texts of its hunks' rows, or nil.")
+
+(defun diffs--folded-section-texts (section)
+  "Return the rows of SECTION's hunks as the split would draw them open.
+The result is (OLD . NEW), the text of each side with a newline after
+every row, as it would stand in the split buffer.  Call this in the
+unified buffer."
+  (pcase-let* ((`(,old ,new . ,_) (diffs--split-collect (list section)))
+               (`(,old-rows ,new-rows . ,_)
+                (diffs--split-physical-rows old new 8)))
+    (cl-flet ((text (rows)
+                (mapconcat (lambda (row)
+                             (if (eq (nth 3 row) 'header)
+                                 ""
+                               (concat (car row) "\n")))
+                           rows "")))
+      (cons (text old-rows) (text new-rows)))))
+
+(defun diffs--split-hidden-text (section)
+  "Return the text this side would show for the hunks of folded SECTION.
+It is kept until the pair is rebuilt, so a search builds it once."
+  (let* ((cache (or diffs--split-hidden-cache
+                    (setq diffs--split-hidden-cache
+                          (make-hash-table :test #'eq))))
+         (texts (or (gethash section cache)
+                    (puthash section
+                             (with-current-buffer diffs--split-unified
+                               (diffs--folded-section-texts section))
+                             cache))))
+    (if (eq diffs--split-role 'old) (car texts) (cdr texts))))
+
+(defun diffs--split-hidden-match-p (section string search)
+  "Return non-nil when the folded SECTION hides a match of STRING.
+SEARCH is isearch's search function.  It looks in the text this side
+shows once the file is open, so line anchors and matches across rows
+agree with the search after the file is shown."
+  (let ((text (diffs--split-hidden-text section))
+        (fold case-fold-search)
+        (isearch-forward t))
+    (with-temp-buffer
+      (insert text)
+      (goto-char (point-min))
+      (let ((case-fold-search fold))
+        (and (funcall search string nil t) t)))))
+
+(defun diffs--split-isearch-gate (gates string search origin hit bound)
+  "Return the gate in GATES that a search from ORIGIN reaches before HIT.
+HIT is the (BEG . END) of the match SEARCH found in the rows, or nil,
+and BOUND limits the search.  The gate is also one whose file hides a
+match of STRING."
+  (let ((forward isearch-forward))
+    (cl-find-if
+     (lambda (gate)
+       (pcase-let ((`(,section ,beg ,end) gate))
+         (and (if forward
+                  (and (> end origin)
+                       (or (null hit) (<= end (car hit)))
+                       (or (null bound) (<= end bound)))
+                (and (< beg origin)
+                     (or (null hit) (>= beg (cdr hit)))
+                     (or (null bound) (>= beg bound))))
+              (diffs--split-hidden-match-p section string search))))
+     (if forward gates (reverse gates)))))
+
+(defun diffs--split-isearch-search-fun ()
+  "Return isearch's search function, extended to stop on folded files.
+Lazy highlighting and counting call it too, so a folded file that
+matches counts as one match and its note row is highlighted."
+  (let ((search (isearch-search-fun-default)))
+    (lambda (string &optional bound noerror count)
+      (let ((gates (and (not count) (diffs--split-fold-gates))))
+        (if (not gates)
+            (funcall search string bound noerror count)
+          (let* ((origin (point))
+                 (found (funcall search string bound noerror count))
+                 (hit (and found (cons (match-beginning 0) (match-end 0))))
+                 (gate (diffs--split-isearch-gate
+                        gates string search origin hit bound)))
+            (if (not gate)
+                found
+              (set-match-data (list (nth 1 gate) (nth 2 gate)))
+              (goto-char (if isearch-forward (nth 2 gate) (nth 1 gate))))))))))
+
+(defun diffs--split-isearch-state ()
+  "Return the settings of the search in progress as a plist."
+  (list :string isearch-string :forward isearch-forward
+        :regexp isearch-regexp :function isearch-regexp-function
+        :fold isearch-case-fold-search
+        :lax isearch-lax-whitespace
+        :regexp-lax isearch-regexp-lax-whitespace))
+
+(defun diffs--split-goto-hit (section state)
+  "Move to the first match of search STATE in the rows of shown SECTION."
+  (when diffs--split-paged-p
+    (diffs--split-paged-materialize-all))
+  (let* ((isearch-string (plist-get state :string))
+         (isearch-forward (plist-get state :forward))
+         (isearch-regexp (plist-get state :regexp))
+         (isearch-regexp-function (plist-get state :function))
+         (isearch-lax-whitespace (plist-get state :lax))
+         (isearch-regexp-lax-whitespace (plist-get state :regexp-lax))
+         (case-fold-search (plist-get state :fold))
+         (first (diffs--imenu-split-row-index
+                 section (car (plist-get section :hunks))))
+         (stop (let ((index first))
+                 (while (and (< index (length diffs--split-rows))
+                             (eq section (diffs--split-row-section
+                                          (aref diffs--split-rows index))))
+                   (cl-incf index))
+                 index))
+         (beg (diffs--split-row-position first))
+         (end (diffs--split-row-position stop))
+         (hit (save-excursion
+                (goto-char (if isearch-forward beg end))
+                (and (funcall (isearch-search-fun-default)
+                              isearch-string (if isearch-forward end beg) t)
+                     (point)))))
+    (if hit
+        (diffs--split-show-position hit)
+      (message "No match for \"%s\" in %s"
+               isearch-string (plist-get section :file)))))
+
+(defvar-local diffs--split-pending-reveal nil
+  "The folded section to show and the search that stopped on it, or nil.")
+
+(defun diffs--split-isearch-forget ()
+  "Drop the pending reveal, as a new command has started."
+  (when diffs--split-pending-reveal
+    (setq diffs--split-pending-reveal nil)
+    (remove-hook 'post-command-hook #'diffs--split-isearch-reveal t)))
+
+(defun diffs--split-isearch-reveal ()
+  "Show the folded file that the search which just ended stopped on.
+This runs once, when the command that ended the search is done."
+  (remove-hook 'post-command-hook #'diffs--split-isearch-reveal t)
+  (let ((pending (prog1 diffs--split-pending-reveal
+                   (setq diffs--split-pending-reveal nil))))
+    ;; `isearch-edit-string' ends the search and starts it again within
+    ;; one command.
+    (when (and pending
+               (not isearch-mode)
+               (eq (window-buffer (selected-window)) (current-buffer)))
+      ;; An error in a command hook would discard the buffer's hooks.
+      (condition-case error
+          (let ((section (car pending)))
+            (diffs--split-set-fold section nil)
+            (diffs--split-goto-section section)
+            (diffs--split-goto-hit section (cdr pending)))
+        (error (message "diffs: cannot show %s: %s"
+                        (plist-get (car pending) :file)
+                        (error-message-string error)))))))
+
+(defun diffs--split-isearch-end ()
+  "Arrange to show the folded file on whose note row the search stopped.
+The file is shown when the command that ended the search is done."
+  (when-let* (((not isearch-mode-end-hook-quit))
+              (position (and isearch-other-end
+                             (min (point) isearch-other-end)))
+              ((get-text-property position 'diffs-fold-note))
+              (section (diffs--split-section-at-position position))
+              ((let ((case-fold-search isearch-case-fold-search))
+                 (diffs--split-hidden-match-p
+                  section isearch-string (isearch-search-fun-default)))))
+    (setq diffs--split-pending-reveal
+          (cons section (diffs--split-isearch-state)))
+    (add-hook 'post-command-hook #'diffs--split-isearch-reveal nil t)))
 
 (defun diffs--split-find-row
     (hunk source kind number physical-offset)
@@ -6848,7 +7292,9 @@ error never strands the user in the unified view."
   (unless diffs-minor-mode
     (user-error "Not in a diffs buffer"))
   (let* ((unified (current-buffer))
-         (modified-tick (buffer-chars-modified-tick))
+         ;; Folding changes the rows without touching the text.
+         (modified-tick
+          (cons (buffer-chars-modified-tick) (diffs--fold-signature)))
          (wrap-lines diffs-split-wrap-lines)
          (show-line-numbers diffs-line-numbers)
          (show-file-icons diffs-file-icons)
@@ -9772,9 +10218,33 @@ live presentation state and never changes session comment data."
       (and (= (car left) (car right))
            (< (cadr left) (cadr right)))))
 
+(defun diffs--review-reveal-annotation (owner annotation)
+  "Show the file of ANNOTATION in OWNER's visible review if it is folded."
+  (let ((cache (buffer-local-value 'diffs--split-cache owner))
+        (file (plist-get annotation :file)))
+    (dolist (section
+             (with-current-buffer owner
+               (seq-filter
+                (lambda (section)
+                  (and (equal file (plist-get section :file))
+                       (diffs--section-folded-p section)))
+                diffs--sections)))
+      (if-let* ((window
+                 (cl-some
+                  (lambda (key)
+                    (let ((buffer (plist-get cache key)))
+                      (and (buffer-live-p buffer)
+                           (get-buffer-window buffer))))
+                  '(:old :new))))
+          (with-selected-window window
+            (diffs--split-set-fold section nil))
+        (with-current-buffer owner
+          (diffs--set-section-fold section nil))))))
+
 (defun diffs--review-goto-annotation (owner annotation)
   "Move OWNER's visible review to ANNOTATION."
   (when-let* ((target (diffs--review-annotation-target annotation)))
+    (diffs--review-reveal-annotation owner annotation)
     (let* ((cache (buffer-local-value 'diffs--split-cache owner))
            (split
             (plist-get cache (if (eq (car target) 'old) :old :new)))
@@ -12145,6 +12615,10 @@ INDEPENDENT-SOURCES means the old and new paths are separate files."
               (format "Cannot position diff at source line %d: %s"
                       line (error-message-string error-data))
               :warning))))
+        (with-current-buffer buf
+          (when-let* ((section (diffs--section-at-pos (point)))
+                      ((diffs--hunk-at-pos section (point))))
+            (diffs--reveal-section section)))
         (setq entry-anchor
               (with-current-buffer buf
                 (diffs--split-entry-anchor))))

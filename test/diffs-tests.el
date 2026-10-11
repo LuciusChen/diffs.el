@@ -47,6 +47,26 @@
    "+(message \"new\")\n"
    "+(message \"extra\")\n"))
 
+(defconst diffs-tests--lock-file-patch
+  (concat
+   diffs-tests--normal
+   "diff --git a/package-lock.json b/package-lock.json\n"
+   "index 3333333..4444444 100644\n"
+   "--- a/package-lock.json\n"
+   "+++ b/package-lock.json\n"
+   "@@ -1,3 +1,3 @@\n"
+   " {\n"
+   "-  \"version\": \"1.0.0\",\n"
+   "+  \"version\": \"1.0.1\",\n"
+   " }\n"
+   "diff --git a/bar.el b/bar.el\n"
+   "index 5555555..6666666 100644\n"
+   "--- a/bar.el\n"
+   "+++ b/bar.el\n"
+   "@@ -10 +10 @@\n"
+   "-old bar\n"
+   "+new bar\n"))
+
 (defconst diffs-tests--png
   (base64-decode-string
    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
@@ -2269,9 +2289,14 @@
   (should-not (keymap-lookup diffs-minor-mode-map "c"))
   (should (eq (keymap-lookup diffs-split-mode-map "c")
               #'diffs-review-toggle-comment))
+  ;; Stacked views leave `TAB' to outline.  The split view has no outline,
+  ;; so `TAB' there folds the file at point, the same fold `TAB' makes on
+  ;; a file heading in a stacked view.
   (dolist (key '("TAB" "<backtab>"))
-    (should-not (keymap-lookup diffs-minor-mode-map key))
-    (should-not (keymap-lookup diffs-split-mode-map key)))
+    (should-not (keymap-lookup diffs-minor-mode-map key)))
+  (should (eq (keymap-lookup diffs-split-mode-map "TAB")
+              #'diffs-toggle-file-fold))
+  (should-not (keymap-lookup diffs-split-mode-map "<backtab>"))
   (diffs-tests--with-diff diffs-tests--hidden-context
     (diffs-minor-mode 1)
     (goto-char (point-min))
@@ -5481,6 +5506,1186 @@ Batch Emacs never reaches the redisplay step that does this."
       (when (buffer-live-p diff-buffer)
         (kill-buffer diff-buffer))
       (delete-directory directory t))))
+
+(ert-deftest diffs-file-header-display-keeps-the-block-newline-real ()
+  ;; A fold hides from the end of the first header line.  The display
+  ;; string must stop short of the block's last newline, otherwise the
+  ;; display string of the first hunk separator is the next thing
+  ;; redisplay meets and it shows through the hidden text.
+  (diffs-tests--with-diff (concat diffs-tests--normal
+                                  "diff --git a/old.txt b/new.txt\n"
+                                  "similarity index 100%\n"
+                                  "rename from old.txt\n"
+                                  "rename to new.txt\n")
+    (diffs-minor-mode 1)
+    (should (= (length diffs--sections) 2))
+    (dolist (section diffs--sections)
+      (let* ((beg (plist-get section :beg))
+             (end (diffs--section-header-end section))
+             (display (get-text-property beg 'display)))
+        (should (eq (char-before end) ?\n))
+        (should (stringp display))
+        (should-not (string-search "\n" display))
+        (should (= (next-single-property-change beg 'display nil end)
+                   (1- end)))
+        (should-not (get-text-property (1- end) 'display))))))
+
+(defun diffs-tests--section-for (file)
+  "Return the scanned section of FILE in the current buffer."
+  (seq-find (lambda (section) (equal (plist-get section :file) file))
+            diffs--sections))
+
+(ert-deftest diffs-collapsed-files-default-matches-lock-files-only ()
+  (dolist (file '("package-lock.json" "web/package-lock.json"
+                  "npm-shrinkwrap.json" "Cargo.lock" "a/b/yarn.lock"
+                  "poetry.lock" "pnpm-lock.yaml" "go.sum"
+                  "src/packages.lock.json"))
+    (should (diffs--collapsed-file-p (list :file file))))
+  (dolist (file '("lock.el" "src/lockfile.el" "my-package-lock.json"
+                  "docs/go.summary" "unlock.el" "flake.nix"
+                  "src/clock.lock.el"))
+    (should-not (diffs--collapsed-file-p (list :file file)))))
+
+(ert-deftest diffs-collapsed-files-start-folded ()
+  (diffs-tests--with-diff diffs-tests--lock-file-patch
+    (diffs-minor-mode 1)
+    (let ((source (diffs-tests--section-for "foo.el"))
+          (lock (diffs-tests--section-for "package-lock.json"))
+          (other (diffs-tests--section-for "bar.el")))
+      (should (diffs--section-folded-p lock))
+      (should-not (diffs--section-folded-p source))
+      (should-not (diffs--section-folded-p other))
+      ;; The header and its neighbours stay, the hunk text goes.
+      (should-not (invisible-p (plist-get lock :beg)))
+      (should (invisible-p (car (car (plist-get lock :hunks)))))
+      (should (invisible-p (- (plist-get lock :end) 2)))
+      (should-not (invisible-p (plist-get source :block-end)))
+      (should-not (invisible-p (plist-get other :beg)))
+      (should-not (invisible-p (plist-get other :block-end))))))
+
+(ert-deftest diffs-collapsed-files-option-chooses-the-folded-files ()
+  (let ((diffs-collapsed-files '("\\`bar\\.el\\'")))
+    (diffs-tests--with-diff diffs-tests--lock-file-patch
+      (diffs-minor-mode 1)
+      (should (diffs--section-folded-p (diffs-tests--section-for "bar.el")))
+      (should-not
+       (diffs--section-folded-p (diffs-tests--section-for "package-lock.json")))))
+  (let ((diffs-collapsed-files nil))
+    (diffs-tests--with-diff diffs-tests--lock-file-patch
+      (diffs-minor-mode 1)
+      (should-not (seq-find #'diffs--section-folded-p diffs--sections)))))
+
+(ert-deftest diffs-collapsed-files-leave-a-single-file-open ()
+  ;; A review of one file was asked for by name, so it is not folded.
+  (diffs-tests--with-diff (concat
+                           "diff --git a/yarn.lock b/yarn.lock\n"
+                           "index 1111111..2222222 100644\n"
+                           "--- a/yarn.lock\n"
+                           "+++ b/yarn.lock\n"
+                           "@@ -1 +1 @@\n"
+                           "-old\n"
+                           "+new\n")
+    (diffs-minor-mode 1)
+    (should (= (length diffs--sections) 1))
+    (should-not (diffs--section-folded-p (car diffs--sections)))))
+
+(ert-deftest diffs-file-fold-is-outline-state-for-the-whole-file ()
+  ;; Every way outline can hide part of a file maps to the right answer.
+  (diffs-tests--with-diff diffs-tests--lock-file-patch
+    (let ((diffs-collapsed-files nil))
+      (diffs-minor-mode 1))
+    (let ((source (diffs-tests--section-for "foo.el")))
+      (goto-char (plist-get source :beg))
+      (should-not (diffs--section-folded-p source))
+      (outline-hide-subtree)
+      (should (diffs--section-folded-p source))
+      ;; Showing only the hunk headings is not a folded file.
+      (outline-show-children)
+      (should-not (diffs--section-folded-p source))
+      (outline-hide-subtree)
+      (outline-show-subtree)
+      (should-not (diffs--section-folded-p source))
+      ;; Hiding only the text before the first heading leaves the hunks.
+      (outline-hide-entry)
+      (should-not (diffs--section-folded-p source)))))
+
+(ert-deftest diffs-only-files-with-hunks-under-a-heading-fold ()
+  (diffs-tests--with-diff (concat
+                           diffs-tests--normal
+                           "diff --git a/old.txt b/new.txt\n"
+                           "similarity index 100%\n"
+                           "rename from old.txt\n"
+                           "rename to new.txt\n"
+                           "Index: legacy.c\n"
+                           "--- legacy.c\n"
+                           "+++ legacy.c\n"
+                           "@@ -1 +1 @@\n"
+                           "-a\n"
+                           "+b\n")
+    (diffs-minor-mode 1)
+    (should (= (length diffs--sections) 3))
+    (should (diffs--section-foldable-p (diffs-tests--section-for "foo.el")))
+    (should-not
+     (diffs--section-foldable-p (diffs-tests--section-for "new.txt")))
+    (should-not
+     (diffs--section-foldable-p (diffs-tests--section-for "legacy.c")))
+    (goto-char (plist-get (diffs-tests--section-for "new.txt") :beg))
+    (should-error (diffs-toggle-file-fold) :type 'user-error)))
+
+(ert-deftest diffs-toggle-file-fold-folds-and-unfolds-the-file-at-point ()
+  (diffs-tests--with-diff diffs-tests--lock-file-patch
+    (diffs-minor-mode 1)
+    (let ((lock (diffs-tests--section-for "package-lock.json"))
+          (source (diffs-tests--section-for "foo.el")))
+      ;; From inside a folded file's header the same command opens it.
+      (goto-char (plist-get lock :beg))
+      (diffs-toggle-file-fold)
+      (should-not (diffs--section-folded-p lock))
+      (should-not (invisible-p (plist-get lock :block-end)))
+      (diffs-toggle-file-fold)
+      (should (diffs--section-folded-p lock))
+      ;; Folding from the middle of a hunk leaves point on the header.
+      (goto-char (plist-get source :beg))
+      (search-forward "+(message \"new\")")
+      (diffs-toggle-file-fold)
+      (should (diffs--section-folded-p source))
+      (should (= (point) (plist-get source :beg)))
+      (should (invisible-p (car (car (plist-get source :hunks))))))))
+
+(ert-deftest diffs-disabling-the-mode-shows-folded-files ()
+  (diffs-tests--with-diff diffs-tests--lock-file-patch
+    (diffs-minor-mode 1)
+    (should (seq-find #'diffs--section-folded-p diffs--sections))
+    (diffs-minor-mode -1)
+    (should-not (seq-find #'diffs--section-folded-p diffs--sections))
+    (goto-char (point-min))
+    (while (not (eobp))
+      (should-not (invisible-p (point)))
+      (forward-line 1))))
+
+(ert-deftest diffs-disabling-the-mode-keeps-an-outline-that-was-already-on ()
+  ;; With outline on beforehand, only the files diffs folded come back;
+  ;; a fold of one hunk is the user's.
+  (diffs-tests--with-diff diffs-tests--lock-file-patch
+    (outline-minor-mode 1)
+    (diffs-minor-mode 1)
+    (let* ((lock (diffs-tests--section-for "package-lock.json"))
+           (source (diffs-tests--section-for "foo.el"))
+           (hunk (car (car (plist-get source :hunks))))
+           (body (save-excursion (goto-char hunk) (forward-line 1) (point))))
+      (should (diffs--section-folded-p lock))
+      (goto-char hunk)
+      (outline-hide-subtree)
+      (should (invisible-p body))
+      (diffs-minor-mode -1)
+      (should-not (diffs--section-folded-p lock))
+      (should outline-minor-mode)
+      (should (invisible-p body)))))
+
+(defun diffs-tests--fold-states (&rest files)
+  "Return the folded state of each of FILES in the current buffer."
+  (mapcar (lambda (file)
+            (and (diffs--section-folded-p (diffs-tests--section-for file)) t))
+          files))
+
+(defconst diffs-tests--yarn-lock-patch
+  (concat
+   "diff --git a/yarn.lock b/yarn.lock\n"
+   "index 7777777..8888888 100644\n"
+   "--- a/yarn.lock\n"
+   "+++ b/yarn.lock\n"
+   "@@ -1 +1 @@\n"
+   "-old\n"
+   "+new\n")
+  "A second lock file, new to a refreshed review.")
+
+(defmacro diffs-tests--with-refreshable-review (patches &rest body)
+  "Run BODY in a live review whose refreshes return the next of PATCHES.
+The first element of PATCHES is the review opened.  Each `diffs-refresh'
+then shows the following one, the last repeating."
+  (declare (indent 1) (debug t))
+  `(let* ((buffer (generate-new-buffer " *diffs fold refresh test*"))
+          (patches ,patches)
+          regenerator)
+     (unwind-protect
+         (save-window-excursion
+           (switch-to-buffer buffer)
+           (insert (pop patches))
+           (diff-mode)
+           (diffs-minor-mode 1)
+           (setq regenerator
+                 (lambda ()
+                   (let ((staged
+                          (diffs--prepare-buffer temporary-file-directory)))
+                     (with-current-buffer staged
+                       (insert (if (cdr patches) (pop patches) (car patches))))
+                     (diffs--present staged nil nil nil regenerator)))
+                 diffs--regenerator regenerator)
+           ,@body)
+       (when (buffer-live-p buffer)
+         (kill-buffer buffer)))))
+
+(ert-deftest diffs-refresh-keeps-the-folds-it-knew-and-folds-new-lock-files ()
+  (diffs-tests--with-refreshable-review
+      (list diffs-tests--lock-file-patch
+            (concat diffs-tests--lock-file-patch
+                    diffs-tests--yarn-lock-patch))
+    (should (equal (diffs-tests--fold-states
+                    "foo.el" "package-lock.json" "bar.el")
+                   '(nil t nil)))
+    ;; Open the lock file and fold a source file, both by hand.
+    (goto-char (plist-get (diffs-tests--section-for "package-lock.json") :beg))
+    (diffs-toggle-file-fold)
+    (goto-char (plist-get (diffs-tests--section-for "bar.el") :beg))
+    (diffs-toggle-file-fold)
+    (should (equal (diffs-tests--fold-states
+                    "foo.el" "package-lock.json" "bar.el")
+                   '(nil nil t)))
+    (diffs-refresh)
+    (should (eq (current-buffer) buffer))
+    (should (equal (diffs-tests--fold-states
+                    "foo.el" "package-lock.json" "bar.el" "yarn.lock")
+                   '(nil nil t t)))))
+
+(ert-deftest diffs-refresh-from-the-split-view-keeps-its-folds ()
+  (diffs-tests--with-refreshable-review
+      (list diffs-tests--lock-file-patch
+            (concat diffs-tests--lock-file-patch
+                    diffs-tests--yarn-lock-patch))
+    (setq buffer-read-only t)
+    (diffs-toggle-split)
+    (goto-char (point-min))
+    (search-forward "hidden lines")
+    (diffs-toggle-file-fold)
+    (should (string-search "1.0.1" (diffs-tests--split-text)))
+    (diffs-refresh)
+    (should (derived-mode-p 'diffs-split-mode))
+    (with-current-buffer buffer
+      (should (equal (diffs-tests--fold-states
+                      "package-lock.json" "yarn.lock")
+                     '(nil t))))
+    ;; The rebuilt pair shows the opened file and the new folded one.
+    (let ((text (diffs-tests--split-text)))
+      (should (string-search "1.0.1" text))
+      (should (string-search "yarn.lock" text))
+      (should (string-search "2 hidden lines" text)))
+    (diffs-split-quit)))
+
+(ert-deftest diffs-failed-refresh-restores-the-folds ()
+  (diffs-tests--with-refreshable-review
+      (list diffs-tests--lock-file-patch
+            (concat diffs-tests--lock-file-patch
+                    diffs-tests--yarn-lock-patch))
+    (goto-char (plist-get (diffs-tests--section-for "package-lock.json") :beg))
+    (diffs-toggle-file-fold)
+    (goto-char (plist-get (diffs-tests--section-for "bar.el") :beg))
+    (diffs-toggle-file-fold)
+    (should (equal (diffs-tests--fold-states
+                    "foo.el" "package-lock.json" "bar.el")
+                   '(nil nil t)))
+    (should-error
+     (cl-letf (((symbol-function 'diffs--review-restore-refreshed-state)
+                (lambda (&rest _)
+                  (error "Injected refresh failure"))))
+       (diffs-refresh))
+     :type 'error)
+    (should (equal (diffs-tests--fold-states
+                    "foo.el" "package-lock.json" "bar.el")
+                   '(nil nil t)))))
+
+(ert-deftest diffs-split-collect-folds-a-file-to-its-header-and-a-note ()
+  (diffs-tests--with-diff diffs-tests--lock-file-patch
+    (diffs-minor-mode 1)
+    (pcase-let* ((`(,old ,new ,anchors) (diffs--split-collect))
+                 (lock (diffs-tests--section-for "package-lock.json"))
+                 (rows (seq-filter (lambda (row) (eq (nth 11 row) lock)) old)))
+      (should (= (length old) (length new)))
+      (should (equal (mapcar (lambda (row) (nth 3 row)) rows)
+                     '(header meta)))
+      (should (string-match-p "4 hidden lines" (car (cadr rows))))
+      (should-not (seq-find (lambda (row) (nth 5 row)) rows))
+      ;; Only the two open files have a hunk to jump to.
+      (should (= (length anchors) 2)))))
+
+(defun diffs-tests--split-text ()
+  "Return the plain text of the current split buffer, all rows included."
+  (when diffs--split-paged-p
+    (diffs--split-materialize-range 0 (length diffs--split-rows)))
+  (buffer-substring-no-properties (point-min) (point-max)))
+
+(defmacro diffs-tests--with-split (spec &rest body)
+  "Run BODY in the new side of a split review of a patch.
+SPEC is (PATCH VIRTUALIZATION BUFFER OLD-BUFFER NEW-BUFFER).  Bind
+BUFFER to the unified owner, and OLD-BUFFER and NEW-BUFFER to the two
+sides of its split."
+  (declare (indent 1) (debug t))
+  (pcase-let ((`(,patch ,virtualization ,buffer ,old-buffer ,new-buffer)
+               spec))
+    `(let ((,buffer (generate-new-buffer " *diffs fold split test*"))
+           (diffs-split-virtualization ,virtualization)
+           ,old-buffer ,new-buffer)
+       (unwind-protect
+           (save-window-excursion
+             (switch-to-buffer ,buffer)
+             (insert ,patch)
+             (diff-mode)
+             (diffs-minor-mode 1)
+             (setq buffer-read-only t)
+             (diffs-toggle-split)
+             (setq ,new-buffer (current-buffer)
+                   ,old-buffer diffs--split-other)
+             ,@body
+             (diffs-split-quit))
+         (dolist (live (list ,old-buffer ,new-buffer ,buffer))
+           (when (buffer-live-p live)
+             (kill-buffer live)))))))
+
+(ert-deftest diffs-split-shows-a-folded-file-as-its-header-and-a-note ()
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+      (should (eq diffs--split-paged-p (eq virtualization 'paged)))
+      (let ((text (diffs-tests--split-text)))
+        (should (string-search "package-lock.json" text))
+        (should (string-search "4 hidden lines" text))
+        (should (string-search "(message \"new\")" text))
+        (should (string-search "new bar" text))
+        (should-not (string-search "1.0.1" text))
+        (should (= (length diffs--split-anchors) 2))))))
+
+(ert-deftest diffs-split-follows-a-fold-made-in-the-unified-view ()
+  (diffs-tests--with-split
+      (diffs-tests--lock-file-patch
+       diffs-split-virtualization buffer old-buffer new-buffer)
+    (should-not (string-search "1.0.1" (diffs-tests--split-text)))
+    (diffs-split-quit)
+    (set-buffer buffer)
+    ;; The pair is cached, but a fold changes what it shows.
+    (diffs--set-section-fold
+     (diffs-tests--section-for "package-lock.json") nil)
+    (diffs-toggle-split)
+    (should (string-search "1.0.1" (diffs-tests--split-text)))
+    (should (= (length diffs--split-anchors) 3))))
+
+(ert-deftest diffs-toggle-file-fold-in-the-split-view-rebuilds-the-pair ()
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+      (let ((lock (with-current-buffer buffer
+                    (diffs-tests--section-for "package-lock.json"))))
+        ;; From the folded file's note the same key opens it.
+        (goto-char (point-min))
+        (search-forward "hidden lines")
+        (diffs-toggle-file-fold)
+        (should (derived-mode-p 'diffs-split-mode))
+        (should (eq (current-buffer) new-buffer))
+        (should (string-search "1.0.1" (diffs-tests--split-text)))
+        (should-not
+         (with-current-buffer buffer (diffs--section-folded-p lock)))
+        (should (equal (diffs--split-property-at 'diffs-file (point))
+                       "package-lock.json"))
+        (should (looking-at "package-lock.json"))
+        ;; From inside an open file, the key folds it again.
+        (search-forward "1.0.1")
+        (diffs-toggle-file-fold)
+        (should-not (string-search "1.0.1" (diffs-tests--split-text)))
+        (should
+         (with-current-buffer buffer (diffs--section-folded-p lock)))
+        (should (looking-at "package-lock.json"))
+        (should (eq (get-buffer-window new-buffer)
+                    (selected-window)))))))
+
+(defconst diffs-tests--folded-order-patch
+  (concat
+   "diff --git a/a.el b/a.el\n"
+   "--- a/a.el\n"
+   "+++ b/a.el\n"
+   "@@ -1 +1 @@\n"
+   "-old a\n"
+   "+needle a\n"
+   "diff --git a/package-lock.json b/package-lock.json\n"
+   "--- a/package-lock.json\n"
+   "+++ b/package-lock.json\n"
+   "@@ -1,4 +1,4 @@\n"
+   " {\n"
+   "-  \"v\": \"needle old\",\n"
+   "-  \"w\": \"other\",\n"
+   "+  \"v\": \"needle new\",\n"
+   "+  \"w\": \"needle again\",\n"
+   " }\n"
+   "diff --git a/yarn.lock b/yarn.lock\n"
+   "--- a/yarn.lock\n"
+   "+++ b/yarn.lock\n"
+   "@@ -1,2 +1,2 @@\n"
+   "-# needle old\n"
+   "+# needle new\n"
+   " resolved\n"
+   "diff --git a/b.el b/b.el\n"
+   "--- a/b.el\n"
+   "+++ b/b.el\n"
+   "@@ -1 +1 @@\n"
+   "-old b\n"
+   "+needle b\n")
+  "A visible hit on each side of two folded lock files that also match.")
+
+(defun diffs-tests--isearch-start (&optional backward position)
+  "Start an incremental search at POSITION or the edge of the buffer.
+The pre-command hook runs first, as it does for a key."
+  (goto-char (or position (if backward (point-max) (point-min))))
+  (let ((this-command (if backward 'isearch-backward 'isearch-forward)))
+    (run-hooks 'pre-command-hook))
+  (isearch-mode (not backward)))
+
+(defun diffs-tests--isearch-type (string)
+  "Type STRING into the search in progress."
+  (mapc (lambda (char) (isearch-printing-char char 1)) string))
+
+(defun diffs-tests--isearch-end ()
+  "End the search in progress, then finish the command that ended it."
+  (isearch-done)
+  (run-hooks 'post-command-hook))
+
+(defun diffs-tests--line ()
+  "Return the plain text of the current line."
+  (buffer-substring-no-properties (line-beginning-position)
+                                  (line-end-position)))
+
+(defmacro diffs-tests--isearching (backward &rest body)
+  "Start a search, run BODY, and leave no search behind."
+  (declare (indent 1) (debug t))
+  `(progn
+     (diffs-tests--isearch-start ,backward)
+     (unwind-protect (progn ,@body)
+       (when isearch-mode (isearch-done t)))))
+
+(ert-deftest diffs-split-search-stops-on-a-folded-file-and-shows-it-when-accepted ()
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+      (let ((lock (with-current-buffer buffer
+                    (diffs-tests--section-for "package-lock.json"))))
+        (should (string-search "hidden lines" (diffs-tests--split-text)))
+        (diffs-tests--isearching nil
+          ;; Typing narrows the search: "1" is on a visible row, and the
+          ;; whole string only in the hidden hunk.
+          (diffs-tests--isearch-type "1")
+          (should (string-search "foo.el" (diffs-tests--line)))
+          (diffs-tests--isearch-type ".0.1")
+          (should isearch-success)
+          (should (string-search "hidden lines" (diffs-tests--line)))
+          ;; Nothing is built while the search is still going.
+          (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+          (should-not (string-search "1.0.1" (diffs-tests--split-text)))
+          (diffs-tests--isearch-end))
+        (should-not (with-current-buffer buffer (diffs--section-folded-p lock)))
+        (should (derived-mode-p 'diffs-split-mode))
+        (should (eq (current-buffer) new-buffer))
+        (should (eq (window-buffer (selected-window)) new-buffer))
+        (should (string-search "1.0.1" (diffs-tests--line)))
+        (should (looking-back "\"1\\.0\\.1" (line-beginning-position)))))))
+
+(defun diffs-tests--section-file-at-point ()
+  "Return the file of the diff section at point in a split buffer."
+  (plist-get (diffs--split-section-at-position (point)) :file))
+
+(ert-deftest diffs-split-search-reaches-folded-files-in-document-order ()
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--folded-order-patch virtualization buffer old-buffer new-buffer)
+      (diffs-tests--isearching nil
+        (diffs-tests--isearch-type "needle")
+        (should (equal (diffs-tests--line) "needle a"))
+        (isearch-repeat-forward)
+        (should (string-search "hidden lines" (diffs-tests--line)))
+        (should (equal (diffs-tests--section-file-at-point)
+                       "package-lock.json"))
+        (isearch-repeat-forward)
+        (should (string-search "hidden lines" (diffs-tests--line)))
+        (should (equal (diffs-tests--section-file-at-point) "yarn.lock"))
+        (isearch-repeat-forward)
+        (should (equal (diffs-tests--line) "needle b"))
+        (isearch-repeat-forward)
+        (should-not isearch-success)
+        (isearch-done t))
+      (diffs-tests--isearching t
+        (diffs-tests--isearch-type "needle")
+        (should (equal (diffs-tests--line) "needle b"))
+        (isearch-repeat-backward)
+        (should (equal (diffs-tests--section-file-at-point) "yarn.lock"))
+        (isearch-repeat-backward)
+        (should (equal (diffs-tests--section-file-at-point)
+                       "package-lock.json"))
+        (should (string-search "hidden lines" (diffs-tests--line)))
+        (isearch-repeat-backward)
+        (should (equal (diffs-tests--line) "needle a"))
+        (isearch-done t))
+      ;; Passing a note row without ending on it shows nothing.
+      (dolist (file '("package-lock.json" "yarn.lock"))
+        (should (with-current-buffer buffer
+                  (diffs--section-folded-p
+                   (diffs-tests--section-for file))))))))
+
+(ert-deftest diffs-split-search-shows-a-folded-file-at-the-match-in-its-direction ()
+  (dolist (virtualization '(complete paged))
+    (dolist (backward '(nil t))
+      (diffs-tests--with-split
+          (diffs-tests--folded-order-patch virtualization buffer old-buffer new-buffer)
+        (diffs-tests--isearching backward
+          (diffs-tests--isearch-type "needle")
+          ;; Forward the lock file follows the first hit, and backward
+          ;; the second lock file and then this one precede it.
+          (dotimes (_ (if backward 2 1))
+            (if backward
+                (isearch-repeat-backward)
+              (isearch-repeat-forward)))
+          (should (equal (diffs-tests--section-file-at-point)
+                         "package-lock.json"))
+          (should (string-search "hidden lines" (diffs-tests--line)))
+          (diffs-tests--isearch-end))
+        (should-not (with-current-buffer buffer
+                      (diffs--section-folded-p
+                       (diffs-tests--section-for "package-lock.json"))))
+        (should (with-current-buffer buffer
+                  (diffs--section-folded-p
+                   (diffs-tests--section-for "yarn.lock"))))
+        ;; It opens on the first match going forward, on the last going
+        ;; backward, as the search would have found them.
+        (if backward
+            (progn
+              (should (string-search "needle again" (diffs-tests--line)))
+              (should (looking-at "needle again")))
+          (should (string-search "needle new" (diffs-tests--line)))
+          (should (looking-back "needle" (line-beginning-position))))))))
+
+(ert-deftest diffs-split-search-stops-once-on-a-wrapped-note-row ()
+  (let ((buffer (generate-new-buffer " *diffs fold split test*"))
+        (diffs-split-wrap-lines t)
+        old-buffer new-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (insert diffs-tests--lock-file-patch)
+          (diff-mode)
+          (diffs-minor-mode 1)
+          (setq buffer-read-only t)
+          ;; Halve the window that the split divides, so that the note
+          ;; wraps over several rows.
+          (split-window-right)
+          (diffs-toggle-split)
+          (setq new-buffer (current-buffer)
+                old-buffer diffs--split-other)
+          (should (> (cl-count-if
+                      (lambda (row)
+                        (and (> (length (car row)) 0)
+                             (get-text-property 0 'diffs-fold-note (car row))))
+                      diffs--split-rows)
+                     1))
+          (diffs-tests--isearching nil
+            (diffs-tests--isearch-type "version")
+            (should (string-search "hidden" (diffs-tests--line)))
+            (isearch-repeat-forward)
+            (should-not isearch-success)
+            (isearch-done t))
+          (diffs-tests--isearching nil
+            (diffs-tests--isearch-type "version")
+            (diffs-tests--isearch-end))
+          (should (string-search "version" (diffs-tests--line)))
+          (diffs-split-quit))
+      (dolist (live (list old-buffer new-buffer buffer))
+        (when (buffer-live-p live)
+          (kill-buffer live))))))
+
+(ert-deftest diffs-split-search-finds-a-match-in-a-hunk-a-paged-split-has-not-drawn ()
+  (let ((patch
+         (concat
+          diffs-tests--normal
+          "diff --git a/yarn.lock b/yarn.lock\n"
+          "--- a/yarn.lock\n"
+          "+++ b/yarn.lock\n"
+          "@@ -1,60 +1,60 @@\n"
+          (mapconcat (lambda (n) (format " entry %d\n" n))
+                     (number-sequence 1 60) "")
+          "@@ -300,2 +300,2 @@\n"
+          " tail\n"
+          "-old\n"
+          "+needle at the end\n"))
+        (diffs-split-overscan 0))
+    (diffs-tests--with-split (patch 'paged buffer old-buffer new-buffer)
+      (should diffs--split-paged-p)
+      (diffs-tests--isearching nil
+        (diffs-tests--isearch-type "needle")
+        (should (string-search "hidden lines" (diffs-tests--line)))
+        (diffs-tests--isearch-end))
+      (should (string-search "needle at the end" (diffs-tests--line)))
+      (should (looking-back "needle" (line-beginning-position))))))
+
+(ert-deftest diffs-split-fold-gates-follow-the-text-of-a-paged-split ()
+  ;; Drawing the second hunk of a.el moves the note row after it.
+  (let ((patch
+         (concat
+          "diff --git a/a.el b/a.el\n"
+          "--- a/a.el\n"
+          "+++ b/a.el\n"
+          "@@ -1,60 +1,60 @@\n"
+          (mapconcat (lambda (n) (format " entry %d\n" n))
+                     (number-sequence 1 60) "")
+          "@@ -300,2 +300,2 @@\n"
+          " tail\n"
+          "-old\n"
+          "+a much longer replacement line\n"
+          "diff --git a/yarn.lock b/yarn.lock\n"
+          "--- a/yarn.lock\n"
+          "+++ b/yarn.lock\n"
+          "@@ -1,2 +1,2 @@\n"
+          "-old\n"
+          "+new\n"
+          " same\n"))
+        (diffs-split-overscan 0))
+    (diffs-tests--with-split (patch 'paged buffer old-buffer new-buffer)
+      (let ((before (car (diffs--split-fold-gates))))
+        (diffs--split-paged-materialize-all)
+        (let ((after (car (diffs--split-fold-gates))))
+          (should (> (nth 1 after) (nth 1 before)))
+          (should (string-search "hidden lines"
+                                 (buffer-substring-no-properties
+                                  (nth 1 after) (nth 2 after)))))))))
+
+(defconst diffs-tests--projection-patch
+  (concat
+   diffs-tests--normal
+   "diff --git a/yarn.lock b/yarn.lock\n"
+   "--- a/yarn.lock\n"
+   "+++ b/yarn.lock\n"
+   "@@ -1,8 +1,7 @@\n"
+   " alpha\n"
+   " beta\n"
+   "-old one\n"
+   "-old two\n"
+   "-old three\n"
+   "+new one\n"
+   "+new two\n"
+   " gamma\n"
+   " delta\n"
+   "@@ -50,2 +49,2 @@\n"
+   " omega\n"
+   "-old tail\n"
+   "+new tail\n"
+   "@@ -52,2 +51,2 @@\n"
+   " tail2\n"
+   "-old x\n"
+   "+new x\n")
+  "A folded file of three hunks, one with a change block that is longer on
+one side than on the other.")
+
+(defun diffs-tests--searches-folded-and-open (lock buffer string regexp backward)
+  "Return what a search for STRING finds in folded LOCK, then when it is open.
+BUFFER owns the split.  The string is typed, so that a REGEXP search
+keeps its anchors and newlines.  The result is (FOLDED . OPEN): whether
+the search stops on the note row of LOCK, and whether it finds the text
+in the rows of LOCK once the file is shown."
+  (let (folded open)
+    (diffs-tests--isearch-start backward)
+    (when regexp
+      (isearch-toggle-regexp))
+    (unwind-protect
+        (progn
+          (diffs-tests--isearch-type string)
+          (setq folded (and isearch-success
+                            (eq (diffs--split-section-at-position (point))
+                                lock)
+                            (string-search "hidden lines"
+                                           (diffs-tests--line))
+                            t)))
+      (isearch-done t))
+    (diffs--split-set-fold lock nil)
+    (diffs-tests--isearch-start backward)
+    (when regexp
+      (isearch-toggle-regexp))
+    (unwind-protect
+        (progn
+          (diffs-tests--isearch-type string)
+          (setq open (and isearch-success
+                          (eq (diffs--split-section-at-position (point))
+                              lock)
+                          t)))
+      (isearch-done t))
+    (diffs--split-set-fold lock t)
+    (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+    (cons folded open)))
+
+(ert-deftest diffs-split-search-matches-line-anchors-in-a-folded-file ()
+  (dolist (virtualization '(complete paged))
+    (dolist (backward '(nil t))
+      (dolist (pattern '("^{" "^  \"version\": \"1\\.0\\.1\"" "\",$"))
+        (diffs-tests--with-split
+            (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+          (let ((lock (with-current-buffer buffer
+                        (diffs-tests--section-for "package-lock.json"))))
+            (diffs-tests--isearch-start backward)
+            (isearch-toggle-regexp)
+            (unwind-protect
+                (progn
+                  (diffs-tests--isearch-type pattern)
+                  (should isearch-success)
+                  (should (string-search "hidden lines" (diffs-tests--line)))
+                  (should (eq (diffs--split-section-at-position (point))
+                              lock))
+                  (diffs-tests--isearch-end))
+              (when isearch-mode (isearch-done t)))
+            (should-not (with-current-buffer buffer
+                          (diffs--section-folded-p lock)))
+            (should (string-match-p pattern (diffs-tests--line)))
+            (should (equal (diffs-tests--section-file-at-point)
+                           "package-lock.json"))))))))
+
+(ert-deftest diffs-split-search-matches-across-rows-of-a-folded-file ()
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--projection-patch virtualization buffer old-buffer new-buffer)
+      (let ((lock (with-current-buffer buffer
+                    (diffs-tests--section-for "yarn.lock"))))
+        ;; The new side shows its own lines one after the other, with a
+        ;; blank row where the other side has a line left over.
+        (dolist (case '(("alpha\nbeta\nnew one" . t)
+                        ("beta\n-old one" . nil)
+                        ("beta\nold one" . nil)
+                        ("new two\n\ngamma" . t)
+                        ("new two\ngamma" . nil)))
+          (should (equal (diffs-tests--searches-folded-and-open
+                          lock buffer (car case) nil nil)
+                         (cons (cdr case) (cdr case)))))
+        ;; The old side is the mirror image.
+        (select-window (get-buffer-window old-buffer))
+        (dolist (case '(("beta\nold one\nold two" . t)
+                        ("beta\n+new one" . nil)
+                        ("old three\ngamma" . t)
+                        ("old three\n\ngamma" . nil)))
+          (should (equal (diffs-tests--searches-folded-and-open
+                          lock buffer (car case) nil nil)
+                         (cons (cdr case) (cdr case)))))))))
+
+(ert-deftest diffs-split-search-finds-the-same-text-folded-and-open ()
+  ;; Each case is (PATTERN REGEXP NEW OLD): whether the new and the old
+  ;; side show a match, which a folded file must report as the file open.
+  (dolist (virtualization '(complete paged))
+    (dolist (backward '(nil t))
+      (diffs-tests--with-split
+          (diffs-tests--projection-patch virtualization buffer old-buffer new-buffer)
+        (let ((lock (with-current-buffer buffer
+                      (diffs-tests--section-for "yarn.lock"))))
+          (dolist (side '(new old))
+            (select-window (get-buffer-window (if (eq side 'new)
+                                                  new-buffer
+                                                old-buffer)))
+            (pcase-dolist (`(,pattern ,regexp ,new ,old)
+                           '(("new one" nil t nil)
+                             ("old one" nil nil t)
+                             ("gamma" nil t t)
+                             ("delta\n" nil t t)
+                             ("^gamma$" t t t)
+                             ("^new one$" t t nil)
+                             ("^old two$" t nil t)
+                             ("^-old" t nil nil)
+                             ("^[+]new" t nil nil)
+                             ("^ gamma" t nil nil)
+                             ("gamma\ndelta" t t t)
+                             ("two\nold three" t nil t)
+                             ("two\n\ngamma" t t nil)
+                             ("^new tail$" t t nil)
+                             ("omega\n.*tail" t t t)
+                             ("unmodified lines" nil t t)
+                             ("^↓" t t t)
+                             ("new tail\n⋯\ntail2" t t nil)
+                             ("old tail\ntail2" t nil nil)
+                             ("zzz" nil nil nil)))
+              (let ((expected (if (eq side 'new) new old)))
+                (ert-info ((format "%s side, %S, regexp %S, backward %S"
+                                   side pattern regexp backward))
+                  (should (equal (diffs-tests--searches-folded-and-open
+                                  lock buffer pattern regexp backward)
+                                 (cons expected expected))))))))))))
+
+(ert-deftest diffs-split-search-does-not-take-a-folded-files-header-for-hidden-text ()
+  (diffs-tests--with-split
+      (diffs-tests--lock-file-patch 'complete buffer old-buffer new-buffer)
+    (diffs-tests--isearching nil
+      (diffs-tests--isearch-type "package-lock")
+      (should (string-search "package-lock.json" (diffs-tests--line)))
+      (isearch-repeat-forward)
+      (should-not isearch-success)
+      (isearch-done t))))
+
+(ert-deftest diffs-split-search-builds-a-folded-files-text-once ()
+  (diffs-tests--with-split
+      (diffs-tests--lock-file-patch 'complete buffer old-buffer new-buffer)
+    (let ((collected 0))
+      (cl-letf* ((collect (symbol-function 'diffs--split-collect))
+                 ((symbol-function 'diffs--split-collect)
+                  (lambda (&rest arguments)
+                    (cl-incf collected)
+                    (apply collect arguments))))
+        (dolist (string '("1.0.1" "version" "1.0"))
+          (diffs-tests--isearching nil
+            (diffs-tests--isearch-type string)
+            (should (string-search "hidden lines" (diffs-tests--line)))
+            (isearch-done t)))
+        (should (= collected 1))))))
+
+(ert-deftest diffs-folded-section-texts-are-the-rows-the-split-draws-open ()
+  (diffs-tests--with-diff diffs-tests--hidden-context
+    (diffs--scan)
+    (let* ((section (car diffs--sections))
+           (gap (diffs--gap-for-hunk (car (plist-get section :hunks)))))
+      (puthash section ["old one" "old two" "old three" "old four" "old five"]
+               diffs--old-content-cache)
+      (puthash section ["new one" "new two" "new three" "new four" "new five"]
+               diffs--new-content-cache)
+      ;; With its context hidden, the hunk starts with a separator row.
+      (let ((texts (diffs--folded-section-texts section)))
+        (should (string-match-p "\\`[^\n]*unmodified lines[^\n]*\nold five\n\\'"
+                                (car texts)))
+        (should (string-match-p "\\`[^\n]*unmodified lines[^\n]*\nnew five\n\\'"
+                                (cdr texts))))
+      ;; With all of it shown the separator row is not drawn at all.
+      (diffs--set-context-visible gap 4)
+      (let ((texts (diffs--folded-section-texts section)))
+        (should (equal (car texts)
+                       "old one\nold two\nold three\nold four\nold five\n"))
+        (should (equal (cdr texts)
+                       "new one\nnew two\nnew three\nnew four\nnew five\n"))))))
+
+(ert-deftest diffs-split-search-matches-only-the-text-its-side-shows ()
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+      (let ((lock (with-current-buffer buffer
+                    (diffs-tests--section-for "package-lock.json"))))
+        ;; 1.0.0 is only on the removed line, which the new side lacks.
+        (diffs-tests--isearching nil
+          (diffs-tests--isearch-type "1.0.0")
+          (should-not isearch-success)
+          (diffs-tests--isearch-end))
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+        ;; A match across the diff marker is not text the side shows.
+        (diffs-tests--isearching nil
+          (diffs-tests--isearch-type "+  \"version")
+          (should-not isearch-success)
+          (diffs-tests--isearch-end))
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+        (select-window (get-buffer-window old-buffer))
+        (diffs-tests--isearching nil
+          (diffs-tests--isearch-type "1.0.0")
+          (should isearch-success)
+          (should (string-search "hidden lines" (diffs-tests--line)))
+          (diffs-tests--isearch-end))
+        (should-not (with-current-buffer buffer (diffs--section-folded-p lock)))
+        (should (eq (current-buffer) old-buffer))
+        (should (looking-back "\"1\\.0\\.0" (line-beginning-position)))))))
+
+(ert-deftest diffs-split-search-leaves-folded-files-alone-unless-accepted ()
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+      (let ((lock (with-current-buffer buffer
+                    (diffs-tests--section-for "package-lock.json"))))
+        ;; Quitting on the note row keeps the file folded.
+        (diffs-tests--isearching nil
+          (diffs-tests--isearch-type "1.0.1")
+          (should (string-search "hidden lines" (diffs-tests--line)))
+          (condition-case nil
+              (isearch-abort)
+            (quit nil))
+          (run-hooks 'post-command-hook))
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+        (should (= (point) (point-min)))
+        ;; A search that ends before it finds anything has no match to
+        ;; show.
+        (diffs-tests--isearching nil
+          (diffs-tests--isearch-end))
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+        ;; Quitting puts point back on the note row the search began on.
+        (let ((note (nth 1 (car (diffs--split-fold-gates)))))
+          (diffs-tests--isearch-start nil note)
+          (unwind-protect
+              (progn
+                (diffs-tests--isearch-type "1.0.1")
+                (should isearch-success)
+                (condition-case nil
+                    (isearch-abort)
+                  (quit nil))
+                (run-hooks 'post-command-hook)
+                (should (= (point) note)))
+            (when isearch-mode (isearch-done t))))
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+        ;; The note row's own text is an ordinary match.
+        (diffs-tests--isearching nil
+          (diffs-tests--isearch-type "hidden lines")
+          (should (string-search "hidden lines" (diffs-tests--line)))
+          (diffs-tests--isearch-end))
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+        ;; A command that leaves another window selected does not rebuild
+        ;; the pair under it.
+        (diffs-tests--isearching nil
+          (diffs-tests--isearch-type "1.0.1")
+          (isearch-done)
+          (select-window (get-buffer-window old-buffer))
+          (set-buffer new-buffer)
+          (run-hooks 'post-command-hook))
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))))))
+
+(ert-deftest diffs-split-search-shows-the-file-only-when-its-command-is-done ()
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+      (let ((lock (with-current-buffer buffer
+                    (diffs-tests--section-for "package-lock.json"))))
+        ;; Nothing happens until the command that ended the search is done.
+        (diffs-tests--isearching nil
+          (diffs-tests--isearch-type "1.0.1")
+          (isearch-done))
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+        (run-hooks 'post-command-hook)
+        (should-not (with-current-buffer buffer (diffs--section-folded-p lock)))
+        (diffs-toggle-file-fold)
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+        ;; A command that starts first makes the pending show stale.
+        (diffs-tests--isearching nil
+          (diffs-tests--isearch-type "1.0.1")
+          (isearch-done))
+        (run-hooks 'pre-command-hook)
+        (run-hooks 'post-command-hook)
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))
+        ;; A search that is going again when the command is done is left
+        ;; alone, as when the search string is edited in the minibuffer.
+        (diffs-tests--isearching nil
+          (diffs-tests--isearch-type "1.0.1")
+          (isearch-done)
+          (isearch-mode t)
+          (run-hooks 'post-command-hook)
+          (should isearch-mode)
+          (isearch-done t))
+        (should (with-current-buffer buffer (diffs--section-folded-p lock)))))))
+
+(ert-deftest diffs-split-search-ends-on-a-note-row-before-the-file-is-opened-by-hand ()
+  ;; The search that ended on the note row must not act on a later search.
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+      (diffs-tests--isearching nil
+        (diffs-tests--isearch-type "1.0.1")
+        (should (string-search "hidden lines" (diffs-tests--line)))
+        (isearch-done))
+      (goto-char (point-min))
+      (search-forward "hidden lines")
+      (diffs-toggle-file-fold)
+      (diffs-tests--isearching nil
+        (diffs-tests--isearch-type "1.0.1")
+        (should isearch-success)
+        (should (string-search "1.0.1" (diffs-tests--line)))
+        (isearch-done t)))))
+
+(ert-deftest diffs-split-search-function-counts-folded-files-as-matches ()
+  ;; Lazy highlighting and counting step through the buffer with a bound.
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--folded-order-patch virtualization buffer old-buffer new-buffer)
+      (when diffs--split-paged-p
+        (diffs--split-paged-materialize-all))
+      (let ((isearch-forward t)
+            (case-fold-search nil)
+            (search (diffs--split-isearch-search-fun))
+            stops)
+        (goto-char (point-min))
+        ;; A search that stops advancing must fail the test, not hang it.
+        (cl-loop repeat 10
+                 while (funcall search "needle" (point-max) t)
+                 do (push (list (diffs-tests--line)
+                                (diffs-tests--section-file-at-point)
+                                (- (match-end 0) (match-beginning 0)))
+                          stops))
+        (setq stops (nreverse stops))
+        (should (= (length stops) 4))
+        (should (equal (car (nth 0 stops)) "needle a"))
+        (should (string-search "hidden lines" (car (nth 1 stops))))
+        (should (equal (cadr (nth 1 stops)) "package-lock.json"))
+        (should (equal (cadr (nth 2 stops)) "yarn.lock"))
+        (should (equal (car (nth 3 stops)) "needle b"))
+        ;; A note row is a match as long as its text.
+        (should (> (nth 2 (nth 1 stops)) (length "needle")))))))
+
+(ert-deftest diffs-split-search-function-keeps-a-folded-file-within-its-bound ()
+  (diffs-tests--with-split
+      (diffs-tests--lock-file-patch 'complete buffer old-buffer new-buffer)
+    (let* ((case-fold-search nil)
+           (search (diffs--split-isearch-search-fun))
+           (note (car (diffs--split-fold-gates))))
+      (let ((isearch-forward t))
+        (goto-char (point-min))
+        (should-not (funcall search "1.0.1" (1- (nth 2 note)) t))
+        (should (= (funcall search "1.0.1" (nth 2 note) t) (nth 2 note))))
+      (let ((isearch-forward nil))
+        (goto-char (point-max))
+        (should-not (funcall search "1.0.1" (1+ (nth 1 note)) t))
+        (should (= (funcall search "1.0.1" (nth 1 note) t) (nth 1 note)))))))
+
+(ert-deftest diffs-imenu-shows-a-folded-file-before-jumping-to-its-hunk ()
+  (diffs-tests--with-diff diffs-tests--lock-file-patch
+    (diffs-minor-mode 1)
+    (let* ((index (funcall imenu-create-index-function))
+           (entries (cdr (assoc "package-lock.json" index)))
+           (lock (diffs-tests--section-for "package-lock.json"))
+           (hunk (car (plist-get lock :hunks))))
+      (should (diffs--section-folded-p lock))
+      ;; The file itself is visible even when folded.
+      (goto-char (point-min))
+      (imenu (car entries))
+      (should (= (point) (plist-get lock :beg)))
+      (should (diffs--section-folded-p lock))
+      (imenu (cadr entries))
+      (should-not (diffs--section-folded-p lock))
+      (should (= (point) (car hunk))))))
+
+(ert-deftest diffs-imenu-in-split-shows-a-folded-file-before-jumping-to-its-hunk ()
+  (dolist (virtualization '(complete paged))
+    (diffs-tests--with-split
+        (diffs-tests--lock-file-patch virtualization buffer old-buffer new-buffer)
+      (let* ((index (funcall imenu-create-index-function))
+             (entries (cdr (assoc "package-lock.json" index)))
+             (lock (with-current-buffer buffer
+                     (diffs-tests--section-for "package-lock.json"))))
+        (should-not (string-search "1.0.1" (diffs-tests--split-text)))
+        (imenu (cadr entries))
+        (should (derived-mode-p 'diffs-split-mode))
+        (should-not
+         (with-current-buffer buffer (diffs--section-folded-p lock)))
+        (should (string-search "1.0.1" (diffs-tests--split-text)))
+        (should (equal (diffs--split-property-at 'diffs-file (point))
+                       "package-lock.json"))
+        (should (eq (diffs--split-property-at 'diffs-kind (point))
+                    'sep))))))
+
+(defconst diffs-tests--version-bump "^+  \"version\""
+  "Regexp matching the added line of the lock file's version bump.")
+
+(ert-deftest diffs-annotation-navigation-shows-a-folded-file ()
+  (let ((buffer (generate-new-buffer " *diffs fold annotation test*")))
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (insert diffs-tests--lock-file-patch)
+          (diff-mode)
+          (let ((diffs-collapsed-files nil))
+            (diffs-minor-mode 1))
+          (let ((lock (diffs-tests--section-for "package-lock.json")))
+            (goto-char (plist-get lock :beg))
+            (re-search-forward diffs-tests--version-bump)
+            (beginning-of-line)
+            (diffs-review-add-annotation "Check the version bump." nil)
+            (diffs--set-section-fold lock t)
+            (goto-char (point-min))
+            (diffs-review-next-annotation)
+            (should-not (diffs--section-folded-p lock))
+            (should (looking-at diffs-tests--version-bump))))
+      (kill-buffer buffer))))
+
+(ert-deftest diffs-annotation-navigation-in-split-shows-a-folded-file ()
+  (let ((buffer (generate-new-buffer " *diffs fold annotation test*"))
+        old-buffer new-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (insert diffs-tests--lock-file-patch)
+          (diff-mode)
+          (let ((diffs-collapsed-files nil))
+            (diffs-minor-mode 1))
+          (setq buffer-read-only t)
+          (let ((lock (diffs-tests--section-for "package-lock.json")))
+            (goto-char (plist-get lock :beg))
+            (re-search-forward diffs-tests--version-bump)
+            (beginning-of-line)
+            (diffs-review-add-annotation "Check the version bump." nil)
+            (diffs--set-section-fold lock t)
+            (diffs-toggle-split)
+            (setq new-buffer (current-buffer)
+                  old-buffer diffs--split-other)
+            (should-not (string-search "1.0.1" (diffs-tests--split-text)))
+            (goto-char (point-min))
+            (diffs-review-next-annotation)
+            (should (derived-mode-p 'diffs-split-mode))
+            (should-not (with-current-buffer buffer
+                          (diffs--section-folded-p lock)))
+            (should (looking-at " *\"version\": \"1.0.1\""))
+            (diffs-split-quit)))
+      (dolist (live (list old-buffer new-buffer buffer))
+        (when (buffer-live-p live)
+          (kill-buffer live))))))
+
+(ert-deftest diffs-split-with-review-state-in-a-folded-file-builds ()
+  ;; Review state in hidden rows has nowhere to be drawn, and says so
+  ;; by drawing nothing instead of failing.
+  (let ((buffer (generate-new-buffer " *diffs fold review test*"))
+        old-buffer new-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (insert diffs-tests--lock-file-patch)
+          (diff-mode)
+          (let ((diffs-collapsed-files nil))
+            (diffs-minor-mode 1))
+          (setq buffer-read-only t)
+          (let ((lock (diffs-tests--section-for "package-lock.json")))
+            (goto-char (plist-get lock :beg))
+            (re-search-forward diffs-tests--version-bump)
+            (beginning-of-line)
+            (diffs-review-add-annotation "Check the version bump." nil)
+            (diffs--set-section-fold lock t)
+            (diffs-toggle-split)
+            (setq new-buffer (current-buffer)
+                  old-buffer diffs--split-other)
+            (should-not diffs--split-paged-p)
+            (should (string-search "4 hidden lines" (diffs-tests--split-text)))
+            (diffs-split-quit)))
+      (dolist (live (list old-buffer new-buffer buffer))
+        (when (buffer-live-p live)
+          (kill-buffer live))))))
+
+(ert-deftest diffs-entering-at-a-line-shows-its-folded-file ()
+  (let ((diffs-default-view 'stacked)
+        buffer)
+    (unwind-protect
+        (save-window-excursion
+          (setq buffer (diffs--prepare-buffer temporary-file-directory))
+          (with-current-buffer buffer
+            (insert diffs-tests--lock-file-patch))
+          (cl-letf (((symbol-function 'diff-hl-diff-skip-to)
+                     (lambda (_line)
+                       (goto-char (point-min))
+                       (re-search-forward diffs-tests--version-bump))))
+            (diffs--present buffer nil nil 2))
+          (with-current-buffer buffer
+            (should-not
+             (diffs--section-folded-p
+              (diffs-tests--section-for "package-lock.json")))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest diffs-entering-without-a-hunk-keeps-the-first-file-folded ()
+  ;; A lock file sorts first.  Entering at a line the diff cannot reach
+  ;; leaves point on its header, which is no reason to open it.
+  (let ((diffs-default-view 'stacked)
+        buffer)
+    (unwind-protect
+        (save-window-excursion
+          (setq buffer (diffs--prepare-buffer temporary-file-directory))
+          (with-current-buffer buffer
+            (insert diffs-tests--yarn-lock-patch diffs-tests--normal))
+          (cl-letf (((symbol-function 'diff-hl-diff-skip-to) #'ignore))
+            (diffs--present buffer nil nil 2))
+          (with-current-buffer buffer
+            (should (diffs--section-folded-p
+                     (diffs-tests--section-for "yarn.lock")))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (ert-deftest diffs-review-refresh-preserves-and-revalidates-live-state ()
   (let ((buffer
