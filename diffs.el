@@ -6631,9 +6631,10 @@ current selected again."
 
 ;; A folded file has no rows in the split buffers, so isearch cannot see
 ;; its hunks.  The note row stands in for them: a search that would pass
-;; the note row, with a match in the hidden hunks on this side, stops on
-;; it.  Ending the search there shows the file and moves to its first
-;; match, so nothing is built for a file the search does not settle on.
+;; the note row, with a match in the rows the file would show on this
+;; side, stops on it.  Ending the search there shows the file and moves
+;; to its first match, so no file is drawn that the search does not
+;; settle on.
 
 (defvar-local diffs--split-gates-cache nil
   "Cons of a modification tick of this split buffer and its folded files.")

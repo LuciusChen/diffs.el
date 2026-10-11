@@ -5911,17 +5911,20 @@ one side than on the other.")
 
 (defun diffs-tests--searches-folded-and-open (lock buffer string regexp backward)
   "Return what a search for STRING finds in folded LOCK, then when it is open.
-BUFFER owns the split.  The result is (FOLDED . OPEN): whether the
-search stops on the note row, and whether it finds the text after the
-file is shown."
+BUFFER owns the split.  The string is typed, so that a REGEXP search
+keeps its anchors and newlines.  The result is (FOLDED . OPEN): whether
+the search stops on the note row of LOCK, and whether it finds the text
+in the rows of LOCK once the file is shown."
   (let (folded open)
     (diffs-tests--isearch-start backward)
     (when regexp
       (isearch-toggle-regexp))
     (unwind-protect
         (progn
-          (isearch-yank-string string)
+          (diffs-tests--isearch-type string)
           (setq folded (and isearch-success
+                            (eq (diffs--split-section-at-position (point))
+                                lock)
                             (string-search "hidden lines"
                                            (diffs-tests--line))
                             t)))
@@ -5932,8 +5935,11 @@ file is shown."
       (isearch-toggle-regexp))
     (unwind-protect
         (progn
-          (isearch-yank-string string)
-          (setq open (and isearch-success t)))
+          (diffs-tests--isearch-type string)
+          (setq open (and isearch-success
+                          (eq (diffs--split-section-at-position (point))
+                              lock)
+                          t)))
       (isearch-done t))
     (diffs--split-set-fold lock t)
     (should (with-current-buffer buffer (diffs--section-folded-p lock)))
@@ -5954,11 +5960,15 @@ file is shown."
                   (diffs-tests--isearch-type pattern)
                   (should isearch-success)
                   (should (string-search "hidden lines" (diffs-tests--line)))
+                  (should (eq (diffs--split-section-at-position (point))
+                              lock))
                   (diffs-tests--isearch-end))
               (when isearch-mode (isearch-done t)))
             (should-not (with-current-buffer buffer
                           (diffs--section-folded-p lock)))
-            (should (string-match-p pattern (diffs-tests--line)))))))))
+            (should (string-match-p pattern (diffs-tests--line)))
+            (should (equal (diffs-tests--section-file-at-point)
+                           "package-lock.json"))))))))
 
 (ert-deftest diffs-split-search-matches-across-rows-of-a-folded-file ()
   (dolist (virtualization '(complete paged))
@@ -5987,6 +5997,8 @@ file is shown."
                          (cons (cdr case) (cdr case)))))))))
 
 (ert-deftest diffs-split-search-finds-the-same-text-folded-and-open ()
+  ;; Each case is (PATTERN REGEXP NEW OLD): whether the new and the old
+  ;; side show a match, which a folded file must report as the file open.
   (dolist (virtualization '(complete paged))
     (dolist (backward '(nil t))
       (diffs-tests--with-split
@@ -5997,18 +6009,33 @@ file is shown."
             (select-window (get-buffer-window (if (eq side 'new)
                                                   new-buffer
                                                 old-buffer)))
-            (dolist (case '(("new one" . nil) ("old one" . nil)
-                            ("gamma" . nil) ("delta\n" . nil)
-                            ("^gamma$" . t) ("^new one$" . t) ("^old two$" . t)
-                            ("^-old" . t) ("^+new" . t) ("^ gamma" . t)
-                            ("gamma\\ndelta" . t) ("two\\nold three" . t)
-                            ("two\\n\\ngamma" . t) ("^new tail$" . t)
-                            ("omega\\n.*tail" . t) ("unmodified lines" . nil)
-                            ("new tail\\n⋯\\ntail2" . t) ("old tail\\ntail2" . t)
-                            ("^↓" . t) ("^⋯$" . t) ("zzz" . nil)))
-              (let ((outcome (diffs-tests--searches-folded-and-open
-                              lock buffer (car case) (cdr case) backward)))
-                (should (equal (car outcome) (cdr outcome)))))))))))
+            (pcase-dolist (`(,pattern ,regexp ,new ,old)
+                           '(("new one" nil t nil)
+                             ("old one" nil nil t)
+                             ("gamma" nil t t)
+                             ("delta\n" nil t t)
+                             ("^gamma$" t t t)
+                             ("^new one$" t t nil)
+                             ("^old two$" t nil t)
+                             ("^-old" t nil nil)
+                             ("^[+]new" t nil nil)
+                             ("^ gamma" t nil nil)
+                             ("gamma\ndelta" t t t)
+                             ("two\nold three" t nil t)
+                             ("two\n\ngamma" t t nil)
+                             ("^new tail$" t t nil)
+                             ("omega\n.*tail" t t t)
+                             ("unmodified lines" nil t t)
+                             ("^↓" t t t)
+                             ("new tail\n⋯\ntail2" t t nil)
+                             ("old tail\ntail2" t nil nil)
+                             ("zzz" nil nil nil)))
+              (let ((expected (if (eq side 'new) new old)))
+                (ert-info ((format "%s side, %S, regexp %S, backward %S"
+                                   side pattern regexp backward))
+                  (should (equal (diffs-tests--searches-folded-and-open
+                                  lock buffer pattern regexp backward)
+                                 (cons expected expected))))))))))))
 
 (ert-deftest diffs-split-search-does-not-take-a-folded-files-header-for-hidden-text ()
   (diffs-tests--with-split
